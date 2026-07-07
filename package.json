@@ -1,0 +1,40 @@
+{
+  "name": "installation-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon --watch ./ --exec node index.js",
+    "build": "pnpm -w --filter ./packages/shared run build"
+  },
+  "dependencies": {
+    "bcrypt": "^6.0.0",
+    "bcryptjs": "^3.0.3",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "dayjs": "^1.11.19",
+    "dotenv": "^17.2.3",
+    "express": "^5.1.0",
+    "focus-trap-react": "^11.0.4",
+    "framer-motion": "^12.23.24",
+    "helmet": "^8.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "morgan": "^1.10.1",
+    "mssql": "^12.0.0",
+    "multer": "^2.0.2",
+    "mysql2": "^3.15.3",
+    "sequelize": "^6.37.7"
+  },
+  "devDependencies": {
+    "eslint": "^9.38.0",
+    "nodemon": "^3.1.10"
+  },
+  "workspaces": [
+    "frontend",
+    "mobile",
+    "packages/*"
+  ],
+  "allowScripts": {
+    "bcrypt@6.0.0": true
+  }
+}
