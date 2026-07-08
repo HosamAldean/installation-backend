@@ -383,67 +383,21 @@ router.post("/order-step/update", authenticateToken, upload.single("media"), asy
         // Save location (optional)
         await upsertTeamLocation(teamId, lat, lng);
 
+        // Broadcast a plain "something changed" event so every connected
+        // dashboard re-fetches orders and runs its own detectChanges() —
+        // which builds the field-news entry for this step change itself
+        // (correctly localized/translated, fixArabic'd project name, and
+        // the same item-label resolution used everywhere else on the
+        // frontend). This route used to ALSO push a fully-formed
+        // 'field_news' SSE event built from a separate, raw backend-side
+        // query — that duplicated what detectChanges() already produces,
+        // but disagreed with it: no fixArabic() on the project name (showed
+        // as mojibake), no status translation (raw "Completed" instead of
+        // the localized label), and a different item-label fallback order
+        // than the frontend's own (it.unitNo ?? it.unitIdContract ??
+        // it.itemName), so the two versions never matched on dedup and
+        // both stayed visible as separate entries for the same event.
         try {
-            // Send field news update for step status change
-            const teamDetails = await sequelize2.query(
-                `SELECT name FROM IIT_Petra.instTeams WHERE id = :teamId LIMIT 1`,
-                { replacements: { teamId }, type: QueryTypes.SELECT }
-            );
-            const teamName = teamDetails[0]?.name;
-            const itemDetails = await sequelize.query(`
-                SELECT i.itemName, i.unitNo, p.projectNo, p.projectName, i.id as instOrderItemId
-                FROM IIT_Petra.instOrderItems i
-                LEFT JOIN IIT_Petra.instOrders o ON o.id = i.instOrderId
-                LEFT JOIN IIT_Petra.instReqMaster m ON m.instReqMasterId = o.instReqMasterId
-                LEFT JOIN IIT_Petra.project p ON p.projectId = m.projectId
-                WHERE i.id = (SELECT instOrderItemId FROM IIT_Petra.instOrderSteps WHERE id = :stepId LIMIT 1)
-                LIMIT 1
-            `, { replacements: { stepId }, type: QueryTypes.SELECT });
-
-            const item = itemDetails[0];
-            const projectLabel = item?.projectNo ? `${item.projectNo} ${item.projectName || ''}`.trim() : (item?.projectName ?? undefined);
-            const itemLabel = item?.unitNo ?? item?.itemName ?? undefined;
-
-            // Get step name
-            const stepDetails = await sequelize2.query(`
-                SELECT i.stepName FROM IIT_Petra.instOrderSteps s
-                JOIN IIT_Petra.instSteps i ON i.instStepId = s.instStepId
-                WHERE s.id = :stepId LIMIT 1
-            `, { replacements: { stepId }, type: QueryTypes.SELECT });
-
-            const stepName = stepDetails[0]?.stepName || 'Step';
-
-            console.log('[Field News] Sending update:', {
-                stepId,
-                stepName,
-                status,
-                teamName,
-                projectLabel,
-                itemLabel
-            });
-
-            notifyOrderUpdate({
-                event: 'field_news',
-                news: {
-                    id: `update-${stepId}-${Date.now()}`,
-                    type: 'update',
-                    message: `${stepName} → ${status}`,
-                    project: projectLabel,
-                    item: itemLabel,
-                    team: teamName,
-                    status,
-                    time: new Date().toISOString(),
-                    photo: mediaUrl,
-                    note: null,
-                }
-            });
-            // Also broadcast a plain "something changed" event — unlike
-            // /order-step/photo and /order-step/issue below, this route
-            // never did this, so other managers' dashboards never
-            // re-fetched orders after a step completed. Without that
-            // refresh, detectChanges() on the frontend was comparing against
-            // stale progress and could never notice an item crossing 100%,
-            // so "completed" news entries silently never fired.
             notifyOrderUpdate();
         } catch (e) { console.error('Error sending field news update:', e); }
 
