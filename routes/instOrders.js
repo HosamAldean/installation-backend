@@ -800,6 +800,12 @@ router.get('/assigned', async (req, res) => {
         );
 
         // 8️⃣ Fetch recent team checkpoints (used by Field News) - last 48 hours
+        // UTC_TIMESTAMP(), not NOW() — checkpoints are now written with
+        // UTC_TIMESTAMP() (see /follow-up/team/checkpoint), so the cutoff
+        // here has to use the same reference or the window silently
+        // shrinks: NOW() is 3 hours ahead of UTC_TIMESTAMP() on this
+        // server, so DATE_SUB(NOW(), 48h) was effectively a 45-hour cutoff
+        // against UTC-stored createdAt values.
         const rawCheckpoints = await sequelize3.query(
             `SELECT c.id,
                     c.team_id AS teamId,
@@ -814,7 +820,7 @@ router.get('/assigned', async (req, res) => {
              LEFT JOIN IIT_Petra.instOrders iod ON iod.Id = c.order_id
              LEFT JOIN IIT_Petra.instReqMaster m ON m.instReqMasterId = iod.instReqMasterId
              LEFT JOIN IIT_Petra.project j ON m.projectId = j.projectId
-             WHERE c.createdAt >= DATE_SUB(NOW(), INTERVAL 48 HOUR)
+             WHERE c.createdAt >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 48 HOUR)
              ORDER BY c.createdAt DESC`,
             { type: QueryTypes.SELECT }
         );
