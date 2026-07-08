@@ -10,7 +10,7 @@ import { getSqlPool, sequelize } from "../config/db.js";
 import { authenticateToken, authorizeRoles } from "../middleware/auth.js";
 
 const router = express.Router();
-router.use(authenticateToken, authorizeRoles("warehouse", "manager", "admin"));
+router.use(authenticateToken, authorizeRoles("shipping_manager", "installation_manager", "admin"));
 
 // Same latin1-passthrough workaround as followUp.js — only applies the
 // re-decoded value if it actually looks like Arabic, so it can't corrupt

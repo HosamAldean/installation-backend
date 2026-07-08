@@ -51,7 +51,7 @@ router.get('/me', requireAuth, async (req, res) => {
 ---------------------------------- */
 router.get('/', requireAuth, async (req, res) => {
     try {
-        if (!['admin', 'manager'].includes(req.user.role))
+        if (!['admin', 'installation_manager'].includes(req.user.role))
             return res.status(403).json({ success: false, message: 'Forbidden' });
 
         // Was silently ignored — a duplicate, dead GET '/' handler further

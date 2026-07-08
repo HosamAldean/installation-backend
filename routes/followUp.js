@@ -293,7 +293,7 @@ async function resolveTeamIdForUser(reqUser) {
 // Managers/admins are allowed through since they legitimately act on
 // behalf of any team from the web dashboard.
 async function assertOwnsStep(reqUser, stepId) {
-    if (reqUser.role === 'manager' || reqUser.role === 'admin') return true;
+    if (reqUser.role === 'installation_manager' || reqUser.role === 'admin') return true;
     const [stepTeamId, userTeamId] = await Promise.all([
         resolveTeamId(stepId),
         resolveTeamIdForUser(reqUser),
@@ -620,7 +620,7 @@ router.post("/team/checkpoint", authenticateToken, async (req, res) => {
 /** ------------------------
  * GET Live Team Locations
  * ------------------------ */
-router.get('/team/locations', authenticateToken, authorizeRoles('manager', 'admin'), async (req, res) => {
+router.get('/team/locations', authenticateToken, authorizeRoles('installation_manager', 'admin'), async (req, res) => {
     try {
         // Return latest row per team with team info (optimized for MySQL/MariaDB)
         const rows = await sequelize2.query(
@@ -650,7 +650,7 @@ router.get('/team/locations', authenticateToken, authorizeRoles('manager', 'admi
  * indicator — a team is online if any of its logged-in members currently
  * has isOnline=true (set on login, cleared on explicit logout).
  */
-router.get('/team/online-status', authenticateToken, authorizeRoles('manager', 'admin'), async (req, res) => {
+router.get('/team/online-status', authenticateToken, authorizeRoles('installation_manager', 'admin'), async (req, res) => {
     try {
         // InsUser.teamId is stale/unreliable (the JWT deliberately omits it —
         // see auth.js login) — the real team is resolved the same way every
@@ -682,7 +682,7 @@ router.get('/team/online-status', authenticateToken, authorizeRoles('manager', '
  * GET history for a team
  * Returns last N pings for team_id ordered by ping_time asc (for proper path drawing)
  */
-router.get('/team/history/:teamId', authenticateToken, authorizeRoles('manager', 'admin'), async (req, res) => {
+router.get('/team/history/:teamId', authenticateToken, authorizeRoles('installation_manager', 'admin'), async (req, res) => {
     try {
         const teamId = parseInt(req.params.teamId, 10);
         if (!teamId) return res.status(400).json({ success: false, message: 'teamId required' });
@@ -713,7 +713,7 @@ router.get("/my-orders/:orderId/last-checkpoint", authenticateToken, async (req,
     try {
         const { orderId } = req.params;
 
-        if (req.user.role !== 'manager' && req.user.role !== 'admin') {
+        if (req.user.role !== 'installation_manager' && req.user.role !== 'admin') {
             const [order] = await sequelize2.query(
                 `SELECT team_id FROM IIT_Petra.instOrders WHERE id = :orderId LIMIT 1`,
                 { replacements: { orderId }, type: QueryTypes.SELECT }
@@ -1185,7 +1185,7 @@ router.post("/location", authenticateToken, async (req, res) => {
  * the same team+order, and counts installation steps completed by that
  * team's members while on-site during that visit.
  * ------------------------ */
-router.get('/reports/checkin-checkout', authenticateToken, authorizeRoles('manager', 'admin'), async (req, res) => {
+router.get('/reports/checkin-checkout', authenticateToken, authorizeRoles('installation_manager', 'admin'), async (req, res) => {
     try {
         // Team names read correctly via sequelize2, but the `project` table's
         // Arabic text needs the primary `sequelize` connection's latin1->UTF-8
@@ -1324,7 +1324,7 @@ router.get('/reports/checkin-checkout', authenticateToken, authorizeRoles('manag
  * (which step design/training tends to cause problems) and by team (which
  * teams report issues disproportionately).
  * ------------------------ */
-router.get('/reports/issues', authenticateToken, authorizeRoles('manager', 'admin'), async (req, res) => {
+router.get('/reports/issues', authenticateToken, authorizeRoles('installation_manager', 'admin'), async (req, res) => {
     try {
         // sequelize2 (not the primary sequelize connection) reads Arabic
         // text from instSteps correctly — same inconsistent per-table
@@ -1490,7 +1490,7 @@ async function fetchUnoByBarcodeChunked(pool, barcodes, selectCols) {
  * SQL Server (barcode -> UNO), so this requires bridging two separate
  * database engines rather than a single SQL join.
  * ------------------------ */
-router.get('/reports/delivery-lag', authenticateToken, authorizeRoles('manager', 'admin'), async (req, res) => {
+router.get('/reports/delivery-lag', authenticateToken, authorizeRoles('installation_manager', 'admin'), async (req, res) => {
     try {
         const delivered = await sequelize2.query(
             `SELECT Insbarcode, InsDeliverdDate FROM IIT_Petra.InsDelivered WHERE Insbarcode IS NOT NULL`,
@@ -1583,7 +1583,7 @@ router.get('/reports/delivery-lag', authenticateToken, authorizeRoles('manager',
  * consecutive step completions within the same item (ordered by
  * stepOrder) as a defensible proxy for how long each step actually took.
  * ------------------------ */
-router.get('/reports/standard-time-calibration', authenticateToken, authorizeRoles('manager', 'admin'), async (req, res) => {
+router.get('/reports/standard-time-calibration', authenticateToken, authorizeRoles('installation_manager', 'admin'), async (req, res) => {
     try {
         const { from, to } = req.query;
         const dateFilter = [];
@@ -1662,7 +1662,7 @@ router.get('/reports/standard-time-calibration', authenticateToken, authorizeRol
  * matching approach as /reports/delivery-lag), aggregated per project and
  * per team so a manager can see delivery completion at a glance.
  * ------------------------ */
-router.get('/reports/delivery-status', authenticateToken, authorizeRoles('manager', 'admin'), async (req, res) => {
+router.get('/reports/delivery-status', authenticateToken, authorizeRoles('installation_manager', 'admin'), async (req, res) => {
     try {
         // Team names read correctly via sequelize2 but not through the
         // primary `sequelize` connection used below for `project` (same
@@ -1765,7 +1765,7 @@ router.get('/reports/delivery-status', authenticateToken, authorizeRoles('manage
  * issues reported today. Accepts an optional ?date=YYYY-MM-DD to look at a
  * past day instead of today.
  * ------------------------ */
-router.get('/reports/daily-activity', authenticateToken, authorizeRoles('manager', 'admin'), async (req, res) => {
+router.get('/reports/daily-activity', authenticateToken, authorizeRoles('installation_manager', 'admin'), async (req, res) => {
     try {
         const dateParam = /^\d{4}-\d{2}-\d{2}$/.test(req.query?.date || '') ? req.query.date : null;
 

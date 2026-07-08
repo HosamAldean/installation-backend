@@ -10,7 +10,7 @@ router.get('/health', (req, res) => res.json({ ok: true }));
 // Dashboard stats — previously unauthenticated, exposing internal
 // user/team/project counts to any caller. Only called from the
 // manager/admin-gated Dashboard pages.
-router.get('/stats', authenticateToken, authorizeRoles('manager', 'admin'), async (req, res) => {
+router.get('/stats', authenticateToken, authorizeRoles('installation_manager', 'admin'), async (req, res) => {
     try {
         const [[{ userCount }]] = await sequelize.query(`SELECT COUNT(*) AS userCount FROM InsUser`);
         const [[{ teamCount }]] = await sequelize.query(`SELECT COUNT(*) AS teamCount FROM instTeams`);

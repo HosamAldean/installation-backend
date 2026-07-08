@@ -7,7 +7,7 @@ const router = express.Router();
 // (Basic_Salary / 240) to any caller with network access. Gate to
 // manager/admin like the rest of the employee/team-management surface.
 router.use(authenticateToken);
-router.use(authorizeRoles('manager', 'admin'));
+router.use(authorizeRoles('installation_manager', 'admin'));
 
 /**
  * ✅ GET /api/employees

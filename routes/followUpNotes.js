@@ -10,7 +10,7 @@ import { FollowUpNotes } from "../models/index.js";
 const router = express.Router();
 
 // POST /api/follow-up-notes  { issueId, note }
-router.post("/", authenticateToken, authorizeRoles("manager", "admin"), async (req, res) => {
+router.post("/", authenticateToken, authorizeRoles("installation_manager", "admin"), async (req, res) => {
     try {
         const { issueId, note } = req.body || {};
         if (!issueId) {
@@ -42,7 +42,7 @@ router.post("/", authenticateToken, authorizeRoles("manager", "admin"), async (r
 });
 
 // PATCH /api/follow-up-notes/:id/resolve  { resolved: true|false }
-router.patch("/:id/resolve", authenticateToken, authorizeRoles("manager", "admin"), async (req, res) => {
+router.patch("/:id/resolve", authenticateToken, authorizeRoles("installation_manager", "admin"), async (req, res) => {
     try {
         const note = await FollowUpNotes.findByPk(req.params.id);
         if (!note) return res.status(404).json({ success: false, message: "Note not found" });
@@ -62,7 +62,7 @@ router.patch("/:id/resolve", authenticateToken, authorizeRoles("manager", "admin
 });
 
 // DELETE /api/follow-up-notes/:id
-router.delete("/:id", authenticateToken, authorizeRoles("manager", "admin"), async (req, res) => {
+router.delete("/:id", authenticateToken, authorizeRoles("installation_manager", "admin"), async (req, res) => {
     try {
         const deleted = await FollowUpNotes.destroy({ where: { id: req.params.id } });
         if (!deleted) return res.status(404).json({ success: false, message: "Note not found" });

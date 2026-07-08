@@ -9,7 +9,7 @@ const router = express.Router();
 // anyone with network access. The frontend (EmployeeCardPage.tsx) is already
 // gated to manager/admin via RoleProtectedRoute — mirror that here.
 router.use(authenticateToken);
-router.use(authorizeRoles('manager', 'admin'));
+router.use(authorizeRoles('installation_manager', 'admin'));
 
 /** -------------------------------------------------------
  *  🔧 Arabic Auto-Recovery (Fix double-encoded UTF-8 text)

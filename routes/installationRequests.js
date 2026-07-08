@@ -11,7 +11,7 @@ const router = express.Router();
 // already gated to manager/admin via RoleProtectedRoute — mirror that here
 // so it can't be bypassed by calling the API directly, matching instOrders.js.
 router.use(authenticateToken);
-router.use(authorizeRoles('manager', 'admin'));
+router.use(authorizeRoles('installation_manager', 'admin'));
 
 /** -------------------------------------------------------
  *  🔧 Arabic Auto-Recovery (Fix double-encoded UTF-8 text)

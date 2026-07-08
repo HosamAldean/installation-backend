@@ -11,7 +11,7 @@ const router = express.Router();
 // already gates to manager/admin (see router.tsx) — this mirrors that same
 // restriction on the backend so it can't be bypassed by calling the API directly.
 router.use(authenticateToken);
-router.use(authorizeRoles('manager', 'admin'));
+router.use(authorizeRoles('installation_manager', 'admin'));
 
 const ARABIC_RE = /[اأإآابتثجحخدذرزسشصضطظعغفقكلمنهوي]/;
 const fixArabic = (str) => {

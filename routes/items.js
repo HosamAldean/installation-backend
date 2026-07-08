@@ -30,7 +30,7 @@ router.get('/:id', authenticateToken, async (req, res) => {
 
 
 // Create item (admin or manager)
-router.post('/', authenticateToken, authorizeRoles('admin', 'manager'), async (req, res) => {
+router.post('/', authenticateToken, authorizeRoles('admin', 'installation_manager'), async (req, res) => {
     const { code, name, description, qty } = req.body;
     if (!code || !String(code).trim() || !name || !String(name).trim()) {
         return res.status(400).json({ message: 'code and name are required' });
@@ -57,7 +57,7 @@ router.post('/', authenticateToken, authorizeRoles('admin', 'manager'), async (r
 
 
 // Update item
-router.put('/:id', authenticateToken, authorizeRoles('admin', 'manager'), async (req, res) => {
+router.put('/:id', authenticateToken, authorizeRoles('admin', 'installation_manager'), async (req, res) => {
     const item = await Item.findByPk(req.params.id);
     if (!item) return res.status(404).json({ message: 'Not found' });
 
