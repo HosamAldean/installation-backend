@@ -27,7 +27,7 @@ import { getSqlPool } from "../config/db.js";
 import { authenticateToken, authorizeRoles } from "../middleware/auth.js";
 
 const router = express.Router();
-router.use(authenticateToken, authorizeRoles("shipping_manager", "installation_manager", "admin"));
+router.use(authenticateToken, authorizeRoles("shipping_manager", "admin"));
 
 // Matches the Access VBA's ItemNOC sub (M1 module): barcode = 2-digit year +
 // last 4 digits of orderNo + 4-digit zero-padded serialNo, all concatenated
