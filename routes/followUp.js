@@ -316,15 +316,22 @@ async function upsertTeamLocation(teamId, lat, lng) {
         { replacements: { team_id: teamId }, type: QueryTypes.SELECT }
     );
     if (!teamExists.length) return;
+    // UTC_TIMESTAMP(), not CURRENT_TIMESTAMP/NOW() — this MySQL server's
+    // SYSTEM timezone is UTC+3 (confirmed live), and mysql2 reads DATETIME
+    // columns back as naive UTC with no conversion. A local-time
+    // ping_time would appear ~3 hours ahead of true Date.now() on the
+    // frontend, which computes isOnline/isIdle as (now - lastPing) — a
+    // team that actually went quiet up to ~3 hours ago could still show a
+    // negative/near-zero elapsed time and read as perpetually active.
     await sequelize2.query(
         `
         INSERT INTO IIT_Petra.instTeamLocations
-        (team_id, latitude, longitude)
-        VALUES (:team_id, :lat, :lng)
+        (team_id, latitude, longitude, ping_time)
+        VALUES (:team_id, :lat, :lng, UTC_TIMESTAMP())
         ON DUPLICATE KEY UPDATE
             latitude = VALUES(latitude),
             longitude = VALUES(longitude),
-            ping_time = CURRENT_TIMESTAMP;
+            ping_time = UTC_TIMESTAMP();
         `,
         { replacements: { team_id: teamId, lat, lng }, type: QueryTypes.INSERT }
     );
@@ -617,11 +624,18 @@ router.post("/team/checkpoint", authenticateToken, async (req, res) => {
         }
 
         // Insert checkpoint
+        // UTC_TIMESTAMP(), not NOW() — this MySQL server's SYSTEM timezone
+        // is UTC+3 (confirmed live), and mysql2 reads DATETIME columns back
+        // as naive UTC with no conversion applied. NOW() here would silently
+        // bake in a 3-hour-ahead skew for every checkpoint, which the
+        // frontend's field-news feed (built on real Date.now() UTC math)
+        // would then read as "3 hours more recent than it really was" —
+        // wrong "time ago" display and a ~51h instead of 48h expiry.
         await sequelize2.query(
             `
             INSERT INTO IIT_Petra.instTeamCheckpoints
             (team_id, user_id, order_id, checkpoint_type, latitude, longitude, notes, createdAt, updatedAt)
-            VALUES (:team_id, :user_id, :order_id, :checkpoint_type, :latitude, :longitude, :notes, NOW(), NOW())
+            VALUES (:team_id, :user_id, :order_id, :checkpoint_type, :latitude, :longitude, :notes, UTC_TIMESTAMP(), UTC_TIMESTAMP())
             `,
             {
                 replacements: {
