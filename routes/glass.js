@@ -580,4 +580,158 @@ router.post("/orders/:orderNo/bills", async (req, res) => {
     }
 });
 
+// GET /api/glass/reports/status?dateFrom=&dateTo=&projNo= — per-order
+// received-vs-ordered breakdown, for a production-status overview.
+router.get("/reports/status", async (req, res) => {
+    try {
+        const { dateFrom, dateTo, projNo } = req.query;
+        const pool = await getSqlPool("glass");
+        const request = pool.request();
+        const conditions = [];
+        if (dateFrom) { request.input("dateFrom", dateFrom); conditions.push("o.oderDate >= @dateFrom"); }
+        if (dateTo) { request.input("dateTo", dateTo); conditions.push("o.oderDate <= @dateTo"); }
+        if (projNo) { request.input("projNo", `%${projNo}%`); conditions.push("o.projNo LIKE @projNo"); }
+        const whereClause = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+
+        const result = await request.query(`
+            SELECT
+                o.orderNo, o.projNo, o.projName, o.projMgr, o.oderDate,
+                ISNULL(lines.totalQty, 0) AS totalQty,
+                ISNULL(received.totalReceived, 0) AS totalReceived,
+                ISNULL(lines.lineCount, 0) AS lineCount,
+                ISNULL(fullyReceived.cnt, 0) AS fullyReceivedLines
+            FROM Sorders o
+            LEFT JOIN (
+                SELECT orderNo, SUM(qty) AS totalQty, COUNT(*) AS lineCount
+                FROM Sorderdetails GROUP BY orderNo
+            ) lines ON lines.orderNo = o.orderNo
+            LEFT JOIN (
+                SELECT OrderNo, SUM(QTYIN) AS totalReceived
+                FROM SSTOCK GROUP BY OrderNo
+            ) received ON received.OrderNo = o.orderNo
+            LEFT JOIN (
+                SELECT d.orderNo, COUNT(*) AS cnt
+                FROM Sorderdetails d
+                LEFT JOIN SSTOCK s ON s.OrderNo = d.orderNo AND s.SerialNo = d.serialNo
+                WHERE ISNULL(s.QTYIN, 0) >= d.qty
+                GROUP BY d.orderNo
+            ) fullyReceived ON fullyReceived.orderNo = o.orderNo
+            ${whereClause}
+            ORDER BY o.orderNo DESC
+        `);
+
+        const orders = result.recordset.map(row => ({
+            ...row,
+            pctReceived: row.totalQty > 0 ? Math.round((row.totalReceived / row.totalQty) * 100) : 0,
+        }));
+
+        const totals = orders.reduce((acc, o) => ({
+            totalQty: acc.totalQty + o.totalQty,
+            totalReceived: acc.totalReceived + o.totalReceived,
+            orderCount: acc.orderCount + 1,
+            fullyReceivedOrders: acc.fullyReceivedOrders + (o.lineCount > 0 && o.fullyReceivedLines >= o.lineCount ? 1 : 0),
+        }), { totalQty: 0, totalReceived: 0, orderCount: 0, fullyReceivedOrders: 0 });
+
+        res.json({ success: true, orders, totals });
+    } catch (err) {
+        console.error("❌ GLASS STATUS REPORT ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to fetch status report" });
+    }
+});
+
+// GET /api/glass/reports/billing?dateFrom=&dateTo=&projNo= — computed
+// (priced-but-maybe-not-yet-invoiced) totals vs. actually invoiced (SBill)
+// totals, grouped by project, so outstanding-to-invoice stands out.
+router.get("/reports/billing", async (req, res) => {
+    try {
+        const { dateFrom, dateTo, projNo } = req.query;
+        const pool = await getSqlPool("glass");
+
+        const itemsRequest = pool.request();
+        const itemConditions = ["d.price IS NOT NULL"];
+        if (dateFrom) { itemsRequest.input("dateFrom", dateFrom); itemConditions.push("o.oderDate >= @dateFrom"); }
+        if (dateTo) { itemsRequest.input("dateTo", dateTo); itemConditions.push("o.oderDate <= @dateTo"); }
+        if (projNo) { itemsRequest.input("projNo", `%${projNo}%`); itemConditions.push("o.projNo LIKE @projNo"); }
+        const itemsResult = await itemsRequest.query(`
+            SELECT o.orderNo, o.projNo, o.projName,
+                   d.height, d.width, d.qty, d.spacer, d.intype, d.outtype,
+                   d.price, d.price1, d.plusCost, d.pricingType
+            FROM Sorderdetails d
+            JOIN Sorders o ON o.orderNo = d.orderNo
+            WHERE ${itemConditions.join(" AND ")}
+        `);
+
+        const billsRequest = pool.request();
+        const billConditions = [];
+        if (dateFrom) { billsRequest.input("dateFrom", dateFrom); billConditions.push("b.DateEnter >= @dateFrom"); }
+        if (dateTo) { billsRequest.input("dateTo", dateTo); billConditions.push("b.DateEnter <= @dateTo"); }
+        if (projNo) { billsRequest.input("projNo", `%${projNo}%`); billConditions.push("o.projNo LIKE @projNo"); }
+        const billsWhereClause = billConditions.length ? `WHERE ${billConditions.join(" AND ")}` : "";
+        const billsResult = await billsRequest.query(`
+            SELECT o.projNo, o.projName, SUM(b.Price) AS invoicedTotal, COUNT(*) AS billCount
+            FROM SBill b
+            JOIN Sorders o ON o.orderNo = b.orderNo
+            ${billsWhereClause}
+            GROUP BY o.projNo, o.projName
+        `);
+
+        const byProject = new Map();
+        itemsResult.recordset.forEach(row => {
+            const key = row.projNo;
+            const { totalPU } = computeBilling(row);
+            const entry = byProject.get(key) || { projNo: row.projNo, projName: row.projName, computedTotal: 0, invoicedTotal: 0, billCount: 0 };
+            entry.computedTotal = round3(entry.computedTotal + totalPU);
+            byProject.set(key, entry);
+        });
+        billsResult.recordset.forEach(row => {
+            const key = row.projNo;
+            const entry = byProject.get(key) || { projNo: row.projNo, projName: row.projName, computedTotal: 0, invoicedTotal: 0, billCount: 0 };
+            entry.invoicedTotal = round3(row.invoicedTotal || 0);
+            entry.billCount = row.billCount;
+            byProject.set(key, entry);
+        });
+
+        const projects = Array.from(byProject.values())
+            .map(p => ({ ...p, outstanding: round3(p.computedTotal - p.invoicedTotal) }))
+            .sort((a, b) => b.computedTotal - a.computedTotal);
+
+        const totals = projects.reduce((acc, p) => ({
+            computedTotal: round3(acc.computedTotal + p.computedTotal),
+            invoicedTotal: round3(acc.invoicedTotal + p.invoicedTotal),
+            outstanding: round3(acc.outstanding + p.outstanding),
+        }), { computedTotal: 0, invoicedTotal: 0, outstanding: 0 });
+
+        res.json({ success: true, projects, totals });
+    } catch (err) {
+        console.error("❌ GLASS BILLING REPORT ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to fetch billing report" });
+    }
+});
+
+// GET /api/glass/reports/overdue — items past their expected date and not
+// yet fully received.
+router.get("/reports/overdue", async (req, res) => {
+    try {
+        const pool = await getSqlPool("glass");
+        const result = await pool.request().query(`
+            SELECT
+                d.orderNo, d.serialNo, d.itemNo, d.qty, d.expectdate, d.barcode,
+                o.projNo, o.projName, o.projMgr,
+                ISNULL(s.QTYIN, 0) AS receivedQty,
+                DATEDIFF(day, d.expectdate, GETDATE()) AS daysOverdue
+            FROM Sorderdetails d
+            JOIN Sorders o ON o.orderNo = d.orderNo
+            LEFT JOIN SSTOCK s ON s.OrderNo = d.orderNo AND s.SerialNo = d.serialNo
+            WHERE d.expectdate IS NOT NULL
+              AND d.expectdate < GETDATE()
+              AND ISNULL(s.QTYIN, 0) < d.qty
+            ORDER BY d.expectdate ASC
+        `);
+        res.json({ success: true, items: result.recordset });
+    } catch (err) {
+        console.error("❌ GLASS OVERDUE REPORT ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to fetch overdue report" });
+    }
+});
+
 export default router;
