@@ -830,7 +830,43 @@ router.get('/assigned', async (req, res) => {
             projectName: fixArabic(c.projectName),
         }));
 
-        res.json({ success: true, data: { orders, teams, checkpoints } });
+        // 9️⃣ Fetch recent step-status-update history (last 48 hours) so
+        // Field News's "update"/"completed" entries survive a page
+        // refresh — they used to exist only as in-memory deltas detected
+        // live by detectChanges() on the frontend, so refreshing (or a
+        // dashboard that wasn't open at the time) lost them for good,
+        // unlike checkpoints above which are always re-queried fresh.
+        // Deliberately only fetches the raw facts (which step, what
+        // status, when) — item/project/team display labels are resolved
+        // by the frontend from `orders`/`teams` above (the same data
+        // detectChanges() already uses for live-detected entries), since
+        // this item's masterControl-sourced itemName/projectName hit a
+        // separate, pre-existing mojibake issue that a naive fixArabic()
+        // pass here corrupts further rather than fixes.
+        const rawStepUpdates = await sequelize2.query(
+            `SELECT u.id,
+                    u.instOrderStepId AS stepId,
+                    u.status,
+                    u.problem_note AS note,
+                    u.image_after,
+                    u.image_before,
+                    u.createdAt,
+                    s.instOrderItemId,
+                    stepDef.stepName
+             FROM IIT_Petra.instOrderStepUpdates u
+             JOIN IIT_Petra.instOrderSteps s ON s.id = u.instOrderStepId
+             JOIN IIT_Petra.instSteps stepDef ON stepDef.instStepId = s.instStepId
+             WHERE u.createdAt >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 48 HOUR)
+             ORDER BY u.createdAt DESC`,
+            { type: QueryTypes.SELECT }
+        );
+
+        const recentStepUpdates = (Array.isArray(rawStepUpdates) ? rawStepUpdates : []).map((u) => ({
+            ...u,
+            stepName: fixArabic(u.stepName),
+        }));
+
+        res.json({ success: true, data: { orders, teams, checkpoints, recentStepUpdates } });
 
     } catch (err) {
         console.error("❌ FETCH ASSIGNED ORDERS ERROR:", err);
