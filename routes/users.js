@@ -33,6 +33,7 @@ router.get('/me', requireAuth, async (req, res) => {
                 'role',
                 'avatarUrl',
                 'teamId',
+                'assignedStore',
                 'active'
             ]
         });
@@ -84,6 +85,7 @@ router.get('/', requireAuth, async (req, res) => {
                 'email',
                 'role',
                 'teamId',
+                'assignedStore',
                 'active',
                 'createdAt'
             ],
@@ -105,7 +107,7 @@ router.get('/', requireAuth, async (req, res) => {
 // CREATE user (Admin)
 router.post('/', requireAuth, requireAdmin, async (req, res) => {
     try {
-        const { empNo, role = 'user', teamId: bodyTeamId, password: bodyPassword } = req.body;
+        const { empNo, role = 'user', teamId: bodyTeamId, password: bodyPassword, assignedStore } = req.body;
 
         let username, firstName, lastName, email, password, teamId;
 
@@ -171,6 +173,7 @@ router.post('/', requireAuth, requireAdmin, async (req, res) => {
             role,
             teamId,
             assignedEmpNo: empNo ? String(empNo) : null,
+            assignedStore: assignedStore ? Number(assignedStore) : null,
             active: true,
         });
 
@@ -203,6 +206,7 @@ router.patch('/:id', requireAuth, async (req, res) => {
             avatarUrl,
             role,
             teamId,
+            assignedStore,
             active
         } = req.body;
 
@@ -215,6 +219,7 @@ router.patch('/:id', requireAuth, async (req, res) => {
         if (req.user.role === 'admin') {
             if (role !== undefined) user.role = role;
             if (teamId !== undefined) user.teamId = teamId;
+            if (assignedStore !== undefined) user.assignedStore = assignedStore === null ? null : Number(assignedStore);
             if (active !== undefined) user.active = active;
         }
 

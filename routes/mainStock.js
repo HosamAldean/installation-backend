@@ -236,28 +236,42 @@ router.get("/projects/:projNo/items", async (req, res) => {
     }
 });
 
-// GET /api/main-stock/stock-summary?search=&onlyRemaining=true
+// GET /api/main-stock/stock-summary?search=&onlyRemaining=true&category=
 // Project-level rollup (total ordered / shipped / remaining) — the
 // equivalent of the Access app's QALLR printable report. Unlike the
 // original, which excludes already-fully-shipped Stock rows from the sums
 // entirely (a quirk that under-counts a project's true total once any of
 // its items finish shipping), this sums every item for the project first
 // and only then optionally hides projects with nothing left to ship.
+//
+// Grouped by category (o.C) as well as project — previously this blended
+// Aluminum/Glass/Steel-Wood into one row per project with no way to tell
+// them apart, which became misleading once Glass/Iron auto-sync started
+// mixing categories under the same project automatically (see
+// backend/utils/minStockSync.js). A project with material in more than one
+// category now surfaces as one row per category, and an optional
+// ?category= filter narrows to a single one.
 router.get("/stock-summary", async (req, res) => {
     try {
         const search = String(req.query.search || "").trim();
         const onlyRemaining = req.query.onlyRemaining !== "false";
+        const category = req.query.category !== undefined && req.query.category !== "" ? parseInt(req.query.category, 10) : null;
 
         const pool = await getSqlPool("minstock");
         const request = pool.request();
-        let whereClause = "";
+        const whereParts = [];
         if (search) {
             request.input("search", `%${search}%`);
-            whereClause = "WHERE (o.projName LIKE @search OR o.projNo LIKE @search)";
+            whereParts.push("(o.projName LIKE @search OR o.projNo LIKE @search)");
         }
+        if (Number.isInteger(category)) {
+            request.input("category", category);
+            whereParts.push("o.C = @category");
+        }
+        const whereClause = whereParts.length ? `WHERE ${whereParts.join(" AND ")}` : "";
 
         const result = await request.query(`
-            SELECT o.projNo, o.projName,
+            SELECT o.projNo, MAX(o.projName) AS projName, o.C AS category,
                    SUM(s.QTY) AS totalQty,
                    SUM(ISNULL(shipped.total, 0)) AS totalShipped,
                    SUM(s.QTY) - SUM(ISNULL(shipped.total, 0)) AS remaining
@@ -269,7 +283,7 @@ router.get("/stock-summary", async (req, res) => {
                 GROUP BY orderNo, serialNo
             ) shipped ON shipped.orderNo = s.orderNo AND shipped.serialNo = s.serialNo
             ${whereClause}
-            GROUP BY o.projNo, o.projName
+            GROUP BY o.projNo, o.C
             ${onlyRemaining ? "HAVING SUM(s.QTY) - SUM(ISNULL(shipped.total, 0)) <> 0" : ""}
             ORDER BY o.projNo DESC
         `);
@@ -281,26 +295,37 @@ router.get("/stock-summary", async (req, res) => {
     }
 });
 
-// GET /api/main-stock/shipments/projects?search=
+// GET /api/main-stock/shipments/projects?search=&category=
 // Project-level shipment totals from the permanent `out` log — level 1 of
 // the Access app's XOUT -> X1OUT -> OUT shipment-history drill-down.
+//
+// Grouped by category (s.C, from the STOCKO header the shipment's orderNo
+// belongs to) as well as project, same reasoning as /stock-summary above —
+// a project shipped in more than one category now surfaces as one row per
+// category instead of a blended total.
 router.get("/shipments/projects", async (req, res) => {
     try {
         const search = String(req.query.search || "").trim();
+        const category = req.query.category !== undefined && req.query.category !== "" ? parseInt(req.query.category, 10) : null;
         const pool = await getSqlPool("minstock");
         const request = pool.request();
-        let whereClause = "";
+        const whereParts = [];
         if (search) {
             request.input("search", `%${search}%`);
-            whereClause = "WHERE (s.projName LIKE @search OR o.projNo LIKE @search)";
+            whereParts.push("(s.projName LIKE @search OR o.projNo LIKE @search)");
         }
+        if (Number.isInteger(category)) {
+            request.input("category", category);
+            whereParts.push("s.C = @category");
+        }
+        const whereClause = whereParts.length ? `WHERE ${whereParts.join(" AND ")}` : "";
 
         const result = await request.query(`
-            SELECT o.projNo, MAX(s.projName) AS projName, SUM(o.OUTQTY) AS totalShipped
+            SELECT o.projNo, MAX(s.projName) AS projName, s.C AS category, SUM(o.OUTQTY) AS totalShipped
             FROM [out] o
             LEFT JOIN STOCKO s ON s.orderNo = o.orderNo
             ${whereClause}
-            GROUP BY o.projNo
+            GROUP BY o.projNo, s.C
             ORDER BY o.projNo DESC
         `);
 
@@ -311,22 +336,30 @@ router.get("/shipments/projects", async (req, res) => {
     }
 });
 
-// GET /api/main-stock/shipments/projects/:projNo/production-numbers
+// GET /api/main-stock/shipments/projects/:projNo/production-numbers?category=
 // Level 2 of the drill-down — shipment totals per production number within
-// a project.
+// a project. Optional ?category= (carried over from the level-1 row the
+// user clicked) keeps the drill-down scoped to the same category rather
+// than re-blending Aluminum/Glass/Steel-Wood back together one level down.
 router.get("/shipments/projects/:projNo/production-numbers", async (req, res) => {
     try {
         const projNo = req.params.projNo;
+        const category = req.query.category !== undefined && req.query.category !== "" ? parseInt(req.query.category, 10) : null;
         const pool = await getSqlPool("minstock");
-        const result = await pool.request()
-            .input("projNo", projNo)
-            .query(`
-                SELECT ProdctionNO, SUM(OUTQTY) AS totalShipped
-                FROM [out]
-                WHERE projNo = @projNo
-                GROUP BY ProdctionNO
-                ORDER BY ProdctionNO
-            `);
+        const request = pool.request().input("projNo", projNo);
+        let categoryClause = "";
+        if (Number.isInteger(category)) {
+            request.input("category", category);
+            categoryClause = "AND s.C = @category";
+        }
+        const result = await request.query(`
+            SELECT o.ProdctionNO, SUM(o.OUTQTY) AS totalShipped
+            FROM [out] o
+            LEFT JOIN STOCKO s ON s.orderNo = o.orderNo
+            WHERE o.projNo = @projNo ${categoryClause}
+            GROUP BY o.ProdctionNO
+            ORDER BY o.ProdctionNO
+        `);
         res.json({ success: true, productionNumbers: result.recordset });
     } catch (err) {
         console.error("❌ MAIN STOCK SHIPMENT PRODUCTION NUMBERS ERROR:", err);
@@ -334,22 +367,28 @@ router.get("/shipments/projects/:projNo/production-numbers", async (req, res) =>
     }
 });
 
-// GET /api/main-stock/shipments/projects/:projNo/:productionNo/log
+// GET /api/main-stock/shipments/projects/:projNo/:productionNo/log?category=
 // Level 3 of the drill-down — the individual shipment log entries (the
-// Access app's OUT form), one row per item per shipment batch.
+// Access app's OUT form), one row per item per shipment batch. Same
+// category scoping as level 2.
 router.get("/shipments/projects/:projNo/:productionNo/log", async (req, res) => {
     try {
         const { projNo, productionNo } = req.params;
+        const category = req.query.category !== undefined && req.query.category !== "" ? parseInt(req.query.category, 10) : null;
         const pool = await getSqlPool("minstock");
-        const result = await pool.request()
-            .input("projNo", projNo)
-            .input("productionNo", productionNo)
-            .query(`
-                SELECT A, orderNo, serialNo, Prodc, UNO, OUTQTY, Note, DATEO, BNO, FNO, DRIVER, barcode
-                FROM [out]
-                WHERE projNo = @projNo AND ProdctionNO = @productionNo
-                ORDER BY DATEO DESC, A DESC
-            `);
+        const request = pool.request().input("projNo", projNo).input("productionNo", productionNo);
+        let categoryClause = "";
+        if (Number.isInteger(category)) {
+            request.input("category", category);
+            categoryClause = "AND s.C = @category";
+        }
+        const result = await request.query(`
+            SELECT o.A, o.orderNo, o.serialNo, o.Prodc, o.UNO, o.OUTQTY, o.Note, o.DATEO, o.BNO, o.FNO, o.DRIVER, o.barcode
+            FROM [out] o
+            LEFT JOIN STOCKO s ON s.orderNo = o.orderNo
+            WHERE o.projNo = @projNo AND o.ProdctionNO = @productionNo ${categoryClause}
+            ORDER BY o.DATEO DESC, o.A DESC
+        `);
         res.json({ success: true, log: result.recordset });
     } catch (err) {
         console.error("❌ MAIN STOCK SHIPMENT LOG ERROR:", err);
@@ -670,27 +709,52 @@ router.post("/orders", async (req, res) => {
         transaction = pool.transaction();
         await transaction.begin();
 
-        // orderNo is an identity column — let SQL Server generate it rather
-        // than computing MAX()+1 ourselves (confirmed live: manually
-        // supplying it fails with "Cannot insert explicit value for
-        // identity column").
-        const insertResult = await transaction.request()
-            .input("projName", projName || null)
+        // Reuse an existing STOCKO header for the same projNo+ProdctionNO+C
+        // instead of always inserting a new one — matches the auto-sync
+        // path's own findOrCreateStocko() behavior (minStockSync.js).
+        // Without this, a worker manually creating an order for a
+        // project/production/category that already has material logged
+        // (whether from an earlier manual entry or an auto-synced Glass/
+        // Iron item) would silently split that project's stock into two
+        // separate headers.
+        const existingResult = await transaction.request()
             .input("projNo", projNo)
-            .input("additional", additional || null)
             .input("ProdctionNO", ProdctionNO)
-            .input("projMgr", projMgr || null)
-            .input("Worker", Worker || null)
             .input("C", parseInt(C))
             .query(`
-                INSERT INTO STOCKO (projName, projNo, additional, ProdctionNO, projMgr, Worker, C, Date)
-                OUTPUT INSERTED.orderNo
-                VALUES (@projName, @projNo, @additional, @ProdctionNO, @projMgr, @Worker, @C, GETDATE())
+                SELECT TOP 1 orderNo FROM STOCKO
+                WHERE projNo = @projNo AND ProdctionNO = @ProdctionNO AND C = @C
+                ORDER BY orderNo DESC
             `);
-        const orderNo = insertResult.recordset[0].orderNo;
+
+        let orderNo;
+        let existing = false;
+        if (existingResult.recordset[0]) {
+            orderNo = existingResult.recordset[0].orderNo;
+            existing = true;
+        } else {
+            // orderNo is an identity column — let SQL Server generate it
+            // rather than computing MAX()+1 ourselves (confirmed live:
+            // manually supplying it fails with "Cannot insert explicit
+            // value for identity column").
+            const insertResult = await transaction.request()
+                .input("projName", projName || null)
+                .input("projNo", projNo)
+                .input("additional", additional || null)
+                .input("ProdctionNO", ProdctionNO)
+                .input("projMgr", projMgr || null)
+                .input("Worker", Worker || null)
+                .input("C", parseInt(C))
+                .query(`
+                    INSERT INTO STOCKO (projName, projNo, additional, ProdctionNO, projMgr, Worker, C, Date)
+                    OUTPUT INSERTED.orderNo
+                    VALUES (@projName, @projNo, @additional, @ProdctionNO, @projMgr, @Worker, @C, GETDATE())
+                `);
+            orderNo = insertResult.recordset[0].orderNo;
+        }
 
         await transaction.commit();
-        res.json({ success: true, orderNo });
+        res.json({ success: true, orderNo, existing });
     } catch (err) {
         if (transaction) { try { await transaction.rollback(); } catch { /* already rolled back */ } }
         console.error("❌ MAIN STOCK CREATE ORDER ERROR:", err);

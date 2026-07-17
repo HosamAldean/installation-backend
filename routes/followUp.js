@@ -764,12 +764,31 @@ router.get("/scan-basic/:barcode", authenticateToken, async (req, res) => {
             });
         }
 
+        // out.barcode is a numeric column (orderNo+serialNo, same as
+        // Stock.barcode in mainStock.js) — passing the raw string param
+        // here relied on SQL Server's implicit varchar->int conversion,
+        // which throws (caught below as a generic 500/"ERROR") instead of
+        // a clean NOT_FOUND for anything scanned that isn't a pure digit
+        // string (e.g. a QR/DataMatrix code, which this screen's scanner
+        // also accepts). mainStock.js and glass.js both parseInt() before
+        // querying for the same reason — match that here.
+        const cleanBarcode = parseInt(barcode, 10);
+        if (!Number.isInteger(cleanBarcode)) {
+            return res.json({
+                success: true,
+                status: "NOT_FOUND",
+                stock: null,
+                hireNote: "Item not found in warehouse",
+                canConfirm: false
+            });
+        }
+
         const empNo = req.user.assignedEmpNo;
 
         const pool = await getSqlPool("minstock");
 
         const stockResult = await pool.request()
-            .input("barcode", barcode)
+            .input("barcode", cleanBarcode)
             .query(`
                 SELECT TOP 1 *
                 FROM out
@@ -1039,7 +1058,16 @@ router.get('/delivered-items', authenticateToken, async (req, res) => {
    HELPER: shared delivery confirmation logic
 ================================================================ */
 async function confirmDeliveryLogic(barcode, note, empNo, status = 'DELIVERED', photoUrl = null) {
-    const cleanBarcode = String(barcode).trim();
+    // out.barcode is numeric (see the parseInt in /scan-basic above and in
+    // mainStock.js/glass.js) — comparing it against a varchar param relies
+    // on an implicit SQL-side conversion that throws for non-numeric input
+    // instead of a clean "not found".
+    const cleanBarcode = parseInt(String(barcode).trim(), 10);
+    if (!Number.isInteger(cleanBarcode)) {
+        const err = new Error("Barcode not found");
+        err.statusCode = 404;
+        throw err;
+    }
     const pool = await getSqlPool("minstock");
 
     const stockResult = await pool.request()

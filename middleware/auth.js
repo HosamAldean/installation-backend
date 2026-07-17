@@ -23,6 +23,7 @@ export const authenticateToken = (req, res, next) => {
             role: payload.role,
          //   teamId: payload.teamId || null,
             assignedEmpNo: payload.assignedEmpNo || null, // ✅ single source
+            assignedStore: payload.assignedStore ?? null,
         };
 
         next();

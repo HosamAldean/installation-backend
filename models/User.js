@@ -60,6 +60,15 @@ export const User = sequelize2.define(
             field: 'assignedEmpNo', // DB column
         },
 
+        // Stock House store scope (301/302/303) for material_user accounts —
+        // null means admin/all-store access. Replaces the legacy Access
+        // app's hardcoded per-username store branch.
+        assignedStore: {
+            type: DataTypes.INTEGER,
+            allowNull: true,
+            field: 'assignedStore',
+        },
+
         // ✅ Team mapping
         teamId: {
             type: DataTypes.INTEGER,

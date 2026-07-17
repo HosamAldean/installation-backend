@@ -25,19 +25,26 @@
 import express from "express";
 import { getSqlPool } from "../config/db.js";
 import { authenticateToken, authorizeRoles } from "../middleware/auth.js";
+import { pushFinishedUnitToMinStock } from "../utils/minStockSync.js";
 
 const router = express.Router();
 router.use(authenticateToken, authorizeRoles("shipping_manager", "admin"));
 
 // Matches the Access VBA's ItemNOC sub (M1 module): barcode = 2-digit year +
-// last 4 digits of orderNo + 4-digit zero-padded serialNo, all concatenated
-// then stored as an int (confirmed against live data — Sorderdetails.barcode
-// is an int column).
+// last 4 digits of orderNo + serialNo, all concatenated then stored as an
+// int. Confirmed against real live rows (e.g. orderNo 323123/serialNo 3 ->
+// barcode 2631233 = "26"+"3123"+"3"), which settled an internal
+// contradiction: an earlier version of this function zero-padded serialNo
+// to 4 digits — that not only didn't match those live rows, it also
+// silently broke 100% of new item creation starting this year, since
+// "26" + 8 more digits always exceeds SQL int's ~2.147B ceiling (confirmed
+// live: "Arithmetic overflow error converting expression to data type
+// int"). No padding keeps the number small enough, same as Proj's own
+// barcode formula in projOrders.js.
 function buildBarcode(orderNo, serialNo) {
     const yy = String(new Date().getFullYear()).slice(-2);
     const or1 = String(orderNo).slice(-4);
-    const sn = String(serialNo).padStart(4, "0");
-    return parseInt(`${yy}${or1}${sn}`, 10);
+    return parseInt(`${yy}${or1}${serialNo}`, 10);
 }
 
 // GET /api/glass/orders?search=&page=&pageSize=
@@ -241,6 +248,14 @@ router.post("/orders/:orderNo/items", async (req, res) => {
 // grid directly. This collapses that into one call: upsert the SSTOCK row
 // and set QTYIN directly, since the staging table only ever existed to
 // batch sticker printing, not to gate the receive itself.
+// Once received, a glass item is pushed into Main Stock (category 2,
+// already the established "Glass (legacy)" tag on mainStockCategories.ts)
+// so it becomes shippable through the existing Ship Multiple Items screen
+// — Glass does not get its own ship-out UI; Main Stock is the single
+// store+ship control point across departments. Best-effort: a failure here
+// doesn't fail the receive itself (the SQL Server write to Glass's own DB
+// already committed), just logs, since the two databases can't share a
+// transaction.
 router.post("/orders/:orderNo/items/:serialNo/receive", async (req, res) => {
     const orderNo = parseInt(req.params.orderNo);
     const serialNo = parseInt(req.params.serialNo);
@@ -259,22 +274,30 @@ router.post("/orders/:orderNo/items/:serialNo/receive", async (req, res) => {
         const itemResult = await pool.request()
             .input("orderNo", orderNo)
             .input("serialNo", serialNo)
-            .query("SELECT barcode FROM Sorderdetails WHERE orderNo = @orderNo AND serialNo = @serialNo");
+            .query(`
+                SELECT d.barcode, d.itemNo, d.height, d.width, d.outcolor,
+                       o.projNo, o.projName, o.projMgr, o.ProdctionNO
+                FROM Sorderdetails d
+                JOIN Sorders o ON o.orderNo = d.orderNo
+                WHERE d.orderNo = @orderNo AND d.serialNo = @serialNo
+            `);
         const item = itemResult.recordset[0];
         if (!item) {
             return res.status(404).json({ success: false, message: "Item not found in this order" });
         }
 
+        let totalQtyIn = qtyIn;
         const existing = await pool.request()
             .input("orderNo", orderNo)
             .input("serialNo", serialNo)
             .query("SELECT QTYIN FROM SSTOCK WHERE OrderNo = @orderNo AND SerialNo = @serialNo");
 
         if (existing.recordset[0]) {
+            totalQtyIn = existing.recordset[0].QTYIN + qtyIn;
             await pool.request()
                 .input("orderNo", orderNo)
                 .input("serialNo", serialNo)
-                .input("qtyIn", existing.recordset[0].QTYIN + qtyIn)
+                .input("qtyIn", totalQtyIn)
                 .query("UPDATE SSTOCK SET QTYIN = @qtyIn WHERE OrderNo = @orderNo AND SerialNo = @serialNo");
         } else {
             await pool.request()
@@ -289,10 +312,197 @@ router.post("/orders/:orderNo/items/:serialNo/receive", async (req, res) => {
                 `);
         }
 
+        if (item.projNo && item.ProdctionNO) {
+            try {
+                await pushFinishedUnitToMinStock({
+                    projNo: item.projNo,
+                    projName: item.projName,
+                    ProdctionNO: item.ProdctionNO,
+                    projMgr: item.projMgr,
+                    category: 2,
+                    sourceKey: `GLASS:${orderNo}:${serialNo}`,
+                    description: [item.itemNo, item.height && item.width ? `${item.height}x${item.width}` : null, item.outcolor]
+                        .filter(Boolean).join(" "),
+                    qty: totalQtyIn,
+                    unitNo: item.barcode || serialNo,
+                });
+            } catch (syncErr) {
+                console.error("⚠️ GLASS -> MIN STOCK SYNC FAILED (receive still succeeded):", syncErr);
+            }
+        }
+
         res.json({ success: true });
     } catch (err) {
         console.error("❌ GLASS RECEIVE ITEM ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to receive glass item" });
+    }
+});
+
+// GET/PUT /api/glass/orders/:orderNo/appointments — appointment scheduling
+// and delay tracking against the external Ittihad fabrication factory.
+// Confirmed live and genuinely active (not legacy cruft): the underlying
+// [Dat Orders] table had 78 rows written in the 30 days before this was
+// built, newest dated the day of the audit. One row per order (confirmed:
+// zero orderNo values have more than one row), reached in the legacy app
+// from a popup off SendOrdersDetails1 — no equivalent existed anywhere in
+// the web app before this.
+//
+// Fields, confirmed via the legacy form's own control labels (COM
+// inspection, not guessed): datOrder = date an appointment/delivery slot
+// was secured; dat1/dat2/dat3 = up to three scheduled appointment dates
+// (reschedule history); finshed1/finshed2 = fabrication work start/end at
+// the factory; taken = date the finished glass was picked up; qut/qutIN/
+// qutun/totalQut = quantity completed/received/under-work/total; brcode =
+// a plain reference barcode (not a real FK, same as elsewhere in this
+// schema); Notic = notes.
+//
+// Deliberately NOT ported: the legacy form's own three computed duration
+// fields (Text45/47/49, "Supply/Delivery/Delay duration") depend on two
+// helper fields (Text41/Text43) that aren't captioned or resolvable from
+// the VBA alone — replicating that formula blind risked shipping a
+// confidently-wrong number. Instead this computes one clearly-defined,
+// unambiguous metric server-side: turnaroundDays = taken - datOrder.
+router.get("/orders/:orderNo/appointments", async (req, res) => {
+    try {
+        const orderNo = parseInt(req.params.orderNo);
+        if (!Number.isInteger(orderNo)) {
+            return res.status(400).json({ success: false, message: "Invalid orderNo" });
+        }
+
+        const pool = await getSqlPool("glass");
+        const result = await pool.request()
+            .input("orderNo", orderNo)
+            .query(`
+                SELECT orderNo, projNo, ProdctionNO, datOrder, dat1, dat2, dat3,
+                       finshed1, finshed2, taken, totalQut, qut, qutIN, qutun, brcode, Notic,
+                       CASE WHEN taken IS NOT NULL AND datOrder IS NOT NULL AND taken >= datOrder
+                            THEN DATEDIFF(day, datOrder, taken) END AS turnaroundDays
+                FROM [Dat Orders]
+                WHERE orderNo = @orderNo
+            `);
+
+        res.json({ success: true, appointment: result.recordset[0] || null });
+    } catch (err) {
+        console.error("❌ GLASS APPOINTMENTS GET ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to fetch appointment tracking" });
+    }
+});
+
+router.put("/orders/:orderNo/appointments", async (req, res) => {
+    try {
+        const orderNo = parseInt(req.params.orderNo);
+        if (!Number.isInteger(orderNo)) {
+            return res.status(400).json({ success: false, message: "Invalid orderNo" });
+        }
+        const {
+            datOrder, dat1, dat2, dat3, finshed1, finshed2, taken,
+            totalQut, qut, qutIN, qutun, brcode, notic,
+        } = req.body;
+
+        const pool = await getSqlPool("glass");
+
+        const orderResult = await pool.request()
+            .input("orderNo", orderNo)
+            .query("SELECT orderNo, projNo, ProdctionNO FROM Sorders WHERE orderNo = @orderNo");
+        const order = orderResult.recordset[0];
+        if (!order) {
+            return res.status(404).json({ success: false, message: "Order not found" });
+        }
+
+        const existing = await pool.request()
+            .input("orderNo", orderNo)
+            .query("SELECT orderNo FROM [Dat Orders] WHERE orderNo = @orderNo");
+
+        const request = pool.request()
+            .input("orderNo", orderNo)
+            .input("projNo", order.projNo || null)
+            .input("ProdctionNO", order.ProdctionNO || null)
+            .input("datOrder", datOrder || null)
+            .input("dat1", dat1 || null)
+            .input("dat2", dat2 || null)
+            .input("dat3", dat3 || null)
+            .input("finshed1", finshed1 || null)
+            .input("finshed2", finshed2 || null)
+            .input("taken", taken || null)
+            .input("totalQut", totalQut !== undefined && totalQut !== null && totalQut !== "" ? parseInt(totalQut, 10) : null)
+            .input("qut", qut !== undefined && qut !== null && qut !== "" ? parseInt(qut, 10) : null)
+            .input("qutIN", qutIN !== undefined && qutIN !== null && qutIN !== "" ? parseInt(qutIN, 10) : null)
+            .input("qutun", qutun !== undefined && qutun !== null && qutun !== "" ? parseInt(qutun, 10) : null)
+            .input("brcode", brcode !== undefined && brcode !== null && brcode !== "" ? parseInt(brcode, 10) : null)
+            .input("notic", notic || null);
+
+        if (existing.recordset[0]) {
+            await request.query(`
+                UPDATE [Dat Orders]
+                SET projNo = @projNo, ProdctionNO = @ProdctionNO, datOrder = @datOrder,
+                    dat1 = @dat1, dat2 = @dat2, dat3 = @dat3, finshed1 = @finshed1, finshed2 = @finshed2,
+                    taken = @taken, totalQut = @totalQut, qut = @qut, qutIN = @qutIN, qutun = @qutun,
+                    brcode = @brcode, Notic = @notic
+                WHERE orderNo = @orderNo
+            `);
+        } else {
+            await request.query(`
+                INSERT INTO [Dat Orders]
+                    (orderNo, projNo, ProdctionNO, datOrder, dat1, dat2, dat3, finshed1, finshed2,
+                     taken, totalQut, qut, qutIN, qutun, brcode, Notic)
+                VALUES
+                    (@orderNo, @projNo, @ProdctionNO, @datOrder, @dat1, @dat2, @dat3, @finshed1, @finshed2,
+                     @taken, @totalQut, @qut, @qutIN, @qutun, @brcode, @notic)
+            `);
+        }
+
+        res.json({ success: true });
+    } catch (err) {
+        console.error("❌ GLASS APPOINTMENTS SAVE ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to save appointment tracking" });
+    }
+});
+
+// GET /api/glass/ready-to-ship?orderNo= — items received into store but not
+// yet (fully) shipped out to their project, the glass-side mirror of
+// /not-received (which tracks factory -> store instead of store -> project).
+// GlassOut currently has no writer anywhere in this app — the POST
+// .../ship endpoint that used to write it was removed (confirmed dead, zero
+// frontend caller; real glass ship-out flows through Min Stock's own
+// STOCKO/Stock/out chain via minStockSync.js instead, see glass.js's
+// receive handler). shippedQty below will always compute as 0 until/unless
+// something writes to GlassOut again — this report still correctly shows
+// "received but not synced-out yet" in the meantime.
+router.get("/ready-to-ship", async (req, res) => {
+    try {
+        const orderNo = req.query.orderNo ? parseInt(req.query.orderNo) : null;
+
+        const pool = await getSqlPool("glass");
+        const request = pool.request();
+        let whereClause = "";
+        if (orderNo !== null) {
+            request.input("orderNo", orderNo);
+            whereClause = "AND d.orderNo = @orderNo";
+        }
+
+        const result = await request.query(`
+            SELECT
+                d.orderNo, d.serialNo, d.itemNo, d.height, d.width, d.qty, d.barcode,
+                o.projNo, o.projName, o.projMgr,
+                s.QTYIN AS receivedQty,
+                ISNULL(g.shippedQty, 0) AS shippedQty,
+                s.QTYIN - ISNULL(g.shippedQty, 0) AS remainingToShip
+            FROM Sorderdetails d
+            JOIN Sorders o ON o.orderNo = d.orderNo
+            JOIN SSTOCK s ON s.OrderNo = d.orderNo AND s.SerialNo = d.serialNo
+            LEFT JOIN (
+                SELECT OrderNo, SerialNo, SUM(qty) AS shippedQty
+                FROM GlassOut
+                GROUP BY OrderNo, SerialNo
+            ) g ON g.OrderNo = d.orderNo AND g.SerialNo = d.serialNo
+            WHERE s.QTYIN > 0 AND s.QTYIN - ISNULL(g.shippedQty, 0) > 0 ${whereClause}
+            ORDER BY d.orderNo DESC, d.serialNo ASC
+        `);
+
+        res.json({ success: true, items: result.recordset });
+    } catch (err) {
+        console.error("❌ GLASS READY-TO-SHIP ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to fetch ready-to-ship items" });
     }
 });
 
@@ -347,10 +557,17 @@ router.get("/barcode/:barcode", async (req, res) => {
                     o.projNo, o.projName, o.orderNo, d.serialNo, d.section, d.shape, d.spacer,
                     d.height, d.width, d.itemNo, d.qty, d.barcode, d.incolor, d.intype, d.inthickness,
                     d.outcolor, d.outtype, d.outthickness, o.JPO, o.ProdctionNO,
-                    ISNULL(s.QTYIN, 0) AS receivedQty
+                    ISNULL(s.QTYIN, 0) AS receivedQty,
+                    ISNULL(g.shippedQty, 0) AS shippedQty,
+                    ISNULL(s.QTYIN, 0) - ISNULL(g.shippedQty, 0) AS remainingToShip
                 FROM Sorderdetails d
                 JOIN Sorders o ON o.orderNo = d.orderNo
                 LEFT JOIN SSTOCK s ON s.OrderNo = d.orderNo AND s.SerialNo = d.serialNo
+                LEFT JOIN (
+                    SELECT OrderNo, SerialNo, SUM(qty) AS shippedQty
+                    FROM GlassOut
+                    GROUP BY OrderNo, SerialNo
+                ) g ON g.OrderNo = d.orderNo AND g.SerialNo = d.serialNo
                 WHERE d.barcode = @barcode
             `);
 

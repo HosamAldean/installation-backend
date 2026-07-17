@@ -146,6 +146,13 @@ const sqlServers = {
         database: process.env.MSSQL2_MinStock_DB,
         options: { encrypt: false, trustServerCertificate: true },
     },
+    iron: {
+        user: process.env.MSSQL2_USER,
+        password: process.env.MSSQL2_PASS,
+        server: `${process.env.MSSQL2_SERVER}\\ACCESPROJ`,
+        database: process.env.MSSQL2_IRON_DB,
+        options: { encrypt: false, trustServerCertificate: true },
+    },
 };
 
 // ======================

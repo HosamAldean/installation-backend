@@ -9,7 +9,15 @@ import { authenticateToken, authorizeRoles } from '../middleware/auth.js';
 dotenv.config();
 const router = express.Router();
 
-// Rate limiting for auth endpoints
+// Rate limiting for auth endpoints. Keyed by IP + path — on a small
+// internal network (or local dev testing), multiple people/processes behind
+// the same gateway or machine share one bucket, so one person's failed
+// attempts can lock out someone else on the same IP. Confirmed live: the
+// frontend was also silently swallowing this message (see apiRequest.ts's
+// fix) — a locked-out user previously just saw a generic "Failed" instead
+// of "Too many attempts," making this look like a broken login rather than
+// a rate limit. That's fixed now, so this is at least visible when it
+// happens.
 const authAttempts = new Map();
 const RATE_LIMIT_WINDOW = 15 * 60 * 1000; // 15 minutes
 const MAX_ATTEMPTS = 5;
@@ -57,7 +65,7 @@ setInterval(() => {
 // body's role is safe the same way it already is there.
 router.post('/signup', checkRateLimit, authenticateToken, authorizeRoles('admin'), async (req, res) => {
     try {
-        const { username, password, email, role, firstName, lastName, assignedEmpNo } = req.body;
+        const { username, password, email, role, firstName, lastName, assignedEmpNo, assignedStore } = req.body;
 
         // Input validation
         if (!username || !password)
@@ -87,6 +95,7 @@ router.post('/signup', checkRateLimit, authenticateToken, authorizeRoles('admin'
             lastName,
          //   teamId: teamId || null,
             assignedEmpNo: assignedEmpNo ? String(assignedEmpNo) : null, // ✅ ensure string or null
+            assignedStore: assignedStore ? Number(assignedStore) : null,
             active: true
         });
 
@@ -94,7 +103,8 @@ router.post('/signup', checkRateLimit, authenticateToken, authorizeRoles('admin'
             message: 'User created successfully',
             userId: user.userId,
             username: user.username,
-            assignedEmpNo: user.assignedEmpNo
+            assignedEmpNo: user.assignedEmpNo,
+            assignedStore: user.assignedStore
         });
     } catch (err) {
         console.error('Signup error:', err);
@@ -131,6 +141,7 @@ router.post('/login', checkRateLimit, async (req, res) => {
                 role: user.role,
              //   teamId: user.teamId || null,
                 assignedEmpNo: user.assignedEmpNo || null,
+                assignedStore: user.assignedStore ?? null,
             },
             process.env.JWT_SECRET,
             { expiresIn: process.env.JWT_EXPIRES_IN || '8h' }
@@ -158,6 +169,7 @@ router.post('/login', checkRateLimit, async (req, res) => {
                 active: user.active,
               //  teamId: user.teamId,
                 assignedEmpNo: user.assignedEmpNo,
+                assignedStore: user.assignedStore ?? null,
                 avatarUrl: user.avatarUrl || null
             }
         });

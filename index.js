@@ -31,6 +31,9 @@ import instOrdersRouter from "./routes/instOrders.js";
 import instStepsRouter from "./routes/instSteps.js";
 import mainStockRouter from "./routes/mainStock.js";
 import glassRouter from "./routes/glass.js";
+import stockHouseRouter from "./routes/stockHouse.js";
+import projOrdersRouter from "./routes/projOrders.js";
+import ironRouter from "./routes/iron.js";
  // follow-up module
 
 // Models (named imports)
@@ -134,6 +137,9 @@ app.use("/api/instOrders", instOrdersRouter);
 app.use("/api/instSteps", instStepsRouter);
 app.use("/api/main-stock", mainStockRouter);
 app.use("/api/glass", glassRouter);
+app.use("/api/stock-house", stockHouseRouter);
+app.use("/api/proj-orders", projOrdersRouter);
+app.use("/api/iron", ironRouter);
 
 app.use("/api", apiRouter);
 app.use('/instOrders', instOrdersRouter);
