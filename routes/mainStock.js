@@ -480,7 +480,11 @@ router.post("/checkout", async (req, res) => {
         transaction = pool.transaction();
         await transaction.begin();
 
-        const batchResult = await transaction.request().query("SELECT ISNULL(MAX(A), 0) AS maxA FROM [out]");
+        // UPDLOCK+HOLDLOCK: without this, two concurrent shipments can both
+        // read the same MAX(A) before either commits, handing out the same
+        // batch id to two unrelated shipments. The lock is held until this
+        // transaction commits/rolls back, serializing batch-id generation.
+        const batchResult = await transaction.request().query("SELECT ISNULL(MAX(A), 0) AS maxA FROM [out] WITH (UPDLOCK, HOLDLOCK)");
         const batchId = batchResult.recordset[0].maxA + 1;
 
         const shipped = [];
@@ -605,7 +609,11 @@ router.post("/orders/:orderNo/checkout", async (req, res) => {
         // Shared batch id for this whole checkout action — the equivalent
         // of the Access app's shared "A" counter, but computed safely
         // (MAX+1) instead of a global side-effecting UPDATE statement.
-        const batchResult = await transaction.request().query("SELECT ISNULL(MAX(A), 0) AS maxA FROM [out]");
+        // UPDLOCK+HOLDLOCK: without this, two concurrent shipments can both
+        // read the same MAX(A) before either commits, handing out the same
+        // batch id to two unrelated shipments. The lock is held until this
+        // transaction commits/rolls back, serializing batch-id generation.
+        const batchResult = await transaction.request().query("SELECT ISNULL(MAX(A), 0) AS maxA FROM [out] WITH (UPDLOCK, HOLDLOCK)");
         const batchId = batchResult.recordset[0].maxA + 1;
 
         const shipped = [];
