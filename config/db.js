@@ -207,3 +207,29 @@ export async function getSqlPool(serverKey = 'proj') {
         throw err;
     }
 }
+
+// Runs `queryFn` against a fresh pool/request built inside the callback,
+// retrying once if the first attempt fails. Route handlers observed
+// intermittent 500s here (a single request failing against the on-prem
+// ACCESPROJ SQL Server, immediately succeeding on the next page load) even
+// after getSqlPool started reusing a long-lived pool instead of opening one
+// per request — this covers the remaining class of one-off transient
+// failures (a dropped connection, a momentary timeout) the same way a user
+// hitting refresh already does, without making them do it manually.
+// `queryFn` must build its own `pool.request()` on every call (that's why
+// it receives the pool, not a pre-built request) since an `mssql` Request
+// object can't safely be re-executed after it's already run once.
+export async function withSqlRetry(serverKey, queryFn, { retries = 1 } = {}) {
+    let lastErr;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+            const pool = await getSqlPool(serverKey);
+            return await queryFn(pool);
+        } catch (err) {
+            lastErr = err;
+            if (attempt === retries) break;
+            console.warn(`⚠️ SQL Server query failed on '${serverKey}' (attempt ${attempt + 1}/${retries + 1}), retrying:`, err.message);
+        }
+    }
+    throw lastErr;
+}

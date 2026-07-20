@@ -23,7 +23,7 @@
 // digits of orderNo + serialNo, concatenated with no padding, e.g.
 // orderNo 322633 serialNo 33 -> barcode 26263333.
 import express from "express";
-import { getSqlPool } from "../config/db.js";
+import { getSqlPool, withSqlRetry } from "../config/db.js";
 import { authenticateToken, authorizeRoles } from "../middleware/auth.js";
 import { User } from "../models/User.js";
 
@@ -55,34 +55,36 @@ router.get("/", async (req, res) => {
         const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 25));
         const offset = (page - 1) * pageSize;
 
-        const pool = await getSqlPool("proj");
         const whereClause = search ? "WHERE o.projNo LIKE @search OR o.projName LIKE @search" : "";
 
-        const countRequest = pool.request();
-        if (search) countRequest.input("search", `%${search}%`);
-        const countResult = await countRequest.query(`SELECT COUNT(*) AS total FROM dbo.orders o ${whereClause}`);
-        const total = countResult.recordset[0].total;
+        const { total, rows } = await withSqlRetry("proj", async (pool) => {
+            const countRequest = pool.request();
+            if (search) countRequest.input("search", `%${search}%`);
+            const countResult = await countRequest.query(`SELECT COUNT(*) AS total FROM dbo.orders o ${whereClause}`);
 
-        const rowsRequest = pool.request();
-        rowsRequest.input("offset", offset).input("pageSize", pageSize);
-        if (search) rowsRequest.input("search", `%${search}%`);
-        const rowsResult = await rowsRequest.query(`
-            SELECT
-                o.orderNo, o.projNo, o.projName, o.projMgr, o.oderDate, o.Color,
-                o.ProdctionNO, o.ProdctionDate, o.dateFinsh,
-                ISNULL(lines.lineCount, 0) AS lineCount
-            FROM dbo.orders o
-            LEFT JOIN (
-                SELECT orderNo, COUNT(*) AS lineCount
-                FROM dbo.orderdetails
-                GROUP BY orderNo
-            ) lines ON lines.orderNo = o.orderNo
-            ${whereClause}
-            ORDER BY o.orderNo DESC
-            OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY
-        `);
+            const rowsRequest = pool.request();
+            rowsRequest.input("offset", offset).input("pageSize", pageSize);
+            if (search) rowsRequest.input("search", `%${search}%`);
+            const rowsResult = await rowsRequest.query(`
+                SELECT
+                    o.orderNo, o.projNo, o.projName, o.projMgr, o.oderDate, o.Color,
+                    o.ProdctionNO, o.ProdctionDate, o.dateFinsh,
+                    ISNULL(lines.lineCount, 0) AS lineCount
+                FROM dbo.orders o
+                LEFT JOIN (
+                    SELECT orderNo, COUNT(*) AS lineCount
+                    FROM dbo.orderdetails
+                    GROUP BY orderNo
+                ) lines ON lines.orderNo = o.orderNo
+                ${whereClause}
+                ORDER BY o.orderNo DESC
+                OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY
+            `);
 
-        res.json({ success: true, orders: rowsResult.recordset, total, page, pageSize });
+            return { total: countResult.recordset[0].total, rows: rowsResult.recordset };
+        });
+
+        res.json({ success: true, orders: rows, total, page, pageSize });
     } catch (err) {
         console.error("❌ PROJ ORDERS LIST ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to fetch orders" });

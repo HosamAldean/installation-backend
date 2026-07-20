@@ -6,7 +6,7 @@
 // STOCK holds the individual barcoded finished-product rows under each
 // order, with QTY/QTYOUT/SQTY tracking what's shipped vs. remaining.
 import express from "express";
-import { getSqlPool, sequelize } from "../config/db.js";
+import { getSqlPool, sequelize, withSqlRetry } from "../config/db.js";
 import { authenticateToken, authorizeRoles } from "../middleware/auth.js";
 
 const router = express.Router();
@@ -307,27 +307,29 @@ router.get("/shipments/projects", async (req, res) => {
     try {
         const search = String(req.query.search || "").trim();
         const category = req.query.category !== undefined && req.query.category !== "" ? parseInt(req.query.category, 10) : null;
-        const pool = await getSqlPool("minstock");
-        const request = pool.request();
-        const whereParts = [];
-        if (search) {
-            request.input("search", `%${search}%`);
-            whereParts.push("(s.projName LIKE @search OR o.projNo LIKE @search)");
-        }
-        if (Number.isInteger(category)) {
-            request.input("category", category);
-            whereParts.push("s.C = @category");
-        }
-        const whereClause = whereParts.length ? `WHERE ${whereParts.join(" AND ")}` : "";
 
-        const result = await request.query(`
-            SELECT o.projNo, MAX(s.projName) AS projName, s.C AS category, SUM(o.OUTQTY) AS totalShipped
-            FROM [out] o
-            LEFT JOIN STOCKO s ON s.orderNo = o.orderNo
-            ${whereClause}
-            GROUP BY o.projNo, s.C
-            ORDER BY o.projNo DESC
-        `);
+        const result = await withSqlRetry("minstock", async (pool) => {
+            const request = pool.request();
+            const whereParts = [];
+            if (search) {
+                request.input("search", `%${search}%`);
+                whereParts.push("(s.projName LIKE @search OR o.projNo LIKE @search)");
+            }
+            if (Number.isInteger(category)) {
+                request.input("category", category);
+                whereParts.push("s.C = @category");
+            }
+            const whereClause = whereParts.length ? `WHERE ${whereParts.join(" AND ")}` : "";
+
+            return request.query(`
+                SELECT o.projNo, MAX(s.projName) AS projName, s.C AS category, SUM(o.OUTQTY) AS totalShipped
+                FROM [out] o
+                LEFT JOIN STOCKO s ON s.orderNo = o.orderNo
+                ${whereClause}
+                GROUP BY o.projNo, s.C
+                ORDER BY o.projNo DESC
+            `);
+        });
 
         res.json({ success: true, projects: result.recordset });
     } catch (err) {
