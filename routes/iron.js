@@ -776,4 +776,47 @@ router.get("/report", async (req, res) => {
     }
 });
 
+// GET /api/iron/stock?search=&page=&pageSize= — Iron's current Main Stock
+// position, the legacy Access QSTOCK form's live equivalent (SELECT * FROM
+// QL2IRon, ordered by date DESC). This is a cross-database read against the
+// MinStock SQL Server database (pool key "minstock", not "iron") — same
+// database pushFinishedUnitToMinStock (utils/minStockSync.js) already
+// writes to when an Iron item finishes. guest.QL2IRon is confirmed live and
+// actively written (checked directly against the DB: 14k+ rows, newest
+// dated within the last day) — it's schema-qualified as guest.QL2IRon, not
+// dbo.QL2IRon. Queried directly rather than reconstructed from Stock/STOCKO
+// by hand, since it's the real legacy view and already correctly scoped.
+router.get("/stock", async (req, res) => {
+    try {
+        const search = String(req.query.search || "").trim();
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 25));
+        const offset = (page - 1) * pageSize;
+
+        const pool = await getSqlPool("minstock");
+        const whereClause = search ? "WHERE (projNo LIKE @search OR projName LIKE @search OR Prodc LIKE @search)" : "";
+
+        const countRequest = pool.request();
+        if (search) countRequest.input("search", `%${search}%`);
+        const countResult = await countRequest.query(`SELECT COUNT(*) AS total FROM guest.QL2IRon ${whereClause}`);
+        const total = countResult.recordset[0].total;
+
+        const listRequest = pool.request();
+        listRequest.input("offset", offset).input("pageSize", pageSize);
+        if (search) listRequest.input("search", `%${search}%`);
+        const listResult = await listRequest.query(`
+            SELECT orderNo, serialNo, projNo, projName, Worker, Prodc, ProdctionNO, UNO, QTY, Date, Note
+            FROM guest.QL2IRon
+            ${whereClause}
+            ORDER BY Date DESC
+            OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY
+        `);
+
+        res.json({ success: true, items: listResult.recordset, total, page, pageSize });
+    } catch (err) {
+        console.error("❌ IRON STOCK ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to fetch stock" });
+    }
+});
+
 export default router;

@@ -23,7 +23,7 @@
 // works for current orders going forward; CheckBill/Bill remain untouched
 // as the historical record for pre-cutover orders.
 import express from "express";
-import { getSqlPool } from "../config/db.js";
+import { withSqlRetry } from "../config/db.js";
 import { authenticateToken, authorizeRoles } from "../middleware/auth.js";
 import { pushFinishedUnitToMinStock } from "../utils/minStockSync.js";
 
@@ -59,42 +59,43 @@ router.get("/orders", async (req, res) => {
         const offset = (page - 1) * pageSize;
         const search = String(req.query.search || "").trim();
 
-        const pool = await getSqlPool("glass");
-
         const whereClause = search ? "WHERE (o.projName LIKE @search OR o.projNo LIKE @search OR o.JPO LIKE @search)" : "";
 
-        const countRequest = pool.request();
-        if (search) countRequest.input("search", `%${search}%`);
-        const countResult = await countRequest.query(`SELECT COUNT(*) AS total FROM Sorders o ${whereClause}`);
-        const total = countResult.recordset[0].total;
+        const { total, rows } = await withSqlRetry("glass", async (pool) => {
+            const countRequest = pool.request();
+            if (search) countRequest.input("search", `%${search}%`);
+            const countResult = await countRequest.query(`SELECT COUNT(*) AS total FROM Sorders o ${whereClause}`);
 
-        const rowsRequest = pool.request();
-        rowsRequest.input("offset", offset);
-        rowsRequest.input("pageSize", pageSize);
-        if (search) rowsRequest.input("search", `%${search}%`);
-        const rowsResult = await rowsRequest.query(`
-            SELECT
-                o.orderNo, o.projNo, o.projName, o.projMgr, o.oderDate, o.JPO, o.ProdctionNO,
-                ISNULL(lines.totalQty, 0) AS totalQty,
-                ISNULL(received.totalReceived, 0) AS totalReceived,
-                ISNULL(lines.lineCount, 0) AS lineCount
-            FROM Sorders o
-            LEFT JOIN (
-                SELECT orderNo, SUM(qty) AS totalQty, COUNT(*) AS lineCount
-                FROM Sorderdetails
-                GROUP BY orderNo
-            ) lines ON lines.orderNo = o.orderNo
-            LEFT JOIN (
-                SELECT OrderNo, SUM(QTYIN) AS totalReceived
-                FROM SSTOCK
-                GROUP BY OrderNo
-            ) received ON received.OrderNo = o.orderNo
-            ${whereClause}
-            ORDER BY o.orderNo DESC
-            OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY
-        `);
+            const rowsRequest = pool.request();
+            rowsRequest.input("offset", offset);
+            rowsRequest.input("pageSize", pageSize);
+            if (search) rowsRequest.input("search", `%${search}%`);
+            const rowsResult = await rowsRequest.query(`
+                SELECT
+                    o.orderNo, o.projNo, o.projName, o.projMgr, o.oderDate, o.JPO, o.ProdctionNO,
+                    ISNULL(lines.totalQty, 0) AS totalQty,
+                    ISNULL(received.totalReceived, 0) AS totalReceived,
+                    ISNULL(lines.lineCount, 0) AS lineCount
+                FROM Sorders o
+                LEFT JOIN (
+                    SELECT orderNo, SUM(qty) AS totalQty, COUNT(*) AS lineCount
+                    FROM Sorderdetails
+                    GROUP BY orderNo
+                ) lines ON lines.orderNo = o.orderNo
+                LEFT JOIN (
+                    SELECT OrderNo, SUM(QTYIN) AS totalReceived
+                    FROM SSTOCK
+                    GROUP BY OrderNo
+                ) received ON received.OrderNo = o.orderNo
+                ${whereClause}
+                ORDER BY o.orderNo DESC
+                OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY
+            `);
 
-        res.json({ success: true, orders: rowsResult.recordset, total, page, pageSize });
+            return { total: countResult.recordset[0].total, rows: rowsResult.recordset };
+        });
+
+        res.json({ success: true, orders: rows, total, page, pageSize });
     } catch (err) {
         console.error("❌ GLASS ORDERS ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to fetch glass orders" });
@@ -110,8 +111,7 @@ router.post("/orders", async (req, res) => {
     }
 
     try {
-        const pool = await getSqlPool("glass");
-        const result = await pool.request()
+        const result = await withSqlRetry("glass", (pool) => pool.request()
             .input("projNo", projNo)
             .input("projName", projName || null)
             .input("projMgr", projMgr || null)
@@ -121,7 +121,7 @@ router.post("/orders", async (req, res) => {
                 INSERT INTO Sorders (projNo, projName, projMgr, oderDate, JPO, ProdctionNO)
                 OUTPUT INSERTED.orderNo
                 VALUES (@projNo, @projName, @projMgr, GETDATE(), @JPO, @ProdctionNO)
-            `);
+            `));
         res.json({ success: true, orderNo: result.recordset[0].orderNo });
     } catch (err) {
         console.error("❌ GLASS CREATE ORDER ERROR:", err);
@@ -140,8 +140,7 @@ router.get("/orders/:orderNo/items", async (req, res) => {
             return res.status(400).json({ success: false, message: "Invalid orderNo" });
         }
 
-        const pool = await getSqlPool("glass");
-        const result = await pool.request()
+        const result = await withSqlRetry("glass", (pool) => pool.request()
             .input("orderNo", orderNo)
             .query(`
                 SELECT
@@ -156,7 +155,7 @@ router.get("/orders/:orderNo/items", async (req, res) => {
                 LEFT JOIN SSTOCK s ON s.OrderNo = d.orderNo AND s.SerialNo = d.serialNo
                 WHERE d.orderNo = @orderNo
                 ORDER BY d.serialNo ASC
-            `);
+            `));
 
         res.json({ success: true, items: result.recordset });
     } catch (err) {
@@ -181,61 +180,69 @@ router.post("/orders/:orderNo/items", async (req, res) => {
         return res.status(400).json({ success: false, message: "height, width, and a positive qty are required" });
     }
 
-    let transaction;
     try {
-        const pool = await getSqlPool("glass");
-        transaction = pool.transaction();
-        await transaction.begin();
+        const result = await withSqlRetry("glass", async (pool) => {
+            const transaction = pool.transaction();
+            await transaction.begin();
+            try {
+                const orderResult = await transaction.request()
+                    .input("orderNo", orderNo)
+                    .query("SELECT orderNo FROM Sorders WHERE orderNo = @orderNo");
+                if (!orderResult.recordset[0]) {
+                    await transaction.rollback();
+                    return { notFound: true };
+                }
 
-        const orderResult = await transaction.request()
-            .input("orderNo", orderNo)
-            .query("SELECT orderNo FROM Sorders WHERE orderNo = @orderNo");
-        if (!orderResult.recordset[0]) {
-            await transaction.rollback();
+                const maxResult = await transaction.request()
+                    .input("orderNo", orderNo)
+                    .query("SELECT ISNULL(MAX(serialNo), 0) AS maxSerial FROM Sorderdetails WHERE orderNo = @orderNo");
+                const serialNo = maxResult.recordset[0].maxSerial + 1;
+                const barcode = buildBarcode(orderNo, serialNo);
+
+                await transaction.request()
+                    .input("orderNo", orderNo)
+                    .input("serialNo", serialNo)
+                    .input("itemNo", itemNo || null)
+                    .input("height", parseFloat(height))
+                    .input("width", parseFloat(width))
+                    .input("qty", parseInt(qty))
+                    .input("incolor", incolor || null)
+                    .input("intype", intype || null)
+                    .input("inthickness", inthickness ? parseFloat(inthickness) : null)
+                    .input("spacer", spacer || null)
+                    .input("outcolor", outcolor || null)
+                    .input("outtype", outtype || null)
+                    .input("outthickness", outthickness || null)
+                    .input("section", section || null)
+                    .input("shape", shape || null)
+                    .input("note", note || null)
+                    .input("expectdate", expectdate || null)
+                    .input("status", status || null)
+                    .input("person", person || null)
+                    .input("dept", dept || null)
+                    .input("barcode", barcode)
+                    .query(`
+                        INSERT INTO Sorderdetails
+                            (orderNo, serialNo, itemNo, height, width, qty, incolor, intype, inthickness, spacer,
+                             outcolor, outtype, outthickness, section, shape, note, expectdate, status, person, dept, barcode)
+                        VALUES
+                            (@orderNo, @serialNo, @itemNo, @height, @width, @qty, @incolor, @intype, @inthickness, @spacer,
+                             @outcolor, @outtype, @outthickness, @section, @shape, @note, @expectdate, @status, @person, @dept, @barcode)
+                    `);
+
+                await transaction.commit();
+                return { serialNo, barcode };
+            } catch (err) {
+                try { await transaction.rollback(); } catch { /* already rolled back */ }
+                throw err;
+            }
+        });
+
+        if (result.notFound) {
             return res.status(404).json({ success: false, message: "Order not found" });
         }
-
-        const maxResult = await transaction.request()
-            .input("orderNo", orderNo)
-            .query("SELECT ISNULL(MAX(serialNo), 0) AS maxSerial FROM Sorderdetails WHERE orderNo = @orderNo");
-        const serialNo = maxResult.recordset[0].maxSerial + 1;
-        const barcode = buildBarcode(orderNo, serialNo);
-
-        await transaction.request()
-            .input("orderNo", orderNo)
-            .input("serialNo", serialNo)
-            .input("itemNo", itemNo || null)
-            .input("height", parseFloat(height))
-            .input("width", parseFloat(width))
-            .input("qty", parseInt(qty))
-            .input("incolor", incolor || null)
-            .input("intype", intype || null)
-            .input("inthickness", inthickness ? parseFloat(inthickness) : null)
-            .input("spacer", spacer || null)
-            .input("outcolor", outcolor || null)
-            .input("outtype", outtype || null)
-            .input("outthickness", outthickness || null)
-            .input("section", section || null)
-            .input("shape", shape || null)
-            .input("note", note || null)
-            .input("expectdate", expectdate || null)
-            .input("status", status || null)
-            .input("person", person || null)
-            .input("dept", dept || null)
-            .input("barcode", barcode)
-            .query(`
-                INSERT INTO Sorderdetails
-                    (orderNo, serialNo, itemNo, height, width, qty, incolor, intype, inthickness, spacer,
-                     outcolor, outtype, outthickness, section, shape, note, expectdate, status, person, dept, barcode)
-                VALUES
-                    (@orderNo, @serialNo, @itemNo, @height, @width, @qty, @incolor, @intype, @inthickness, @spacer,
-                     @outcolor, @outtype, @outthickness, @section, @shape, @note, @expectdate, @status, @person, @dept, @barcode)
-            `);
-
-        await transaction.commit();
-        res.json({ success: true, serialNo, barcode });
+        res.json({ success: true, serialNo: result.serialNo, barcode: result.barcode });
     } catch (err) {
-        if (transaction) { try { await transaction.rollback(); } catch { /* already rolled back */ } }
         console.error("❌ GLASS CREATE ITEM ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to create glass item" });
     }
@@ -274,47 +281,60 @@ router.post("/orders/:orderNo/items/:serialNo/receive", async (req, res) => {
     }
 
     try {
-        const pool = await getSqlPool("glass");
+        // withSqlRetry reruns this whole block on a transient failure, which
+        // re-reads QTYIN before re-applying it — safe for the ordinary
+        // "never reached the server" timeout this guards against, but if a
+        // write ever committed server-side right as the connection dropped
+        // (ack lost, not just the request), a retry would double-count this
+        // receive. Accepted as the same narrow trade-off already made for
+        // mainStock.js/projOrders.js's own withSqlRetry usage — connection
+        // failures observed here are consistently pre-connect timeouts, not
+        // mid-query drops.
+        const { item, totalQtyIn } = await withSqlRetry("glass", async (pool) => {
+            const itemResult = await pool.request()
+                .input("orderNo", orderNo)
+                .input("serialNo", serialNo)
+                .query(`
+                    SELECT d.barcode, d.itemNo, d.height, d.width, d.outcolor,
+                           o.projNo, o.projName, o.projMgr, o.ProdctionNO
+                    FROM Sorderdetails d
+                    JOIN Sorders o ON o.orderNo = d.orderNo
+                    WHERE d.orderNo = @orderNo AND d.serialNo = @serialNo
+                `);
+            const item = itemResult.recordset[0];
+            if (!item) return { item: null, totalQtyIn: 0 };
 
-        const itemResult = await pool.request()
-            .input("orderNo", orderNo)
-            .input("serialNo", serialNo)
-            .query(`
-                SELECT d.barcode, d.itemNo, d.height, d.width, d.outcolor,
-                       o.projNo, o.projName, o.projMgr, o.ProdctionNO
-                FROM Sorderdetails d
-                JOIN Sorders o ON o.orderNo = d.orderNo
-                WHERE d.orderNo = @orderNo AND d.serialNo = @serialNo
-            `);
-        const item = itemResult.recordset[0];
+            let totalQtyIn = qtyIn;
+            const existing = await pool.request()
+                .input("orderNo", orderNo)
+                .input("serialNo", serialNo)
+                .query("SELECT QTYIN FROM SSTOCK WHERE OrderNo = @orderNo AND SerialNo = @serialNo");
+
+            if (existing.recordset[0]) {
+                totalQtyIn = existing.recordset[0].QTYIN + qtyIn;
+                await pool.request()
+                    .input("orderNo", orderNo)
+                    .input("serialNo", serialNo)
+                    .input("qtyIn", totalQtyIn)
+                    .query("UPDATE SSTOCK SET QTYIN = @qtyIn WHERE OrderNo = @orderNo AND SerialNo = @serialNo");
+            } else {
+                await pool.request()
+                    .input("orderNo", orderNo)
+                    .input("serialNo", serialNo)
+                    .input("barcode", item.barcode)
+                    .input("store", store ? parseInt(store) : null)
+                    .input("qtyIn", qtyIn)
+                    .query(`
+                        INSERT INTO SSTOCK (STORE, BARCODE, ORDER_DATE, QTYIN, OrderNo, SerialNo)
+                        VALUES (@store, @barcode, GETDATE(), @qtyIn, @orderNo, @serialNo)
+                    `);
+            }
+
+            return { item, totalQtyIn };
+        });
+
         if (!item) {
             return res.status(404).json({ success: false, message: "Item not found in this order" });
-        }
-
-        let totalQtyIn = qtyIn;
-        const existing = await pool.request()
-            .input("orderNo", orderNo)
-            .input("serialNo", serialNo)
-            .query("SELECT QTYIN FROM SSTOCK WHERE OrderNo = @orderNo AND SerialNo = @serialNo");
-
-        if (existing.recordset[0]) {
-            totalQtyIn = existing.recordset[0].QTYIN + qtyIn;
-            await pool.request()
-                .input("orderNo", orderNo)
-                .input("serialNo", serialNo)
-                .input("qtyIn", totalQtyIn)
-                .query("UPDATE SSTOCK SET QTYIN = @qtyIn WHERE OrderNo = @orderNo AND SerialNo = @serialNo");
-        } else {
-            await pool.request()
-                .input("orderNo", orderNo)
-                .input("serialNo", serialNo)
-                .input("barcode", item.barcode)
-                .input("store", store ? parseInt(store) : null)
-                .input("qtyIn", qtyIn)
-                .query(`
-                    INSERT INTO SSTOCK (STORE, BARCODE, ORDER_DATE, QTYIN, OrderNo, SerialNo)
-                    VALUES (@store, @barcode, GETDATE(), @qtyIn, @orderNo, @serialNo)
-                `);
         }
 
         if (item.projNo && item.ProdctionNO) {
@@ -375,8 +395,7 @@ router.get("/orders/:orderNo/appointments", async (req, res) => {
             return res.status(400).json({ success: false, message: "Invalid orderNo" });
         }
 
-        const pool = await getSqlPool("glass");
-        const result = await pool.request()
+        const result = await withSqlRetry("glass", (pool) => pool.request()
             .input("orderNo", orderNo)
             .query(`
                 SELECT orderNo, projNo, ProdctionNO, datOrder, dat1, dat2, dat3,
@@ -385,7 +404,7 @@ router.get("/orders/:orderNo/appointments", async (req, res) => {
                             THEN DATEDIFF(day, datOrder, taken) END AS turnaroundDays
                 FROM [Dat Orders]
                 WHERE orderNo = @orderNo
-            `);
+            `));
 
         res.json({ success: true, appointment: result.recordset[0] || null });
     } catch (err) {
@@ -405,56 +424,60 @@ router.put("/orders/:orderNo/appointments", async (req, res) => {
             totalQut, qut, qutIN, qutun, brcode, notic,
         } = req.body;
 
-        const pool = await getSqlPool("glass");
+        const orderFound = await withSqlRetry("glass", async (pool) => {
+            const orderResult = await pool.request()
+                .input("orderNo", orderNo)
+                .query("SELECT orderNo, projNo, ProdctionNO FROM Sorders WHERE orderNo = @orderNo");
+            const order = orderResult.recordset[0];
+            if (!order) return false;
 
-        const orderResult = await pool.request()
-            .input("orderNo", orderNo)
-            .query("SELECT orderNo, projNo, ProdctionNO FROM Sorders WHERE orderNo = @orderNo");
-        const order = orderResult.recordset[0];
-        if (!order) {
+            const existing = await pool.request()
+                .input("orderNo", orderNo)
+                .query("SELECT orderNo FROM [Dat Orders] WHERE orderNo = @orderNo");
+
+            const request = pool.request()
+                .input("orderNo", orderNo)
+                .input("projNo", order.projNo || null)
+                .input("ProdctionNO", order.ProdctionNO || null)
+                .input("datOrder", datOrder || null)
+                .input("dat1", dat1 || null)
+                .input("dat2", dat2 || null)
+                .input("dat3", dat3 || null)
+                .input("finshed1", finshed1 || null)
+                .input("finshed2", finshed2 || null)
+                .input("taken", taken || null)
+                .input("totalQut", totalQut !== undefined && totalQut !== null && totalQut !== "" ? parseInt(totalQut, 10) : null)
+                .input("qut", qut !== undefined && qut !== null && qut !== "" ? parseInt(qut, 10) : null)
+                .input("qutIN", qutIN !== undefined && qutIN !== null && qutIN !== "" ? parseInt(qutIN, 10) : null)
+                .input("qutun", qutun !== undefined && qutun !== null && qutun !== "" ? parseInt(qutun, 10) : null)
+                .input("brcode", brcode !== undefined && brcode !== null && brcode !== "" ? parseInt(brcode, 10) : null)
+                .input("notic", notic || null);
+
+            if (existing.recordset[0]) {
+                await request.query(`
+                    UPDATE [Dat Orders]
+                    SET projNo = @projNo, ProdctionNO = @ProdctionNO, datOrder = @datOrder,
+                        dat1 = @dat1, dat2 = @dat2, dat3 = @dat3, finshed1 = @finshed1, finshed2 = @finshed2,
+                        taken = @taken, totalQut = @totalQut, qut = @qut, qutIN = @qutIN, qutun = @qutun,
+                        brcode = @brcode, Notic = @notic
+                    WHERE orderNo = @orderNo
+                `);
+            } else {
+                await request.query(`
+                    INSERT INTO [Dat Orders]
+                        (orderNo, projNo, ProdctionNO, datOrder, dat1, dat2, dat3, finshed1, finshed2,
+                         taken, totalQut, qut, qutIN, qutun, brcode, Notic)
+                    VALUES
+                        (@orderNo, @projNo, @ProdctionNO, @datOrder, @dat1, @dat2, @dat3, @finshed1, @finshed2,
+                         @taken, @totalQut, @qut, @qutIN, @qutun, @brcode, @notic)
+                `);
+            }
+
+            return true;
+        });
+
+        if (!orderFound) {
             return res.status(404).json({ success: false, message: "Order not found" });
-        }
-
-        const existing = await pool.request()
-            .input("orderNo", orderNo)
-            .query("SELECT orderNo FROM [Dat Orders] WHERE orderNo = @orderNo");
-
-        const request = pool.request()
-            .input("orderNo", orderNo)
-            .input("projNo", order.projNo || null)
-            .input("ProdctionNO", order.ProdctionNO || null)
-            .input("datOrder", datOrder || null)
-            .input("dat1", dat1 || null)
-            .input("dat2", dat2 || null)
-            .input("dat3", dat3 || null)
-            .input("finshed1", finshed1 || null)
-            .input("finshed2", finshed2 || null)
-            .input("taken", taken || null)
-            .input("totalQut", totalQut !== undefined && totalQut !== null && totalQut !== "" ? parseInt(totalQut, 10) : null)
-            .input("qut", qut !== undefined && qut !== null && qut !== "" ? parseInt(qut, 10) : null)
-            .input("qutIN", qutIN !== undefined && qutIN !== null && qutIN !== "" ? parseInt(qutIN, 10) : null)
-            .input("qutun", qutun !== undefined && qutun !== null && qutun !== "" ? parseInt(qutun, 10) : null)
-            .input("brcode", brcode !== undefined && brcode !== null && brcode !== "" ? parseInt(brcode, 10) : null)
-            .input("notic", notic || null);
-
-        if (existing.recordset[0]) {
-            await request.query(`
-                UPDATE [Dat Orders]
-                SET projNo = @projNo, ProdctionNO = @ProdctionNO, datOrder = @datOrder,
-                    dat1 = @dat1, dat2 = @dat2, dat3 = @dat3, finshed1 = @finshed1, finshed2 = @finshed2,
-                    taken = @taken, totalQut = @totalQut, qut = @qut, qutIN = @qutIN, qutun = @qutun,
-                    brcode = @brcode, Notic = @notic
-                WHERE orderNo = @orderNo
-            `);
-        } else {
-            await request.query(`
-                INSERT INTO [Dat Orders]
-                    (orderNo, projNo, ProdctionNO, datOrder, dat1, dat2, dat3, finshed1, finshed2,
-                     taken, totalQut, qut, qutIN, qutun, brcode, Notic)
-                VALUES
-                    (@orderNo, @projNo, @ProdctionNO, @datOrder, @dat1, @dat2, @dat3, @finshed1, @finshed2,
-                     @taken, @totalQut, @qut, @qutIN, @qutun, @brcode, @notic)
-            `);
         }
 
         res.json({ success: true });
@@ -478,32 +501,33 @@ router.get("/ready-to-ship", async (req, res) => {
     try {
         const orderNo = req.query.orderNo ? parseInt(req.query.orderNo) : null;
 
-        const pool = await getSqlPool("glass");
-        const request = pool.request();
-        let whereClause = "";
-        if (orderNo !== null) {
-            request.input("orderNo", orderNo);
-            whereClause = "AND d.orderNo = @orderNo";
-        }
+        const result = await withSqlRetry("glass", (pool) => {
+            const request = pool.request();
+            let whereClause = "";
+            if (orderNo !== null) {
+                request.input("orderNo", orderNo);
+                whereClause = "AND d.orderNo = @orderNo";
+            }
 
-        const result = await request.query(`
-            SELECT
-                d.orderNo, d.serialNo, d.itemNo, d.height, d.width, d.qty, d.barcode,
-                o.projNo, o.projName, o.projMgr,
-                s.QTYIN AS receivedQty,
-                ISNULL(g.shippedQty, 0) AS shippedQty,
-                s.QTYIN - ISNULL(g.shippedQty, 0) AS remainingToShip
-            FROM Sorderdetails d
-            JOIN Sorders o ON o.orderNo = d.orderNo
-            JOIN SSTOCK s ON s.OrderNo = d.orderNo AND s.SerialNo = d.serialNo
-            LEFT JOIN (
-                SELECT OrderNo, SerialNo, SUM(qty) AS shippedQty
-                FROM GlassOut
-                GROUP BY OrderNo, SerialNo
-            ) g ON g.OrderNo = d.orderNo AND g.SerialNo = d.serialNo
-            WHERE s.QTYIN > 0 AND s.QTYIN - ISNULL(g.shippedQty, 0) > 0 ${whereClause}
-            ORDER BY d.orderNo DESC, d.serialNo ASC
-        `);
+            return request.query(`
+                SELECT
+                    d.orderNo, d.serialNo, d.itemNo, d.height, d.width, d.qty, d.barcode,
+                    o.projNo, o.projName, o.projMgr,
+                    s.QTYIN AS receivedQty,
+                    ISNULL(g.shippedQty, 0) AS shippedQty,
+                    s.QTYIN - ISNULL(g.shippedQty, 0) AS remainingToShip
+                FROM Sorderdetails d
+                JOIN Sorders o ON o.orderNo = d.orderNo
+                JOIN SSTOCK s ON s.OrderNo = d.orderNo AND s.SerialNo = d.serialNo
+                LEFT JOIN (
+                    SELECT OrderNo, SerialNo, SUM(qty) AS shippedQty
+                    FROM GlassOut
+                    GROUP BY OrderNo, SerialNo
+                ) g ON g.OrderNo = d.orderNo AND g.SerialNo = d.serialNo
+                WHERE s.QTYIN > 0 AND s.QTYIN - ISNULL(g.shippedQty, 0) > 0 ${whereClause}
+                ORDER BY d.orderNo DESC, d.serialNo ASC
+            `);
+        });
 
         res.json({ success: true, items: result.recordset });
     } catch (err) {
@@ -518,25 +542,26 @@ router.get("/not-received", async (req, res) => {
     try {
         const orderNo = req.query.orderNo ? parseInt(req.query.orderNo) : null;
 
-        const pool = await getSqlPool("glass");
-        const request = pool.request();
-        let whereClause = "";
-        if (orderNo !== null) {
-            request.input("orderNo", orderNo);
-            whereClause = "AND d.orderNo = @orderNo";
-        }
+        const result = await withSqlRetry("glass", (pool) => {
+            const request = pool.request();
+            let whereClause = "";
+            if (orderNo !== null) {
+                request.input("orderNo", orderNo);
+                whereClause = "AND d.orderNo = @orderNo";
+            }
 
-        const result = await request.query(`
-            SELECT
-                d.orderNo, d.serialNo, d.itemNo, d.height, d.width, d.qty, d.barcode,
-                d.expectdate, d.status, o.projNo, o.projName, o.projMgr,
-                ISNULL(s.QTYIN, 0) AS receivedQty
-            FROM Sorderdetails d
-            JOIN Sorders o ON o.orderNo = d.orderNo
-            LEFT JOIN SSTOCK s ON s.OrderNo = d.orderNo AND s.SerialNo = d.serialNo
-            WHERE ISNULL(s.QTYIN, 0) < d.qty ${whereClause}
-            ORDER BY d.orderNo DESC, d.serialNo ASC
-        `);
+            return request.query(`
+                SELECT
+                    d.orderNo, d.serialNo, d.itemNo, d.height, d.width, d.qty, d.barcode,
+                    d.expectdate, d.status, o.projNo, o.projName, o.projMgr,
+                    ISNULL(s.QTYIN, 0) AS receivedQty
+                FROM Sorderdetails d
+                JOIN Sorders o ON o.orderNo = d.orderNo
+                LEFT JOIN SSTOCK s ON s.OrderNo = d.orderNo AND s.SerialNo = d.serialNo
+                WHERE ISNULL(s.QTYIN, 0) < d.qty ${whereClause}
+                ORDER BY d.orderNo DESC, d.serialNo ASC
+            `);
+        });
 
         res.json({ success: true, items: result.recordset });
     } catch (err) {
@@ -555,8 +580,7 @@ router.get("/barcode/:barcode", async (req, res) => {
             return res.status(400).json({ success: false, message: "Invalid barcode" });
         }
 
-        const pool = await getSqlPool("glass");
-        const result = await pool.request()
+        const result = await withSqlRetry("glass", (pool) => pool.request()
             .input("barcode", barcode)
             .query(`
                 SELECT
@@ -575,7 +599,7 @@ router.get("/barcode/:barcode", async (req, res) => {
                     GROUP BY OrderNo, SerialNo
                 ) g ON g.OrderNo = d.orderNo AND g.SerialNo = d.serialNo
                 WHERE d.barcode = @barcode
-            `);
+            `));
 
         if (!result.recordset[0]) {
             return res.status(404).json({ success: false, message: "No item found for this barcode" });
@@ -594,31 +618,32 @@ router.get("/items", async (req, res) => {
         const search = String(req.query.search || "").trim();
         const onlyNotReceived = req.query.onlyNotReceived === "true";
 
-        const pool = await getSqlPool("glass");
-        const request = pool.request();
-        const conditions = [];
-        if (search) {
-            request.input("search", `%${search}%`);
-            conditions.push("(o.projName LIKE @search OR o.projNo LIKE @search OR d.itemNo LIKE @search)");
-        }
-        if (onlyNotReceived) {
-            conditions.push("ISNULL(s.QTYIN, 0) < d.qty");
-        }
-        const whereClause = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+        const result = await withSqlRetry("glass", (pool) => {
+            const request = pool.request();
+            const conditions = [];
+            if (search) {
+                request.input("search", `%${search}%`);
+                conditions.push("(o.projName LIKE @search OR o.projNo LIKE @search OR d.itemNo LIKE @search)");
+            }
+            if (onlyNotReceived) {
+                conditions.push("ISNULL(s.QTYIN, 0) < d.qty");
+            }
+            const whereClause = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
 
-        const result = await request.query(`
-            SELECT
-                d.orderNo, d.serialNo, d.itemNo, d.height, d.width, d.qty, d.barcode,
-                d.incolor, d.intype, d.inthickness, d.spacer, d.outcolor, d.outtype, d.outthickness,
-                d.section, d.shape, d.status, d.expectdate,
-                o.projNo, o.projName, o.projMgr,
-                ISNULL(s.QTYIN, 0) AS receivedQty
-            FROM Sorderdetails d
-            JOIN Sorders o ON o.orderNo = d.orderNo
-            LEFT JOIN SSTOCK s ON s.OrderNo = d.orderNo AND s.SerialNo = d.serialNo
-            ${whereClause}
-            ORDER BY d.orderNo DESC, d.serialNo ASC
-        `);
+            return request.query(`
+                SELECT
+                    d.orderNo, d.serialNo, d.itemNo, d.height, d.width, d.qty, d.barcode,
+                    d.incolor, d.intype, d.inthickness, d.spacer, d.outcolor, d.outtype, d.outthickness,
+                    d.section, d.shape, d.status, d.expectdate,
+                    o.projNo, o.projName, o.projMgr,
+                    ISNULL(s.QTYIN, 0) AS receivedQty
+                FROM Sorderdetails d
+                JOIN Sorders o ON o.orderNo = d.orderNo
+                LEFT JOIN SSTOCK s ON s.OrderNo = d.orderNo AND s.SerialNo = d.serialNo
+                ${whereClause}
+                ORDER BY d.orderNo DESC, d.serialNo ASC
+            `);
+        });
 
         res.json({ success: true, items: result.recordset });
     } catch (err) {
@@ -687,8 +712,7 @@ router.get("/orders/:orderNo/billing", async (req, res) => {
             return res.status(400).json({ success: false, message: "Invalid orderNo" });
         }
 
-        const pool = await getSqlPool("glass");
-        const result = await pool.request()
+        const result = await withSqlRetry("glass", (pool) => pool.request()
             .input("orderNo", orderNo)
             .query(`
                 SELECT orderNo, serialNo, itemNo, height, width, qty, spacer, intype, outtype,
@@ -696,7 +720,7 @@ router.get("/orders/:orderNo/billing", async (req, res) => {
                 FROM Sorderdetails
                 WHERE orderNo = @orderNo
                 ORDER BY serialNo ASC
-            `);
+            `));
 
         const items = result.recordset.map(row => ({ ...row, ...computeBilling(row) }));
         const orderTotal = round3(items.reduce((sum, it) => sum + it.totalPU, 0));
@@ -722,8 +746,7 @@ router.put("/orders/:orderNo/items/:serialNo/billing", async (req, res) => {
     }
 
     try {
-        const pool = await getSqlPool("glass");
-        const result = await pool.request()
+        const result = await withSqlRetry("glass", (pool) => pool.request()
             .input("orderNo", orderNo)
             .input("serialNo", serialNo)
             .input("price", price != null ? parseFloat(price) : null)
@@ -736,7 +759,7 @@ router.put("/orders/:orderNo/items/:serialNo/billing", async (req, res) => {
                 SET price = @price, price1 = @price1, plusCost = @plusCost,
                     pricingType = @pricingType, billNote = @billNote
                 WHERE orderNo = @orderNo AND serialNo = @serialNo
-            `);
+            `));
         if (result.rowsAffected[0] === 0) {
             return res.status(404).json({ success: false, message: "Item not found in this order" });
         }
@@ -756,15 +779,14 @@ router.get("/orders/:orderNo/bills", async (req, res) => {
             return res.status(400).json({ success: false, message: "Invalid orderNo" });
         }
 
-        const pool = await getSqlPool("glass");
-        const result = await pool.request()
+        const result = await withSqlRetry("glass", (pool) => pool.request()
             .input("orderNo", orderNo)
             .query(`
                 SELECT ID, orderNo, BillNO, Price, DateBill, Note, DateEnter
                 FROM SBill
                 WHERE orderNo = @orderNo
                 ORDER BY DateEnter DESC
-            `);
+            `));
         res.json({ success: true, bills: result.recordset });
     } catch (err) {
         console.error("❌ GLASS BILLS ERROR:", err);
@@ -784,8 +806,7 @@ router.post("/orders/:orderNo/bills", async (req, res) => {
     }
 
     try {
-        const pool = await getSqlPool("glass");
-        const result = await pool.request()
+        const result = await withSqlRetry("glass", (pool) => pool.request()
             .input("orderNo", orderNo)
             .input("BillNO", BillNO ? parseInt(BillNO) : null)
             .input("Price", parseFloat(Price))
@@ -795,7 +816,7 @@ router.post("/orders/:orderNo/bills", async (req, res) => {
                 INSERT INTO SBill (orderNo, BillNO, Price, DateBill, Note, DateEnter)
                 OUTPUT INSERTED.ID
                 VALUES (@orderNo, @BillNO, @Price, @DateBill, @Note, GETDATE())
-            `);
+            `));
         res.json({ success: true, id: result.recordset[0].ID });
     } catch (err) {
         console.error("❌ GLASS CREATE BILL ERROR:", err);
@@ -808,40 +829,41 @@ router.post("/orders/:orderNo/bills", async (req, res) => {
 router.get("/reports/status", async (req, res) => {
     try {
         const { dateFrom, dateTo, projNo } = req.query;
-        const pool = await getSqlPool("glass");
-        const request = pool.request();
-        const conditions = [];
-        if (dateFrom) { request.input("dateFrom", dateFrom); conditions.push("o.oderDate >= @dateFrom"); }
-        if (dateTo) { request.input("dateTo", dateTo); conditions.push("o.oderDate <= @dateTo"); }
-        if (projNo) { request.input("projNo", `%${projNo}%`); conditions.push("o.projNo LIKE @projNo"); }
-        const whereClause = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+        const result = await withSqlRetry("glass", (pool) => {
+            const request = pool.request();
+            const conditions = [];
+            if (dateFrom) { request.input("dateFrom", dateFrom); conditions.push("o.oderDate >= @dateFrom"); }
+            if (dateTo) { request.input("dateTo", dateTo); conditions.push("o.oderDate <= @dateTo"); }
+            if (projNo) { request.input("projNo", `%${projNo}%`); conditions.push("o.projNo LIKE @projNo"); }
+            const whereClause = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
 
-        const result = await request.query(`
-            SELECT
-                o.orderNo, o.projNo, o.projName, o.projMgr, o.oderDate,
-                ISNULL(lines.totalQty, 0) AS totalQty,
-                ISNULL(received.totalReceived, 0) AS totalReceived,
-                ISNULL(lines.lineCount, 0) AS lineCount,
-                ISNULL(fullyReceived.cnt, 0) AS fullyReceivedLines
-            FROM Sorders o
-            LEFT JOIN (
-                SELECT orderNo, SUM(qty) AS totalQty, COUNT(*) AS lineCount
-                FROM Sorderdetails GROUP BY orderNo
-            ) lines ON lines.orderNo = o.orderNo
-            LEFT JOIN (
-                SELECT OrderNo, SUM(QTYIN) AS totalReceived
-                FROM SSTOCK GROUP BY OrderNo
-            ) received ON received.OrderNo = o.orderNo
-            LEFT JOIN (
-                SELECT d.orderNo, COUNT(*) AS cnt
-                FROM Sorderdetails d
-                LEFT JOIN SSTOCK s ON s.OrderNo = d.orderNo AND s.SerialNo = d.serialNo
-                WHERE ISNULL(s.QTYIN, 0) >= d.qty
-                GROUP BY d.orderNo
-            ) fullyReceived ON fullyReceived.orderNo = o.orderNo
-            ${whereClause}
-            ORDER BY o.orderNo DESC
-        `);
+            return request.query(`
+                SELECT
+                    o.orderNo, o.projNo, o.projName, o.projMgr, o.oderDate,
+                    ISNULL(lines.totalQty, 0) AS totalQty,
+                    ISNULL(received.totalReceived, 0) AS totalReceived,
+                    ISNULL(lines.lineCount, 0) AS lineCount,
+                    ISNULL(fullyReceived.cnt, 0) AS fullyReceivedLines
+                FROM Sorders o
+                LEFT JOIN (
+                    SELECT orderNo, SUM(qty) AS totalQty, COUNT(*) AS lineCount
+                    FROM Sorderdetails GROUP BY orderNo
+                ) lines ON lines.orderNo = o.orderNo
+                LEFT JOIN (
+                    SELECT OrderNo, SUM(QTYIN) AS totalReceived
+                    FROM SSTOCK GROUP BY OrderNo
+                ) received ON received.OrderNo = o.orderNo
+                LEFT JOIN (
+                    SELECT d.orderNo, COUNT(*) AS cnt
+                    FROM Sorderdetails d
+                    LEFT JOIN SSTOCK s ON s.OrderNo = d.orderNo AND s.SerialNo = d.serialNo
+                    WHERE ISNULL(s.QTYIN, 0) >= d.qty
+                    GROUP BY d.orderNo
+                ) fullyReceived ON fullyReceived.orderNo = o.orderNo
+                ${whereClause}
+                ORDER BY o.orderNo DESC
+            `);
+        });
 
         const orders = result.recordset.map(row => ({
             ...row,
@@ -868,35 +890,37 @@ router.get("/reports/status", async (req, res) => {
 router.get("/reports/billing", async (req, res) => {
     try {
         const { dateFrom, dateTo, projNo } = req.query;
-        const pool = await getSqlPool("glass");
+        const { itemsResult, billsResult } = await withSqlRetry("glass", async (pool) => {
+            const itemsRequest = pool.request();
+            const itemConditions = ["d.price IS NOT NULL"];
+            if (dateFrom) { itemsRequest.input("dateFrom", dateFrom); itemConditions.push("o.oderDate >= @dateFrom"); }
+            if (dateTo) { itemsRequest.input("dateTo", dateTo); itemConditions.push("o.oderDate <= @dateTo"); }
+            if (projNo) { itemsRequest.input("projNo", `%${projNo}%`); itemConditions.push("o.projNo LIKE @projNo"); }
+            const itemsResult = await itemsRequest.query(`
+                SELECT o.orderNo, o.projNo, o.projName,
+                       d.height, d.width, d.qty, d.spacer, d.intype, d.outtype,
+                       d.price, d.price1, d.plusCost, d.pricingType
+                FROM Sorderdetails d
+                JOIN Sorders o ON o.orderNo = d.orderNo
+                WHERE ${itemConditions.join(" AND ")}
+            `);
 
-        const itemsRequest = pool.request();
-        const itemConditions = ["d.price IS NOT NULL"];
-        if (dateFrom) { itemsRequest.input("dateFrom", dateFrom); itemConditions.push("o.oderDate >= @dateFrom"); }
-        if (dateTo) { itemsRequest.input("dateTo", dateTo); itemConditions.push("o.oderDate <= @dateTo"); }
-        if (projNo) { itemsRequest.input("projNo", `%${projNo}%`); itemConditions.push("o.projNo LIKE @projNo"); }
-        const itemsResult = await itemsRequest.query(`
-            SELECT o.orderNo, o.projNo, o.projName,
-                   d.height, d.width, d.qty, d.spacer, d.intype, d.outtype,
-                   d.price, d.price1, d.plusCost, d.pricingType
-            FROM Sorderdetails d
-            JOIN Sorders o ON o.orderNo = d.orderNo
-            WHERE ${itemConditions.join(" AND ")}
-        `);
+            const billsRequest = pool.request();
+            const billConditions = [];
+            if (dateFrom) { billsRequest.input("dateFrom", dateFrom); billConditions.push("b.DateEnter >= @dateFrom"); }
+            if (dateTo) { billsRequest.input("dateTo", dateTo); billConditions.push("b.DateEnter <= @dateTo"); }
+            if (projNo) { billsRequest.input("projNo", `%${projNo}%`); billConditions.push("o.projNo LIKE @projNo"); }
+            const billsWhereClause = billConditions.length ? `WHERE ${billConditions.join(" AND ")}` : "";
+            const billsResult = await billsRequest.query(`
+                SELECT o.projNo, o.projName, SUM(b.Price) AS invoicedTotal, COUNT(*) AS billCount
+                FROM SBill b
+                JOIN Sorders o ON o.orderNo = b.orderNo
+                ${billsWhereClause}
+                GROUP BY o.projNo, o.projName
+            `);
 
-        const billsRequest = pool.request();
-        const billConditions = [];
-        if (dateFrom) { billsRequest.input("dateFrom", dateFrom); billConditions.push("b.DateEnter >= @dateFrom"); }
-        if (dateTo) { billsRequest.input("dateTo", dateTo); billConditions.push("b.DateEnter <= @dateTo"); }
-        if (projNo) { billsRequest.input("projNo", `%${projNo}%`); billConditions.push("o.projNo LIKE @projNo"); }
-        const billsWhereClause = billConditions.length ? `WHERE ${billConditions.join(" AND ")}` : "";
-        const billsResult = await billsRequest.query(`
-            SELECT o.projNo, o.projName, SUM(b.Price) AS invoicedTotal, COUNT(*) AS billCount
-            FROM SBill b
-            JOIN Sorders o ON o.orderNo = b.orderNo
-            ${billsWhereClause}
-            GROUP BY o.projNo, o.projName
-        `);
+            return { itemsResult, billsResult };
+        });
 
         const byProject = new Map();
         itemsResult.recordset.forEach(row => {
@@ -935,8 +959,7 @@ router.get("/reports/billing", async (req, res) => {
 // yet fully received.
 router.get("/reports/overdue", async (req, res) => {
     try {
-        const pool = await getSqlPool("glass");
-        const result = await pool.request().query(`
+        const result = await withSqlRetry("glass", (pool) => pool.request().query(`
             SELECT
                 d.orderNo, d.serialNo, d.itemNo, d.qty, d.expectdate, d.barcode,
                 o.projNo, o.projName, o.projMgr,
@@ -949,11 +972,64 @@ router.get("/reports/overdue", async (req, res) => {
               AND d.expectdate < GETDATE()
               AND ISNULL(s.QTYIN, 0) < d.qty
             ORDER BY d.expectdate ASC
-        `);
+        `));
         res.json({ success: true, items: result.recordset });
     } catch (err) {
         console.error("❌ GLASS OVERDUE REPORT ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to fetch overdue report" });
+    }
+});
+
+// GET /api/glass/reports/factory-status?dateFrom=&dateTo=&projNo= — every
+// current order bucketed by where it stands at the external Ittihad
+// factory, the aggregate view legacy Access's UnderWork/LateDate/NoDate/
+// FINSH reports gave (this app's own /orders/:orderNo/appointments is
+// per-order only). [Dat Orders] has no single "the appointment date"
+// column — datOrder is when a slot was secured, dat1/dat2/dat3 are
+// reschedule history — so COALESCE(dat3, dat2, dat1, datOrder) (most
+// recently set wins) is the best available "current expected date" for
+// the late-bucket check. Confirmed live against the real table: 42 rows
+// across its full history have finshed1 set without finshed2, so
+// underWork is a real, if small, bucket rather than dead code.
+router.get("/reports/factory-status", async (req, res) => {
+    try {
+        const { dateFrom, dateTo, projNo } = req.query;
+        const result = await withSqlRetry("glass", (pool) => {
+            const request = pool.request();
+            const conditions = [];
+            if (dateFrom) { request.input("dateFrom", dateFrom); conditions.push("o.oderDate >= @dateFrom"); }
+            if (dateTo) { request.input("dateTo", dateTo); conditions.push("o.oderDate <= @dateTo"); }
+            if (projNo) { request.input("projNo", `%${projNo}%`); conditions.push("o.projNo LIKE @projNo"); }
+            const whereClause = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+
+            return request.query(`
+                SELECT
+                    o.orderNo, o.projNo, o.projName, o.projMgr, o.oderDate,
+                    d.datOrder, d.dat1, d.dat2, d.dat3, d.finshed1, d.finshed2, d.taken,
+                    CASE
+                        WHEN d.orderNo IS NULL OR (d.datOrder IS NULL AND d.dat1 IS NULL AND d.dat2 IS NULL AND d.dat3 IS NULL) THEN 'noDate'
+                        WHEN d.taken IS NOT NULL THEN 'finished'
+                        WHEN d.finshed1 IS NOT NULL AND d.finshed2 IS NULL THEN 'underWork'
+                        WHEN COALESCE(d.dat3, d.dat2, d.dat1, d.datOrder) < CAST(GETDATE() AS date) THEN 'late'
+                        ELSE 'onTrack'
+                    END AS bucket
+                FROM Sorders o
+                LEFT JOIN [Dat Orders] d ON d.orderNo = o.orderNo
+                ${whereClause}
+                ORDER BY o.orderNo DESC
+            `);
+        });
+
+        const orders = result.recordset;
+        const totals = orders.reduce((acc, o) => {
+            acc[o.bucket] = (acc[o.bucket] || 0) + 1;
+            return acc;
+        }, { noDate: 0, late: 0, underWork: 0, finished: 0, onTrack: 0 });
+
+        res.json({ success: true, orders, totals });
+    } catch (err) {
+        console.error("❌ GLASS FACTORY STATUS REPORT ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to fetch factory status report" });
     }
 });
 

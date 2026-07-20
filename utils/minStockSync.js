@@ -10,7 +10,7 @@
 // staff manually re-entering them as a workaround (see glass.js's own
 // header comment on the never-built ship-out step); this makes that flow
 // automatic and correct instead of a manual duplicate-entry workaround.
-import { getSqlPool } from "../config/db.js";
+import { withSqlRetry } from "../config/db.js";
 
 function pad(value, width) {
     const str = String(value ?? "").trim();
@@ -63,64 +63,70 @@ export async function pushFinishedUnitToMinStock({
 }) {
     if (!projNo || !ProdctionNO || !qty || qty <= 0) return null;
 
-    const pool = await getSqlPool("minstock");
-    const minStockOrderNo = await findOrCreateStocko(pool, { projNo, projName, ProdctionNO, projMgr, category });
+    // Safe to retry whole: every write below is guarded by its own
+    // existing-check (STOCKO by projNo+ProdctionNO+category, Stock by the
+    // Note marker) and sets absolute values, not deltas — re-running this
+    // block from scratch after a transient failure lands on the same rows
+    // instead of creating duplicates or double-applying qty.
+    return withSqlRetry("minstock", async (pool) => {
+        const minStockOrderNo = await findOrCreateStocko(pool, { projNo, projName, ProdctionNO, projMgr, category });
 
-    const marker = `SRC:${sourceKey}`;
-    const existing = await pool.request()
-        .input("orderNo", minStockOrderNo)
-        .input("marker", `${marker}%`)
-        .query("SELECT serialNo FROM Stock WHERE orderNo = @orderNo AND Note LIKE @marker");
-
-    if (existing.recordset[0]) {
-        const serialNo = existing.recordset[0].serialNo;
-        // [out] is the source of truth for shipped qty (same pattern as
-        // mainStock.js's own checkout endpoints) — Stock.QTYOUT/SQTY are
-        // kept in sync from it, not treated as authoritative here either.
-        const shippedResult = await pool.request()
+        const marker = `SRC:${sourceKey}`;
+        const existing = await pool.request()
             .input("orderNo", minStockOrderNo)
-            .input("serialNo", serialNo)
-            .query("SELECT ISNULL(SUM(OUTQTY), 0) AS shipped FROM [out] WHERE orderNo = @orderNo AND serialNo = @serialNo");
-        const shipped = shippedResult.recordset[0].shipped;
+            .input("marker", `${marker}%`)
+            .query("SELECT serialNo FROM Stock WHERE orderNo = @orderNo AND Note LIKE @marker");
+
+        if (existing.recordset[0]) {
+            const serialNo = existing.recordset[0].serialNo;
+            // [out] is the source of truth for shipped qty (same pattern as
+            // mainStock.js's own checkout endpoints) — Stock.QTYOUT/SQTY are
+            // kept in sync from it, not treated as authoritative here either.
+            const shippedResult = await pool.request()
+                .input("orderNo", minStockOrderNo)
+                .input("serialNo", serialNo)
+                .query("SELECT ISNULL(SUM(OUTQTY), 0) AS shipped FROM [out] WHERE orderNo = @orderNo AND serialNo = @serialNo");
+            const shipped = shippedResult.recordset[0].shipped;
+            await pool.request()
+                .input("orderNo", minStockOrderNo)
+                .input("serialNo", serialNo)
+                .input("qty", qty)
+                .input("shipped", shipped)
+                .query(`
+                    UPDATE Stock
+                    SET QTY = @qty, QTYOUT = @shipped, SQTY = @qty - @shipped, X = CASE WHEN @qty = @shipped THEN 1 ELSE 0 END
+                    WHERE orderNo = @orderNo AND serialNo = @serialNo
+                `);
+            return { minStockOrderNo, serialNo, created: false };
+        }
+
+        const maxResult = await pool.request()
+            .input("orderNo", minStockOrderNo)
+            .query("SELECT ISNULL(MAX(serialNo), 0) AS maxSerial FROM Stock WHERE orderNo = @orderNo");
+        const serialNo = maxResult.recordset[0].maxSerial + 1;
+        // Reuse the source item's own barcode when given one (e.g. Glass's
+        // already-printed physical sticker) so re-scanning that same sticker
+        // resolves here via mainStock.js's own /barcode lookup — a freshly
+        // generated number here would never match what's actually on the item.
+        // Falls back to the same formula as mainStock.js's own item-creation
+        // endpoint when the caller has no source barcode of its own to reuse.
+        const barcode = sourceBarcode ?? parseInt(`${minStockOrderNo}${serialNo}`);
+        const barcode1 = [pad(projNo, 5), pad(0, 2), pad(ProdctionNO, 3), pad(unitNo ?? serialNo, 6), pad(0, 6)].join(" ");
+
         await pool.request()
             .input("orderNo", minStockOrderNo)
             .input("serialNo", serialNo)
-            .input("qty", qty)
-            .input("shipped", shipped)
+            .input("C", category)
+            .input("Prodc", description || null)
+            .input("UNO", String(unitNo ?? serialNo))
+            .input("QTY", qty)
+            .input("Note", marker)
+            .input("barcode", barcode)
+            .input("barcode1", barcode1)
             .query(`
-                UPDATE Stock
-                SET QTY = @qty, QTYOUT = @shipped, SQTY = @qty - @shipped, X = CASE WHEN @qty = @shipped THEN 1 ELSE 0 END
-                WHERE orderNo = @orderNo AND serialNo = @serialNo
+                INSERT INTO Stock (orderNo, serialNo, C, Prodc, UNO, QTY, SQTY, QTYOUT, X, Date, Note, barcode, barcode1)
+                VALUES (@orderNo, @serialNo, @C, @Prodc, @UNO, @QTY, @QTY, 0, 0, GETDATE(), @Note, @barcode, @barcode1)
             `);
-        return { minStockOrderNo, serialNo, created: false };
-    }
-
-    const maxResult = await pool.request()
-        .input("orderNo", minStockOrderNo)
-        .query("SELECT ISNULL(MAX(serialNo), 0) AS maxSerial FROM Stock WHERE orderNo = @orderNo");
-    const serialNo = maxResult.recordset[0].maxSerial + 1;
-    // Reuse the source item's own barcode when given one (e.g. Glass's
-    // already-printed physical sticker) so re-scanning that same sticker
-    // resolves here via mainStock.js's own /barcode lookup — a freshly
-    // generated number here would never match what's actually on the item.
-    // Falls back to the same formula as mainStock.js's own item-creation
-    // endpoint when the caller has no source barcode of its own to reuse.
-    const barcode = sourceBarcode ?? parseInt(`${minStockOrderNo}${serialNo}`);
-    const barcode1 = [pad(projNo, 5), pad(0, 2), pad(ProdctionNO, 3), pad(unitNo ?? serialNo, 6), pad(0, 6)].join(" ");
-
-    await pool.request()
-        .input("orderNo", minStockOrderNo)
-        .input("serialNo", serialNo)
-        .input("C", category)
-        .input("Prodc", description || null)
-        .input("UNO", String(unitNo ?? serialNo))
-        .input("QTY", qty)
-        .input("Note", marker)
-        .input("barcode", barcode)
-        .input("barcode1", barcode1)
-        .query(`
-            INSERT INTO Stock (orderNo, serialNo, C, Prodc, UNO, QTY, SQTY, QTYOUT, X, Date, Note, barcode, barcode1)
-            VALUES (@orderNo, @serialNo, @C, @Prodc, @UNO, @QTY, @QTY, 0, 0, GETDATE(), @Note, @barcode, @barcode1)
-        `);
-    return { minStockOrderNo, serialNo, created: true };
+        return { minStockOrderNo, serialNo, created: true };
+    });
 }
