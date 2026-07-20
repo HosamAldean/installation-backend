@@ -1464,6 +1464,8 @@ router.get("/card/:computerNo", async (req, res) => {
         if (!computerNo) {
             return res.status(400).json({ success: false, message: "computerNo required" });
         }
+        const dateFrom = req.query.dateFrom || null;
+        const dateTo = req.query.dateTo || null;
         const storeNo = req.user.assignedStore || null;
 
         const pool = await getSqlPool("stockhouse");
@@ -1486,7 +1488,19 @@ router.get("/card/:computerNo", async (req, res) => {
             }
         }
 
-        const result = await pool.request().input("computerNo", computerNo).query(`
+        // dateFrom/dateTo bound each branch by its own SDate — matches the
+        // legacy Access app's asd/asdDate forms (bound StockOut records by
+        // date before viewing/printing). Since the running balance below is
+        // computed only over the filtered rows, "balance" here means
+        // "balance within the selected date range," not true absolute
+        // on-hand — same as the legacy behavior (a bounded listing, not a
+        // carried-forward ledger), surfaced to the user via a caption in
+        // the frontend rather than silently implied.
+        const result = await pool.request()
+            .input("computerNo", computerNo)
+            .input("dateFrom", dateFrom)
+            .input("dateTo", dateTo)
+            .query(`
             SELECT date, type, qty, ref, ProfileNO, ProfileName, Color, LinthRe, StoreNo, SUser,
                    SUM(balanceQty) OVER (ORDER BY date, seq, RecordNO, SerialNo ROWS UNBOUNDED PRECEDING) AS balance
             FROM (
@@ -1495,6 +1509,8 @@ router.get("/card/:computerNo", async (req, res) => {
                        1 AS seq, ed.RecordNO, ed.SerialNo
                 FROM guest.EnterDou ed
                 WHERE ed.ComputerNO = @computerNo
+                  AND (@dateFrom IS NULL OR ed.SDate >= @dateFrom)
+                  AND (@dateTo IS NULL OR ed.SDate <= @dateTo)
 
                 UNION ALL
 
@@ -1504,6 +1520,8 @@ router.get("/card/:computerNo", async (req, res) => {
                 FROM guest.StockOut so
                 JOIN guest.StockOutO soo ON so.RecordNO = soo.RecordNO
                 WHERE so.ComputerNO = @computerNo
+                  AND (@dateFrom IS NULL OR so.SDate >= @dateFrom)
+                  AND (@dateTo IS NULL OR so.SDate <= @dateTo)
 
                 UNION ALL
 
@@ -1513,6 +1531,8 @@ router.get("/card/:computerNo", async (req, res) => {
                 FROM guest.StockBack sb
                 JOIN guest.StockBackO sbo ON sb.RecordNO = sbo.RecordNO
                 WHERE sb.ComputerNO = @computerNo
+                  AND (@dateFrom IS NULL OR sb.SDate >= @dateFrom)
+                  AND (@dateTo IS NULL OR sb.SDate <= @dateTo)
 
                 UNION ALL
 
@@ -1538,6 +1558,8 @@ router.get("/card/:computerNo", async (req, res) => {
                 FROM guest.MIX mx
                 JOIN guest.MIXO mo ON mx.RecordNO = mo.RecordNO
                 WHERE mx.ComputerNO = @computerNo
+                  AND (@dateFrom IS NULL OR mx.SDate >= @dateFrom)
+                  AND (@dateTo IS NULL OR mx.SDate <= @dateTo)
             ) t
             ORDER BY date, seq, RecordNO, SerialNo
         `);
@@ -2002,6 +2024,46 @@ router.post("/item-profiles/:id/photo", itemPhotoUpload.single("photo"), async (
     } catch (err) {
         console.error("❌ ITEM PROFILE PHOTO UPLOAD ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to upload photo" });
+    }
+});
+
+// GET /api/stock-house/item-profiles/:id/computer-numbers — the real
+// ComputerNO values (the actual per-item identifier staff scan/enter
+// elsewhere in this module, e.g. resolveComputerNo/EnterDou above) already
+// assigned to this profile's ProfileNO across every color+length+store
+// combination that's ever been entered. A profile-level catalog row here
+// doesn't have one ComputerNO of its own — ComputerNO is keyed by
+// (ProfileNO, Color, LinthRe, StoreNo) in dbo.EnterDouC — so this looks the
+// real ones up live rather than storing a single value that would only
+// ever reflect one variant.
+router.get("/item-profiles/:id/computer-numbers", async (req, res) => {
+    if (!requireAdmin(req, res)) return;
+    try {
+        const id = parseInt(req.params.id, 10);
+        if (!Number.isInteger(id)) {
+            return res.status(400).json({ success: false, message: "Invalid id" });
+        }
+
+        const pool = await getSqlPool("stockhouse");
+        const profile = await pool.request().input("id", id)
+            .query("SELECT ProfileNO FROM guest.ItemProfile WHERE ID = @id");
+        if (!profile.recordset[0]) {
+            return res.status(404).json({ success: false, message: "Item profile not found" });
+        }
+
+        const result = await pool.request()
+            .input("profileNO", profile.recordset[0].ProfileNO)
+            .query(`
+                SELECT DISTINCT ComputerNO, Color, LinthRe, StoreNo
+                FROM dbo.EnterDouC
+                WHERE ProfileNO = @profileNO AND ComputerNO IS NOT NULL
+                ORDER BY StoreNo, Color, LinthRe
+            `);
+
+        res.json({ success: true, computerNumbers: result.recordset });
+    } catch (err) {
+        console.error("❌ ITEM PROFILE COMPUTER NUMBERS ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to fetch computer numbers" });
     }
 });
 

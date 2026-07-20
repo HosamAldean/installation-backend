@@ -1248,13 +1248,25 @@ router.get("/order-check", async (req, res) => {
         const listRequest = pool.request();
         listRequest.input("offset", offset).input("pageSize", pageSize);
         if (search) listRequest.input("search", `%${search}%`);
+        // LEFT JOIN dbo.x1 pulls in the Place/Note fields the legacy
+        // QSendOrdersCR/CR2 dispatch-slip report showed alongside cutting/
+        // collecting % — x1.Note/OrederPlace/Place1/Place2 already exist and
+        // are already read/written by the /department-log endpoints above,
+        // just never surfaced here. Time (also on OrderCH itself) is legacy
+        // and effectively unused for current orders (checked live: no
+        // non-null value anywhere in the live order-number range) — shown
+        // only if present, not relied on as the print slip's real timestamp.
         const listResult = await listRequest.query(`
             SELECT
-                orderNo, projNo, projName, projMgr, ProdctionNO, oderDate, dateFinsh,
+                OrderCH.orderNo, OrderCH.projNo, OrderCH.projName, OrderCH.projMgr,
+                OrderCH.ProdctionNO, OrderCH.oderDate, OrderCH.dateFinsh,
                 Expr2 AS cuttingPct, Expr1 AS collectingPct, CountOforderNo AS itemCount,
+                OrderCH.Time AS time,
                 CASE WHEN dateFinsh IS NOT NULL AND dateFinsh >= oderDate
-                     THEN DATEDIFF(day, oderDate, dateFinsh) END AS turnaroundDays
+                     THEN DATEDIFF(day, oderDate, dateFinsh) END AS turnaroundDays,
+                x.Note AS note, x.OrederPlace AS orederPlace, x.Place1 AS place1, x.Place2 AS place2
             FROM dbo.OrderCH
+            LEFT JOIN dbo.x1 x ON x.orderno = OrderCH.orderNo
             ${whereClause}
             ORDER BY orderNo DESC
             OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY
