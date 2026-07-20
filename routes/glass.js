@@ -252,9 +252,14 @@ router.post("/orders/:orderNo/items", async (req, res) => {
 // already the established "Glass (legacy)" tag on mainStockCategories.ts)
 // so it becomes shippable through the existing Ship Multiple Items screen
 // — Glass does not get its own ship-out UI; Main Stock is the single
-// store+ship control point across departments. Best-effort: a failure here
-// doesn't fail the receive itself (the SQL Server write to Glass's own DB
-// already committed), just logs, since the two databases can't share a
+// store+ship control point across departments. The push reuses this same
+// item's own barcode (see minStockSync.js) rather than generating a new
+// one, so re-scanning the physical sticker already on the glass item
+// resolves straight to its Main Stock row — the mobile scan screen tries
+// Main Stock before Glass on every scan, so this is what actually routes
+// a received item into the ship flow. Best-effort: a failure here doesn't
+// fail the receive itself (the SQL Server write to Glass's own DB already
+// committed), just logs, since the two databases can't share a
 // transaction.
 router.post("/orders/:orderNo/items/:serialNo/receive", async (req, res) => {
     const orderNo = parseInt(req.params.orderNo);
@@ -325,6 +330,7 @@ router.post("/orders/:orderNo/items/:serialNo/receive", async (req, res) => {
                         .filter(Boolean).join(" "),
                     qty: totalQtyIn,
                     unitNo: item.barcode || serialNo,
+                    barcode: item.barcode || undefined,
                 });
             } catch (syncErr) {
                 console.error("⚠️ GLASS -> MIN STOCK SYNC FAILED (receive still succeeded):", syncErr);

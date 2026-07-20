@@ -59,7 +59,7 @@ async function findOrCreateStocko(pool, { projNo, projName, ProdctionNO, projMgr
 // `qty` is always the source item's current TOTAL available quantity (not
 // a delta), matching how Stock.QTY/SSTOCK.QTYIN both already work.
 export async function pushFinishedUnitToMinStock({
-    projNo, projName, ProdctionNO, projMgr, category, sourceKey, description, qty, unitNo,
+    projNo, projName, ProdctionNO, projMgr, category, sourceKey, description, qty, unitNo, barcode: sourceBarcode,
 }) {
     if (!projNo || !ProdctionNO || !qty || qty <= 0) return null;
 
@@ -99,9 +99,13 @@ export async function pushFinishedUnitToMinStock({
         .input("orderNo", minStockOrderNo)
         .query("SELECT ISNULL(MAX(serialNo), 0) AS maxSerial FROM Stock WHERE orderNo = @orderNo");
     const serialNo = maxResult.recordset[0].maxSerial + 1;
-    // Same barcode/barcode1 formula as mainStock.js's own item-creation
-    // endpoint, confirmed against live data there.
-    const barcode = parseInt(`${minStockOrderNo}${serialNo}`);
+    // Reuse the source item's own barcode when given one (e.g. Glass's
+    // already-printed physical sticker) so re-scanning that same sticker
+    // resolves here via mainStock.js's own /barcode lookup — a freshly
+    // generated number here would never match what's actually on the item.
+    // Falls back to the same formula as mainStock.js's own item-creation
+    // endpoint when the caller has no source barcode of its own to reuse.
+    const barcode = sourceBarcode ?? parseInt(`${minStockOrderNo}${serialNo}`);
     const barcode1 = [pad(projNo, 5), pad(0, 2), pad(ProdctionNO, 3), pad(unitNo ?? serialNo, 6), pad(0, 6)].join(" ");
 
     await pool.request()
