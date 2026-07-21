@@ -1466,4 +1466,124 @@ router.get("/order-check", async (req, res) => {
     }
 });
 
+// --- Per-department appointment schedule (dbo.ProDATE) ---------------------
+// A small (151 live rows), standalone table keyed by (projNo, ProdctionNO)
+// — not orderNo, confirmed unique on that pair — tracking a target
+// appointment date per department plus one actual-finish date, orthogonal
+// to the x1-x5 actual-completion logs already implemented above. Field
+// captions confirmed via Design-view COM inspection of the legacy
+// "ProDATE"/"ProDATE1" forms (both share the same field captions; ProDATE1
+// is just a "completed appointments" filtered view of the same table, per
+// its own form caption "جدول المواعيد المنتهية"): ALU="موعد الالمنيوم"
+// (aluminum appointment), Glass="موعد الزجاج" (glass appointment),
+// IRON="موعد التبادلات حديد" (iron/steel exchange appointment),
+// Finsh="موعد الانتهاء الفعلي" (actual finish date). IRONprod exists as a
+// column but has no label on either legacy form and is confirmed live to
+// be 100% unused (0 of 151 rows) — not exposed, same treatment as
+// Process.Tik1-4 and X1I's xc4/xc5 elsewhere in this app.
+router.get("/appointments-schedule", async (req, res) => {
+    try {
+        const { projNo } = req.query;
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 25));
+        const offset = (page - 1) * pageSize;
+
+        const result = await withSqlRetry("proj", async (pool) => {
+            const countRequest = pool.request();
+            const listRequest = pool.request().input("offset", offset).input("pageSize", pageSize);
+            let whereClause = "";
+            if (projNo) {
+                countRequest.input("projNo", `%${projNo}%`);
+                listRequest.input("projNo", `%${projNo}%`);
+                whereClause = "WHERE projNo LIKE @projNo OR projName LIKE @projNo";
+            }
+
+            const countResult = await countRequest.query(`SELECT COUNT(*) AS total FROM dbo.ProDATE ${whereClause}`);
+            const listResult = await listRequest.query(`
+                SELECT projNo, projName, ProdctionNO, Section, Product, ALU, Glass, IRON, Finsh
+                FROM dbo.ProDATE
+                ${whereClause}
+                ORDER BY projNo, ProdctionNO
+                OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY
+            `);
+            return { total: countResult.recordset[0].total, rows: listResult.recordset };
+        });
+
+        res.json({ success: true, entries: result.rows, total: result.total, page, pageSize });
+    } catch (err) {
+        console.error("❌ PROJ APPOINTMENTS SCHEDULE ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to fetch appointments schedule" });
+    }
+});
+
+router.post("/appointments-schedule", async (req, res) => {
+    const { projNo, projName, productionNo, section, product, alu, glass, iron, finsh } = req.body;
+    if (!projNo || !String(projNo).trim() || !productionNo || !String(productionNo).trim()) {
+        return res.status(400).json({ success: false, message: "projNo and productionNo are required" });
+    }
+
+    try {
+        const result = await withSqlRetry("proj", async (pool) => {
+            const existing = await pool.request()
+                .input("projNo", projNo)
+                .input("productionNo", productionNo)
+                .query("SELECT projNo FROM dbo.ProDATE WHERE projNo = @projNo AND ProdctionNO = @productionNo");
+            if (existing.recordset[0]) return { error: "duplicate" };
+
+            await pool.request()
+                .input("projNo", projNo)
+                .input("projName", projName || null)
+                .input("productionNo", productionNo)
+                .input("section", section || null)
+                .input("product", product || null)
+                .input("alu", alu || null)
+                .input("glass", glass || null)
+                .input("iron", iron || null)
+                .input("finsh", finsh || null)
+                .query(`
+                    INSERT INTO dbo.ProDATE (projNo, projName, ProdctionNO, Section, Product, ALU, Glass, IRON, Finsh)
+                    VALUES (@projNo, @projName, @productionNo, @section, @product, @alu, @glass, @iron, @finsh)
+                `);
+            return { ok: true };
+        });
+
+        if (result.error === "duplicate") {
+            return res.status(409).json({ success: false, message: "An appointment schedule for this project + production # already exists" });
+        }
+        res.status(201).json({ success: true });
+    } catch (err) {
+        console.error("❌ PROJ APPOINTMENTS SCHEDULE CREATE ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to create appointment schedule entry" });
+    }
+});
+
+router.put("/appointments-schedule/:projNo/:productionNo", async (req, res) => {
+    const { projNo, productionNo } = req.params;
+    const { section, product, alu, glass, iron, finsh } = req.body;
+
+    try {
+        const result = await withSqlRetry("proj", (pool) => pool.request()
+            .input("projNo", projNo)
+            .input("productionNo", productionNo)
+            .input("section", section || null)
+            .input("product", product || null)
+            .input("alu", alu || null)
+            .input("glass", glass || null)
+            .input("iron", iron || null)
+            .input("finsh", finsh || null)
+            .query(`
+                UPDATE dbo.ProDATE
+                SET Section = @section, Product = @product, ALU = @alu, Glass = @glass, IRON = @iron, Finsh = @finsh
+                WHERE projNo = @projNo AND ProdctionNO = @productionNo
+            `));
+        if (!result.rowsAffected[0]) {
+            return res.status(404).json({ success: false, message: "Appointment schedule entry not found" });
+        }
+        res.json({ success: true });
+    } catch (err) {
+        console.error("❌ PROJ APPOINTMENTS SCHEDULE UPDATE ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to update appointment schedule entry" });
+    }
+});
+
 export default router;
