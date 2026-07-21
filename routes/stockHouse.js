@@ -611,6 +611,64 @@ router.put("/ship/:recordNo", async (req, res) => {
     }
 });
 
+// GET /api/stock-house/ship — paginated shipment history, one flat row per
+// record (header+detail joined, SerialNo 1), same reasoning as GET /enter
+// above. Backs the new history tab for PUT /ship/:recordNo.
+router.get("/ship", async (req, res) => {
+    try {
+        const search = String(req.query.search || "").trim();
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 25));
+        const offset = (page - 1) * pageSize;
+        const storeNo = req.user.assignedStore || null;
+
+        const { total, rows } = await withSqlRetry("stockhouse", async (pool) => {
+            const filters = [];
+            const buildRequest = () => {
+                const request = pool.request();
+                if (search) {
+                    request.input("search", `%${search}%`);
+                    filters.length = 0;
+                    filters.push("(so.ProjectNO LIKE @search OR so.ProjectName LIKE @search OR sd.ComputerNO LIKE @search)");
+                }
+                if (storeNo) {
+                    request.input("storeNo", storeNo);
+                    filters.push("so.StoreNo = @storeNo");
+                }
+                return request;
+            };
+            const whereClause = () => (filters.length ? `WHERE ${filters.join(" AND ")}` : "");
+
+            const countResult = await buildRequest().query(`
+                SELECT COUNT(*) AS total
+                FROM guest.StockOutO so
+                JOIN guest.StockOut sd ON sd.RecordNO = so.RecordNO AND sd.SerialNo = 1
+                ${whereClause()}
+            `);
+
+            const listRequest = buildRequest();
+            listRequest.input("offset", offset).input("pageSize", pageSize);
+            const listResult = await listRequest.query(`
+                SELECT
+                    so.RecordNO, so.ProjectNO, so.ProjectName, so.ProductionNO, so.Worker, so.Date, so.StoreNo,
+                    sd.ProfileNO, sd.Color, sd.LinthRe, sd.QtyOut, sd.ComputerNO
+                FROM guest.StockOutO so
+                JOIN guest.StockOut sd ON sd.RecordNO = so.RecordNO AND sd.SerialNo = 1
+                ${whereClause()}
+                ORDER BY so.RecordNO DESC
+                OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY
+            `);
+
+            return { total: countResult.recordset[0].total, rows: listResult.recordset };
+        });
+
+        res.json({ success: true, records: rows, total, page, pageSize });
+    } catch (err) {
+        console.error("❌ STOCK HOUSE SHIP LIST ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to fetch shipment history" });
+    }
+});
+
 // POST /api/stock-house/return — record material coming back into the
 // store. projectNo is optional here — real data confirms generic returns
 // not tied to any specific project use the sentinel ProjectNO "stock" /
@@ -742,6 +800,64 @@ router.put("/return/:recordNo", async (req, res) => {
     } catch (err) {
         console.error("❌ STOCK HOUSE RETURN UPDATE ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to update return record" });
+    }
+});
+
+// GET /api/stock-house/return — paginated return history, one flat row per
+// record (header+detail joined, SerialNo 1), same reasoning as GET /enter
+// above. Backs the new history tab for PUT /return/:recordNo.
+router.get("/return", async (req, res) => {
+    try {
+        const search = String(req.query.search || "").trim();
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 25));
+        const offset = (page - 1) * pageSize;
+        const storeNo = req.user.assignedStore || null;
+
+        const { total, rows } = await withSqlRetry("stockhouse", async (pool) => {
+            const filters = [];
+            const buildRequest = () => {
+                const request = pool.request();
+                if (search) {
+                    request.input("search", `%${search}%`);
+                    filters.length = 0;
+                    filters.push("(so.ProjectNO LIKE @search OR so.ProjectName LIKE @search OR sd.ComputerNO LIKE @search)");
+                }
+                if (storeNo) {
+                    request.input("storeNo", storeNo);
+                    filters.push("so.StoreNo = @storeNo");
+                }
+                return request;
+            };
+            const whereClause = () => (filters.length ? `WHERE ${filters.join(" AND ")}` : "");
+
+            const countResult = await buildRequest().query(`
+                SELECT COUNT(*) AS total
+                FROM guest.StockBackO so
+                JOIN guest.StockBack sd ON sd.RecordNO = so.RecordNO AND sd.SerialNo = 1
+                ${whereClause()}
+            `);
+
+            const listRequest = buildRequest();
+            listRequest.input("offset", offset).input("pageSize", pageSize);
+            const listResult = await listRequest.query(`
+                SELECT
+                    so.RecordNO, so.ProjectNO, so.ProjectName, so.ProductionNO, so.Worker, so.Date, so.StoreNo,
+                    sd.ProfileNO, sd.Color, sd.LinthRe, sd.QtyOut, sd.ComputerNO
+                FROM guest.StockBackO so
+                JOIN guest.StockBack sd ON sd.RecordNO = so.RecordNO AND sd.SerialNo = 1
+                ${whereClause()}
+                ORDER BY so.RecordNO DESC
+                OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY
+            `);
+
+            return { total: countResult.recordset[0].total, rows: listResult.recordset };
+        });
+
+        res.json({ success: true, records: rows, total, page, pageSize });
+    } catch (err) {
+        console.error("❌ STOCK HOUSE RETURN LIST ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to fetch return history" });
     }
 });
 
@@ -1203,6 +1319,68 @@ router.get("/enter/:recordNo", async (req, res) => {
     } catch (err) {
         console.error("❌ STOCK HOUSE ENTER RECORD ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to fetch receive record" });
+    }
+});
+
+// GET /api/stock-house/enter — paginated receive history, one flat row per
+// record (header+detail joined, SerialNo 1) since every Enter POST writes
+// exactly one line item — mirrors GET /reservations, but skips that
+// endpoint's separate header/items-list split since there's never more
+// than one item to drill into here. Backs the new history tab whose PUT
+// /enter/:recordNo endpoint (above) previously had no UI path to reach it.
+router.get("/enter", async (req, res) => {
+    try {
+        const search = String(req.query.search || "").trim();
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 25));
+        const offset = (page - 1) * pageSize;
+        const storeNo = req.user.assignedStore || null;
+
+        const { total, rows } = await withSqlRetry("stockhouse", async (pool) => {
+            const filters = [];
+            const buildRequest = () => {
+                const request = pool.request();
+                if (search) {
+                    request.input("search", `%${search}%`);
+                    filters.length = 0;
+                    filters.push("(ed.ProfileNO LIKE @search OR ed.ComputerNO LIKE @search OR ed.Supplier LIKE @search)");
+                }
+                if (storeNo) {
+                    request.input("storeNo", storeNo);
+                    filters.push("eo.StoreNo = @storeNo");
+                }
+                return request;
+            };
+            const whereClause = () => (filters.length ? `WHERE ${filters.join(" AND ")}` : "");
+
+            const countResult = await buildRequest().query(`
+                SELECT COUNT(*) AS total
+                FROM guest.EnterDouO eo
+                JOIN guest.EnterDou ed ON ed.RecordNO = eo.RecordNO AND ed.SerialNo = 1
+                ${whereClause()}
+            `);
+
+            const listRequest = buildRequest();
+            listRequest.input("offset", offset).input("pageSize", pageSize);
+            const listResult = await listRequest.query(`
+                SELECT
+                    eo.RecordNO, eo.WHouseOffice, eo.QCOffice, eo.QCTestNo, eo.QCTestResult, eo.StoreNo, eo.SDate,
+                    ed.ProfileNO, ed.ProfileName, ed.Color, ed.LinthRe, ed.Supplier, ed.ProjectNO,
+                    ed.QtyRe, ed.QtyEvl, ed.QtyLs, ed.QtyRej, ed.ComputerNO
+                FROM guest.EnterDouO eo
+                JOIN guest.EnterDou ed ON ed.RecordNO = eo.RecordNO AND ed.SerialNo = 1
+                ${whereClause()}
+                ORDER BY eo.RecordNO DESC
+                OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY
+            `);
+
+            return { total: countResult.recordset[0].total, rows: listResult.recordset };
+        });
+
+        res.json({ success: true, records: rows, total, page, pageSize });
+    } catch (err) {
+        console.error("❌ STOCK HOUSE ENTER LIST ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to fetch receive history" });
     }
 });
 
