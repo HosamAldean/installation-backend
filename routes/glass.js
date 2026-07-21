@@ -1203,4 +1203,60 @@ router.get("/reports/factory-status", async (req, res) => {
     }
 });
 
+// GET /api/glass/reports/store?projNo= — the webapp equivalent of the
+// legacy Access app's storeQ/STORENEW forms: everything currently sitting
+// in the physical glass store, not yet shipped out. Reads Main Stock's own
+// STOCKO/Stock tables (category C=2, the Glass tag) rather than
+// reconstructing the legacy storenew/thenewstore chain -- confirmed via
+// the live SQL Server view definitions (Server.storenew1Query etc.) that
+// the legacy "in store" quantity is exactly QTYIN minus what's been
+// shipped, which is precisely what Stock.SQTY (QTY - QTYOUT, kept in sync
+// from [out] by minStockSync.js/mainStock.js's own checkout endpoints)
+// already represents for anything pushed here. Since finshed2 now
+// auto-pushes finished items into Main Stock (see PUT .../appointments
+// above) and Main Stock's own Ship Multiple Items screen already captures
+// a driver name on shipment (mirroring thenewstore's driver-dispatch
+// log), this single dashboard replaces the legacy storeQ -> STORENEW ->
+// thenewstore flow end to end.
+router.get("/reports/store", async (req, res) => {
+    try {
+        const { projNo } = req.query;
+        const result = await withSqlRetry("minstock", (pool) => {
+            const request = pool.request();
+            let whereClause = "";
+            if (projNo) {
+                request.input("projNo", `%${projNo}%`);
+                whereClause = "AND s.projNo LIKE @projNo";
+            }
+            return request.query(`
+                SELECT
+                    s.orderNo AS minStockOrderNo, s.projNo, s.projName, s.ProdctionNO,
+                    k.serialNo, k.Prodc AS description, k.UNO, k.barcode,
+                    k.QTY AS qty, k.QTYOUT AS shippedQty, k.SQTY AS remainingQty, k.Date AS date
+                FROM STOCKO s
+                JOIN Stock k ON k.orderNo = s.orderNo
+                WHERE s.C = 2 AND k.SQTY > 0 ${whereClause}
+                ORDER BY s.projName, k.Date DESC
+            `);
+        });
+
+        const items = result.recordset;
+        const projectMap = new Map();
+        for (const item of items) {
+            const key = item.projNo;
+            if (!projectMap.has(key)) {
+                projectMap.set(key, { projNo: item.projNo, projName: item.projName, remainingQty: 0, lineCount: 0 });
+            }
+            const entry = projectMap.get(key);
+            entry.remainingQty += item.remainingQty;
+            entry.lineCount += 1;
+        }
+
+        res.json({ success: true, items, projectTotals: Array.from(projectMap.values()) });
+    } catch (err) {
+        console.error("❌ GLASS STORE REPORT ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to fetch glass store report" });
+    }
+});
+
 export default router;
