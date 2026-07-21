@@ -187,6 +187,40 @@ router.get("/:orderNo/items", async (req, res) => {
     }
 });
 
+// GET /api/proj-orders/:orderNo/items/summary — count-by-product-type
+// breakdown, the equivalent of the legacy "OredersDisco"/"OrdersDisc"
+// report (a per-order "in progress" / "تحت العمل" header sheet embedding a
+// production breakdown subreport) — previously unresolved in this file's
+// own comments (COM automation into the report had hung in an earlier
+// session). Resolved via read-only Design-view inspection: OrdersDisc's
+// RecordSource is a plain saved SQL string, no VAT/pricing involved --
+// SELECT orderNo, Prudact, [1], COUNT(Prudact) AS CountOfPrudact FROM
+// orderDetails GROUP BY orderNo, Prudact, [1] -- and that table is exactly
+// this app's own live dbo.orderdetails, so no adaptation was needed.
+router.get("/:orderNo/items/summary", async (req, res) => {
+    try {
+        const orderNo = parseInt(req.params.orderNo, 10);
+        if (!Number.isInteger(orderNo)) {
+            return res.status(400).json({ success: false, message: "Invalid orderNo" });
+        }
+
+        const result = await withSqlRetry("proj", (pool) => pool.request()
+            .input("orderNo", orderNo)
+            .query(`
+                SELECT Prudact, [1] AS field1, COUNT(*) AS count
+                FROM dbo.orderdetails
+                WHERE orderNo = @orderNo
+                GROUP BY Prudact, [1]
+                ORDER BY Prudact, [1]
+            `));
+
+        res.json({ success: true, summary: result.recordset });
+    } catch (err) {
+        console.error("❌ PROJ ORDER ITEMS SUMMARY ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to fetch order items summary" });
+    }
+});
+
 // POST /api/proj-orders/:orderNo/items — add an order line (dbo.orderdetails).
 // [1]/[2] are the legacy Access form's own unlabeled free-text columns
 // (confirmed live: used inconsistently for dimensions, notes, or item
