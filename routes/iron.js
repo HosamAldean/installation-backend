@@ -40,12 +40,15 @@
 //   - X1I (event log) is structurally identical to Proj's x1 (xc1-3
 //     checkboxes, x1/x2 generic-labeled value fields, a completion date) —
 //     same generic "x1"/"x2" Label captions confirmed live, so exposed the
-//     same way. Unlike Proj's x1-x5 (five different departments), X1I here
-//     has no department dimension since this whole app already is one
-//     department — X1I is simply the dominant variant (6,213 rows, tracking
-//     almost 1:1 with ordersI's 6,225) versus its four near-unused sibling
-//     tables X1I1-4 (1,615/3,365/132/71 rows), so only X1I is used, same
-//     "one real table" pattern as D1I above.
+//     same way. CORRECTED from an earlier assumption: unlike D1I/D2-D5
+//     (genuinely one real table plus unused near-duplicates), X1I1-4 here
+//     ARE a real department dimension, same idea as Proj's x1-x5 — each is
+//     a distinct department's own inquiry screen off the Main Menu (MIX/
+//     specified-works/lathe/factory, see the event-log route below for the
+//     verified button-caption mapping), and 52% of orders present in both
+//     X1I and X1I2 have a genuinely different completion date between
+//     them. All five tables are read/written by department. See PUT/GET
+//     .../event-log for the full detail.
 //   - ProcessI (per-item cutting/prep status) confirmed as real Access
 //     checkboxes (0/1, not the -1/0 OLE convention seen elsewhere) for
 //     Cuting ("القص" — cutting) and Colcting ("التجهيز" — preparation, not
@@ -615,15 +618,31 @@ router.post("/:orderNo/items/:serialNo/process", async (req, res) => {
     }
 });
 
-// --- Order event log (dbo.X1I) ---------------------------------------------
-// Confirmed live: X1I is structurally identical to Proj's x1 (3 checkboxes
-// stored as the classic Access -1/0 string convention, 2 generically-
-// labeled value fields — the legacy form's own Label captions read "x1"/
-// "x2" verbatim, confirmed via COM, so exposed the same way here) plus a
-// completion date. No department dimension here (unlike Proj's x1-x5) since
-// this whole app already is one department — X1I (6,213 rows, tracking
-// almost 1:1 with ordersI's 6,225) is simply the dominant/real variant
-// versus its four near-unused siblings X1I1-4, same pattern as D1I above.
+// --- Order event log (dbo.X1I + department siblings X1I1-4) ---------------
+// Corrected from an earlier assumption: X1I1-4 are NOT near-unused
+// duplicates of X1I. Confirmed live via the Main Menu's own button
+// captions (COM-inspected, not guessed) that each is a distinct
+// department's inquiry screen — Command1="الاستفسار عن التبادلات الانتاج"
+// (production exchanges, X1I), Command41="...تبادلات MIX" (MIX, X1I1),
+// Command42="...اعمال المحددة" (specified/designated works, X1I2),
+// Command43="...اعمال المخرطة" (lathe/turning work, X1I3), Command44=
+// "...المصنع" (factory, X1I4) — and confirmed live that this isn't
+// redundant tracking: of the ~3,362 orders present in both X1I and X1I2,
+// 52% have a genuinely different x3 completion date between the two
+// tables. Reading/writing only X1I (as this endpoint used to) means the
+// app is blind to — or edits the wrong record for — any order whose real
+// status lives in a department table instead. xc4/xc5 exist on all five
+// tables but are confirmed entirely unused (0 non-zero rows across all
+// five, live) — not exposed here, matching the legacy form which never
+// shows them either.
+const IRON_EVENT_LOG_DEPARTMENTS = {
+    production: "X1I",
+    mix: "X1I1",
+    specifiedWorks: "X1I2",
+    lathe: "X1I3",
+    factory: "X1I4",
+};
+
 router.get("/:orderNo/event-log", async (req, res) => {
     const orderNo = parseInt(req.params.orderNo, 10);
     if (!Number.isInteger(orderNo)) {
@@ -631,21 +650,25 @@ router.get("/:orderNo/event-log", async (req, res) => {
     }
 
     try {
-        const result = await withSqlRetry("iron", (pool) => pool.request()
-            .input("orderNo", orderNo)
-            .query("SELECT xc1, xc2, xc3, x1, x2, date FROM dbo.X1I WHERE orderno = @orderNo"));
-        const row = result.recordset[0] || null;
-
-        res.json({
-            success: true,
-            entry: row
-                ? {
-                    checkboxes: [row.xc1, row.xc2, row.xc3].map((v) => v === "-1"),
-                    values: [row.x1, row.x2],
-                    date: row.date,
-                }
-                : null,
+        const entries = await withSqlRetry("iron", async (pool) => {
+            const result = {};
+            for (const [key, table] of Object.entries(IRON_EVENT_LOG_DEPARTMENTS)) {
+                const r = await pool.request()
+                    .input("orderNo", orderNo)
+                    .query(`SELECT xc1, xc2, xc3, x1, x2, date FROM dbo.${table} WHERE orderno = @orderNo`);
+                const row = r.recordset[0];
+                result[key] = row
+                    ? {
+                        checkboxes: [row.xc1, row.xc2, row.xc3].map((v) => v === "-1"),
+                        values: [row.x1, row.x2],
+                        date: row.date,
+                    }
+                    : null;
+            }
+            return result;
         });
+
+        res.json({ success: true, entries });
     } catch (err) {
         console.error("❌ IRON EVENT LOG ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to fetch order event log" });
@@ -658,6 +681,8 @@ router.post("/:orderNo/event-log", async (req, res) => {
         return res.status(400).json({ success: false, message: "Invalid orderNo" });
     }
     const { checkboxes, values, date } = req.body;
+    const department = IRON_EVENT_LOG_DEPARTMENTS[req.body.department] ? req.body.department : "production";
+    const table = IRON_EVENT_LOG_DEPARTMENTS[department];
 
     try {
         const cb = [0, 1, 2].map((i) => (Array.isArray(checkboxes) && checkboxes[i] ? "-1" : "0"));
@@ -674,7 +699,7 @@ router.post("/:orderNo/event-log", async (req, res) => {
 
             const existing = await pool.request()
                 .input("orderNo", orderNo)
-                .query("SELECT orderno FROM dbo.X1I WHERE orderno = @orderNo");
+                .query(`SELECT orderno FROM dbo.${table} WHERE orderno = @orderNo`);
 
             const request = pool.request()
                 .input("orderNo", orderNo)
@@ -683,9 +708,9 @@ router.post("/:orderNo/event-log", async (req, res) => {
                 .input("date", date || null);
 
             if (existing.recordset[0]) {
-                await request.query("UPDATE dbo.X1I SET xc1=@xc1, xc2=@xc2, xc3=@xc3, x1=@x1, x2=@x2, x3=@date, date=@date WHERE orderno = @orderNo");
+                await request.query(`UPDATE dbo.${table} SET xc1=@xc1, xc2=@xc2, xc3=@xc3, x1=@x1, x2=@x2, x3=@date, date=@date WHERE orderno = @orderNo`);
             } else {
-                await request.query("INSERT INTO dbo.X1I (orderno, xc1, xc2, xc3, x1, x2, x3, date) VALUES (@orderNo, @xc1, @xc2, @xc3, @x1, @x2, @date, @date)");
+                await request.query(`INSERT INTO dbo.${table} (orderno, xc1, xc2, xc3, x1, x2, x3, date) VALUES (@orderNo, @xc1, @xc2, @xc3, @x1, @x2, @date, @date)`);
             }
             return true;
         });
