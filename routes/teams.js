@@ -1,5 +1,5 @@
 ﻿import express from 'express';
-import { sequelize2, getSqlPool } from '../config/db.js';
+import { sequelize2, withSqlRetry } from '../config/db.js';
 import { QueryTypes } from 'sequelize';
 import { authenticateToken, authorizeRoles } from '../middleware/auth.js';
 
@@ -233,27 +233,27 @@ router.get('/:teamId/members', async (req, res) => {
 
         if (members.length === 0) return res.json({ success: true, data: [] });
 
-        const pool = await getSqlPool('erp');
         const empIds = members.map(m => m.emp_no);
         const placeholders = empIds.map((_, i) => `@emp${i}`).join(',');
-        const request = pool.request();
-        empIds.forEach((id, i) => request.input(`emp${i}`, id));
-
         const sqlDB = process.env.MSSQL1_DB;
 
-        const result = await request.query(`
-            SELECT 
-                e.Emp_num AS empNo,
-                e.EmpEngName AS name_en,
-                e.EmpName AS name_ar,
-                e.Job_code,
-                e.Work_status,
-                j.job_Desc
-            FROM ${sqlDB}.dbo.PayEmp AS e
-            LEFT JOIN ${sqlDB}.dbo.Pay_Job AS j
-                ON e.Job_code = j.job_code AND j.Comp_num = '1'
-            WHERE e.Emp_num IN (${placeholders})
-        `);
+        const result = await withSqlRetry('erp', (pool) => {
+            const request = pool.request();
+            empIds.forEach((id, i) => request.input(`emp${i}`, id));
+            return request.query(`
+                SELECT
+                    e.Emp_num AS empNo,
+                    e.EmpEngName AS name_en,
+                    e.EmpName AS name_ar,
+                    e.Job_code,
+                    e.Work_status,
+                    j.job_Desc
+                FROM ${sqlDB}.dbo.PayEmp AS e
+                LEFT JOIN ${sqlDB}.dbo.Pay_Job AS j
+                    ON e.Job_code = j.job_code AND j.Comp_num = '1'
+                WHERE e.Emp_num IN (${placeholders})
+            `);
+        });
 
         const finalMembers = result.recordset.map(emp => {
             const member = members.find(m => m.emp_no === emp.empNo);
@@ -368,7 +368,6 @@ router.delete('/:teamId', async (req, res) => {
  */
 router.get('/employees', async (req, res) => {
     try {
-        const pool = await getSqlPool('erp');
         const sqlDB = process.env.MSSQL1_DB;
 
         // Parse excludeEmpNos query param
@@ -381,7 +380,7 @@ router.get('/employees', async (req, res) => {
         }
 
         let query = `
-            SELECT 
+            SELECT
                 e.Emp_num AS empNo,
                 e.EmpEngName AS name_en,
                 e.EmpName AS name_ar,
@@ -394,7 +393,7 @@ router.get('/employees', async (req, res) => {
                 ON e.Job_code = j.job_code AND j.Comp_num = '1'
             WHERE e.Work_status = '1'
               AND e.Work_place = '7200'
-              
+
         `;
 
         if (excludeEmpNos.length) {
@@ -402,10 +401,11 @@ router.get('/employees', async (req, res) => {
             query += ` AND e.Emp_num NOT IN (${placeholders})`;
         }
 
-        const request = pool.request();
-        excludeEmpNos.forEach((id, i) => request.input(`emp${i}`, id));
-
-        const result = await request.query(query);
+        const result = await withSqlRetry('erp', (pool) => {
+            const request = pool.request();
+            excludeEmpNos.forEach((id, i) => request.input(`emp${i}`, id));
+            return request.query(query);
+        });
         const allEmployees = result.recordset;
 
         const eligibleLeaders = allEmployees.filter(emp => emp.Job_code !== '191');
@@ -424,7 +424,6 @@ router.get('/employees', async (req, res) => {
  */
 router.get('/employees/leaders', async (req, res) => {
     try {
-        const pool = await getSqlPool('erp');
         const sqlDB = process.env.MSSQL1_DB;
 
         // Parse excludeEmpNos query param
@@ -438,7 +437,7 @@ router.get('/employees/leaders', async (req, res) => {
         }
 
         let query = `
-            SELECT 
+            SELECT
                 e.Emp_num AS empNo,
                 e.EmpEngName AS name_en,
                 e.EmpName AS name_ar,
@@ -459,10 +458,11 @@ router.get('/employees/leaders', async (req, res) => {
             query += ` AND e.Emp_num NOT IN (${placeholders})`;
         }
 
-        const request = pool.request();
-        excludeEmpNos.forEach((id, i) => request.input(`emp${i}`, id));
-
-        const result = await request.query(query);
+        const result = await withSqlRetry('erp', (pool) => {
+            const request = pool.request();
+            excludeEmpNos.forEach((id, i) => request.input(`emp${i}`, id));
+            return request.query(query);
+        });
         const eligibleLeaders = result.recordset;
 
         res.json({ success: true, eligibleLeaders });

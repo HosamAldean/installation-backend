@@ -22,7 +22,7 @@ import express from "express";
 import multer from "multer";
 import path from "path";
 import fs from "fs";
-import { getSqlPool } from "../config/db.js";
+import { withSqlRetry } from "../config/db.js";
 import { authenticateToken, authorizeRoles } from "../middleware/auth.js";
 import { User } from "../models/User.js";
 
@@ -110,20 +110,21 @@ router.get("/profile/:computerNo", async (req, res) => {
             return res.status(400).json({ success: false, message: "computerNo required" });
         }
 
-        const pool = await getSqlPool("stockhouse");
-        const request = pool.request().input("computerNo", computerNo);
+        const result = await withSqlRetry("stockhouse", (pool) => {
+            const request = pool.request().input("computerNo", computerNo);
 
-        let storeFilter = "";
-        if (req.user.assignedStore) {
-            request.input("storeNo", req.user.assignedStore);
-            storeFilter = "AND StoreNo = @storeNo";
-        }
+            let storeFilter = "";
+            if (req.user.assignedStore) {
+                request.input("storeNo", req.user.assignedStore);
+                storeFilter = "AND StoreNo = @storeNo";
+            }
 
-        const result = await request.query(`
-            SELECT TOP 1 ProfileNO, ProfileName, Color, LinthRe, ComputerNO, StoreNo
-            FROM dbo.EnterDouC
-            WHERE ComputerNO = @computerNo ${storeFilter}
-        `);
+            return request.query(`
+                SELECT TOP 1 ProfileNO, ProfileName, Color, LinthRe, ComputerNO, StoreNo
+                FROM dbo.EnterDouC
+                WHERE ComputerNO = @computerNo ${storeFilter}
+            `);
+        });
 
         if (!result.recordset.length) {
             return res.status(404).json({ success: false, message: "No item found for this code" });
@@ -169,91 +170,100 @@ router.post("/enter", async (req, res) => {
             return res.status(400).json({ success: false, message: "storeNo is required" });
         }
 
-        const pool = await getSqlPool("stockhouse");
+        const sUser = await resolveUsername(req);
 
-        const resolved = await resolveComputerNo(pool, { profileNo, color, linthRe, storeNo, computerNo });
-        if (!resolved.computerNo) {
+        const result = await withSqlRetry("stockhouse", async (pool) => {
+            const resolved = await resolveComputerNo(pool, { profileNo, color, linthRe, storeNo, computerNo });
+            if (!resolved.computerNo) {
+                return { error: "noCode" };
+            }
+            const resolvedComputerNo = resolved.computerNo;
+            const resolvedProfileName = profileName || resolved.profileName;
+            // EnterDouC (the lookup view every other endpoint depends on, via
+            // resolveComputerNo) filters out rows where ProfileName IS NULL —
+            // an entry created without one would be permanently unfindable by
+            // profile/color/length or by ComputerNO, including from this app's
+            // own /profile endpoint. Only reachable when this is a genuinely
+            // new combination (an existing one always carries a profileName).
+            if (!resolvedProfileName) {
+                return { error: "noName" };
+            }
+
+            // RecordNO is a SQL Server IDENTITY column on EnterDouO — let the
+            // server generate it (OUTPUT INSERTED.RecordNO) rather than
+            // computing MAX+1 ourselves, which would collide with that.
+            const transaction = pool.transaction();
+            await transaction.begin();
+            let recordNo;
+            try {
+                const headerResult = await transaction.request()
+                    .input("whouseOffice", whouseOffice || null)
+                    .input("qcOffice", qcOffice || null)
+                    .input("qcTestNo", qcTestNo || null)
+                    .input("qcTestResult", qcTestResult || null)
+                    .input("storeNo", storeNo)
+                    .input("sUser", sUser)
+                    .query(`
+                        INSERT INTO guest.EnterDouO (WHouseOffice, DateWHouse, QCOffice, DateQC, QCTestNo, QCTestdate, QCTestResult, StoreNo, SUser, SDate)
+                        OUTPUT INSERTED.RecordNO
+                        VALUES (@whouseOffice, CASE WHEN @whouseOffice IS NULL THEN NULL ELSE GETDATE() END,
+                                @qcOffice, CASE WHEN @qcOffice IS NULL THEN NULL ELSE GETDATE() END,
+                                @qcTestNo, CASE WHEN @qcTestResult IS NULL THEN NULL ELSE GETDATE() END, @qcTestResult,
+                                @storeNo, @sUser, GETDATE())
+                    `);
+                recordNo = headerResult.recordset[0].RecordNO;
+
+                await transaction.request()
+                    .input("recordNo", recordNo)
+                    .input("profileNo", profileNo)
+                    .input("profileName", resolvedProfileName)
+                    .input("color", color)
+                    .input("linthRe", linthRe)
+                    .input("supplier", supplier || null)
+                    .input("projectNo", projectNo || null)
+                    .input("qtyRe", qty)
+                    .input("qtyEvl", qtyEvl !== undefined && qtyEvl !== null ? parseInt(qtyEvl, 10) : null)
+                    .input("qtyLs", qtyLs !== undefined && qtyLs !== null ? parseInt(qtyLs, 10) : null)
+                    .input("qtyRej", qtyRej !== undefined && qtyRej !== null ? parseInt(qtyRej, 10) : null)
+                    .input("computerNo", resolvedComputerNo)
+                    .input("unite", unite || null)
+                    .input("weight", weight !== undefined && weight !== null ? parseFloat(weight) : null)
+                    .input("storeNo", storeNo)
+                    .input("sUser", sUser)
+                    .query(`
+                        INSERT INTO guest.EnterDou
+                            (RecordNO, SerialNo, ProfileNO, ProfileName, Color, LinthRe, Supplier, ProjectNO,
+                             QtyRe, QtyEvl, QtyLs, QtyRej, ComputerNO, QtyOut, StoreNo, Weight, Unite, SUser, SDate)
+                        VALUES
+                            (@recordNo, 1, @profileNo, @profileName, @color, @linthRe, @supplier, @projectNo,
+                             @qtyRe, @qtyEvl, @qtyLs, @qtyRej, @computerNo, 0, @storeNo, @weight, @unite, @sUser, GETDATE())
+                    `);
+
+                await transaction.commit();
+            } catch (txErr) {
+                await transaction.rollback();
+                throw txErr;
+            }
+
+            return { recordNo, computerNo: resolvedComputerNo, profileName: resolvedProfileName };
+        });
+
+        if (result.error === "noCode") {
             return res.status(400).json({
                 success: false,
                 message: "No existing code found for this profile/color/length in this store — computerNo is required for a new combination",
             });
         }
-        const resolvedComputerNo = resolved.computerNo;
-        const resolvedProfileName = profileName || resolved.profileName;
-        // EnterDouC (the lookup view every other endpoint depends on, via
-        // resolveComputerNo) filters out rows where ProfileName IS NULL —
-        // an entry created without one would be permanently unfindable by
-        // profile/color/length or by ComputerNO, including from this app's
-        // own /profile endpoint. Only reachable when this is a genuinely
-        // new combination (an existing one always carries a profileName).
-        if (!resolvedProfileName) {
+        if (result.error === "noName") {
             return res.status(400).json({ success: false, message: "profileName is required for a new profile/color/length combination" });
-        }
-
-        const sUser = await resolveUsername(req);
-
-        // RecordNO is a SQL Server IDENTITY column on EnterDouO — let the
-        // server generate it (OUTPUT INSERTED.RecordNO) rather than
-        // computing MAX+1 ourselves, which would collide with that.
-        const transaction = pool.transaction();
-        await transaction.begin();
-        let recordNo;
-        try {
-            const headerResult = await transaction.request()
-                .input("whouseOffice", whouseOffice || null)
-                .input("qcOffice", qcOffice || null)
-                .input("qcTestNo", qcTestNo || null)
-                .input("qcTestResult", qcTestResult || null)
-                .input("storeNo", storeNo)
-                .input("sUser", sUser)
-                .query(`
-                    INSERT INTO guest.EnterDouO (WHouseOffice, DateWHouse, QCOffice, DateQC, QCTestNo, QCTestdate, QCTestResult, StoreNo, SUser, SDate)
-                    OUTPUT INSERTED.RecordNO
-                    VALUES (@whouseOffice, CASE WHEN @whouseOffice IS NULL THEN NULL ELSE GETDATE() END,
-                            @qcOffice, CASE WHEN @qcOffice IS NULL THEN NULL ELSE GETDATE() END,
-                            @qcTestNo, CASE WHEN @qcTestResult IS NULL THEN NULL ELSE GETDATE() END, @qcTestResult,
-                            @storeNo, @sUser, GETDATE())
-                `);
-            recordNo = headerResult.recordset[0].RecordNO;
-
-            await transaction.request()
-                .input("recordNo", recordNo)
-                .input("profileNo", profileNo)
-                .input("profileName", resolvedProfileName)
-                .input("color", color)
-                .input("linthRe", linthRe)
-                .input("supplier", supplier || null)
-                .input("projectNo", projectNo || null)
-                .input("qtyRe", qty)
-                .input("qtyEvl", qtyEvl !== undefined && qtyEvl !== null ? parseInt(qtyEvl, 10) : null)
-                .input("qtyLs", qtyLs !== undefined && qtyLs !== null ? parseInt(qtyLs, 10) : null)
-                .input("qtyRej", qtyRej !== undefined && qtyRej !== null ? parseInt(qtyRej, 10) : null)
-                .input("computerNo", resolvedComputerNo)
-                .input("unite", unite || null)
-                .input("weight", weight !== undefined && weight !== null ? parseFloat(weight) : null)
-                .input("storeNo", storeNo)
-                .input("sUser", sUser)
-                .query(`
-                    INSERT INTO guest.EnterDou
-                        (RecordNO, SerialNo, ProfileNO, ProfileName, Color, LinthRe, Supplier, ProjectNO,
-                         QtyRe, QtyEvl, QtyLs, QtyRej, ComputerNO, QtyOut, StoreNo, Weight, Unite, SUser, SDate)
-                    VALUES
-                        (@recordNo, 1, @profileNo, @profileName, @color, @linthRe, @supplier, @projectNo,
-                         @qtyRe, @qtyEvl, @qtyLs, @qtyRej, @computerNo, 0, @storeNo, @weight, @unite, @sUser, GETDATE())
-                `);
-
-            await transaction.commit();
-        } catch (txErr) {
-            await transaction.rollback();
-            throw txErr;
         }
 
         res.status(201).json({
             success: true,
-            recordNo,
+            recordNo: result.recordNo,
             serialNo: 1,
-            computerNo: resolvedComputerNo,
-            profileName: resolvedProfileName,
+            computerNo: result.computerNo,
+            profileName: result.profileName,
         });
     } catch (err) {
         console.error("❌ STOCK HOUSE ENTER ERROR:", err);
@@ -287,65 +297,70 @@ router.post("/reserve", async (req, res) => {
             return res.status(400).json({ success: false, message: "storeNo is required" });
         }
 
-        const pool = await getSqlPool("stockhouse");
+        const sUser = await resolveUsername(req);
 
-        const project = await resolveProject(pool, projectNo);
-        if (!project) {
+        const result = await withSqlRetry("stockhouse", async (pool) => {
+            const project = await resolveProject(pool, projectNo);
+            if (!project) return { error: "noProject" };
+
+            const resolved = await resolveComputerNo(pool, { profileNo, color, linthRe, storeNo, computerNo });
+            if (!resolved.computerNo) return { error: "noCode" };
+
+            const transaction = pool.transaction();
+            await transaction.begin();
+            let recordNo;
+            try {
+                const headerResult = await transaction.request()
+                    .input("projectNo", projectNo)
+                    .input("projectName", project.ProjectName)
+                    .input("projectManger", project.ProjectManger)
+                    .input("storeNo", storeNo)
+                    .input("sUser", sUser)
+                    .query(`
+                        INSERT INTO guest.ReservationO (ProjectNO, ProjectName, Date, ProjectManger, DateR, StoreNo, SUser, SDate)
+                        OUTPUT INSERTED.RecordNO
+                        VALUES (@projectNo, @projectName, GETDATE(), @projectManger, GETDATE(), @storeNo, @sUser, GETDATE())
+                    `);
+                recordNo = headerResult.recordset[0].RecordNO;
+
+                await transaction.request()
+                    .input("recordNo", recordNo)
+                    .input("profileNo", profileNo)
+                    .input("profileName", resolved.profileName)
+                    .input("color", color)
+                    .input("qtyRe", qty)
+                    .input("linthRe", linthRe)
+                    .input("computerNo", resolved.computerNo)
+                    .input("note", note || null)
+                    .input("storeNo", storeNo)
+                    .input("sUser", sUser)
+                    .query(`
+                        INSERT INTO guest.Reservation
+                            (RecordNO, SerialNo, ProfileNO, ProfileName, Color, QtyRe, LinthRe, ComputerNO, Note, StoreNo, SUser, SDate)
+                        VALUES
+                            (@recordNo, 1, @profileNo, @profileName, @color, @qtyRe, @linthRe, @computerNo, @note, @storeNo, @sUser, GETDATE())
+                    `);
+
+                await transaction.commit();
+            } catch (txErr) {
+                await transaction.rollback();
+                throw txErr;
+            }
+
+            return { recordNo, computerNo: resolved.computerNo };
+        });
+
+        if (result.error === "noProject") {
             return res.status(404).json({ success: false, message: "Project not found" });
         }
-
-        const resolved = await resolveComputerNo(pool, { profileNo, color, linthRe, storeNo, computerNo });
-        if (!resolved.computerNo) {
+        if (result.error === "noCode") {
             return res.status(400).json({
                 success: false,
                 message: "No existing code found for this profile/color/length in this store — computerNo is required for a new combination",
             });
         }
 
-        const sUser = await resolveUsername(req);
-
-        const transaction = pool.transaction();
-        await transaction.begin();
-        let recordNo;
-        try {
-            const headerResult = await transaction.request()
-                .input("projectNo", projectNo)
-                .input("projectName", project.ProjectName)
-                .input("projectManger", project.ProjectManger)
-                .input("storeNo", storeNo)
-                .input("sUser", sUser)
-                .query(`
-                    INSERT INTO guest.ReservationO (ProjectNO, ProjectName, Date, ProjectManger, DateR, StoreNo, SUser, SDate)
-                    OUTPUT INSERTED.RecordNO
-                    VALUES (@projectNo, @projectName, GETDATE(), @projectManger, GETDATE(), @storeNo, @sUser, GETDATE())
-                `);
-            recordNo = headerResult.recordset[0].RecordNO;
-
-            await transaction.request()
-                .input("recordNo", recordNo)
-                .input("profileNo", profileNo)
-                .input("profileName", resolved.profileName)
-                .input("color", color)
-                .input("qtyRe", qty)
-                .input("linthRe", linthRe)
-                .input("computerNo", resolved.computerNo)
-                .input("note", note || null)
-                .input("storeNo", storeNo)
-                .input("sUser", sUser)
-                .query(`
-                    INSERT INTO guest.Reservation
-                        (RecordNO, SerialNo, ProfileNO, ProfileName, Color, QtyRe, LinthRe, ComputerNO, Note, StoreNo, SUser, SDate)
-                    VALUES
-                        (@recordNo, 1, @profileNo, @profileName, @color, @qtyRe, @linthRe, @computerNo, @note, @storeNo, @sUser, GETDATE())
-                `);
-
-            await transaction.commit();
-        } catch (txErr) {
-            await transaction.rollback();
-            throw txErr;
-        }
-
-        res.status(201).json({ success: true, recordNo, serialNo: 1, computerNo: resolved.computerNo });
+        res.status(201).json({ success: true, recordNo: result.recordNo, serialNo: 1, computerNo: result.computerNo });
     } catch (err) {
         console.error("❌ STOCK HOUSE RESERVE ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to create reservation" });
@@ -377,61 +392,66 @@ router.post("/ship", async (req, res) => {
             return res.status(400).json({ success: false, message: "storeNo is required" });
         }
 
-        const pool = await getSqlPool("stockhouse");
+        const sUser = await resolveUsername(req);
 
-        const project = await resolveProject(pool, projectNo);
-        if (!project) {
+        const result = await withSqlRetry("stockhouse", async (pool) => {
+            const project = await resolveProject(pool, projectNo);
+            if (!project) return { error: "noProject" };
+
+            const resolved = await resolveComputerNo(pool, { profileNo, color, linthRe, storeNo, computerNo });
+            if (!resolved.computerNo) return { error: "noCode" };
+
+            const transaction = pool.transaction();
+            await transaction.begin();
+            let recordNo;
+            try {
+                const headerResult = await transaction.request()
+                    .input("projectNo", projectNo)
+                    .input("projectName", project.ProjectName)
+                    .input("productionNo", productionNo || null)
+                    .input("worker", worker || null)
+                    .input("storeNo", storeNo)
+                    .input("sUser", sUser)
+                    .query(`
+                        INSERT INTO guest.StockOutO (ProjectNO, ProjectName, ProductionNO, Date, Worker, StoreNo, SUser, SDate)
+                        OUTPUT INSERTED.RecordNO
+                        VALUES (@projectNo, @projectName, @productionNo, GETDATE(), @worker, @storeNo, @sUser, GETDATE())
+                    `);
+                recordNo = headerResult.recordset[0].RecordNO;
+
+                await transaction.request()
+                    .input("recordNo", recordNo)
+                    .input("profileNo", profileNo)
+                    .input("color", color)
+                    .input("linthRe", linthRe)
+                    .input("qtyOut", qtyOut)
+                    .input("computerNo", resolved.computerNo)
+                    .input("storeNo", storeNo)
+                    .input("sUser", sUser)
+                    .query(`
+                        INSERT INTO guest.StockOut
+                            (RecordNO, SerialNo, ProfileNO, Color, LinthRe, QtyOut, ComputerNO, StoreNo, SUser, SDate)
+                        VALUES
+                            (@recordNo, 1, @profileNo, @color, @linthRe, @qtyOut, @computerNo, @storeNo, @sUser, GETDATE())
+                    `);
+
+                await transaction.commit();
+            } catch (txErr) {
+                await transaction.rollback();
+                throw txErr;
+            }
+
+            return { recordNo, computerNo: resolved.computerNo };
+        });
+
+        if (result.error === "noProject") {
             return res.status(404).json({ success: false, message: "Project not found" });
         }
-
-        const resolved = await resolveComputerNo(pool, { profileNo, color, linthRe, storeNo, computerNo });
-        if (!resolved.computerNo) {
+        if (result.error === "noCode") {
             return res.status(400).json({ success: false, message: "No matching stock found for this profile/color/length in this store" });
         }
 
-        const sUser = await resolveUsername(req);
-
-        const transaction = pool.transaction();
-        await transaction.begin();
-        let recordNo;
-        try {
-            const headerResult = await transaction.request()
-                .input("projectNo", projectNo)
-                .input("projectName", project.ProjectName)
-                .input("productionNo", productionNo || null)
-                .input("worker", worker || null)
-                .input("storeNo", storeNo)
-                .input("sUser", sUser)
-                .query(`
-                    INSERT INTO guest.StockOutO (ProjectNO, ProjectName, ProductionNO, Date, Worker, StoreNo, SUser, SDate)
-                    OUTPUT INSERTED.RecordNO
-                    VALUES (@projectNo, @projectName, @productionNo, GETDATE(), @worker, @storeNo, @sUser, GETDATE())
-                `);
-            recordNo = headerResult.recordset[0].RecordNO;
-
-            await transaction.request()
-                .input("recordNo", recordNo)
-                .input("profileNo", profileNo)
-                .input("color", color)
-                .input("linthRe", linthRe)
-                .input("qtyOut", qtyOut)
-                .input("computerNo", resolved.computerNo)
-                .input("storeNo", storeNo)
-                .input("sUser", sUser)
-                .query(`
-                    INSERT INTO guest.StockOut
-                        (RecordNO, SerialNo, ProfileNO, Color, LinthRe, QtyOut, ComputerNO, StoreNo, SUser, SDate)
-                    VALUES
-                        (@recordNo, 1, @profileNo, @color, @linthRe, @qtyOut, @computerNo, @storeNo, @sUser, GETDATE())
-                `);
-
-            await transaction.commit();
-        } catch (txErr) {
-            await transaction.rollback();
-            throw txErr;
-        }
-
-        res.status(201).json({ success: true, recordNo, serialNo: 1, computerNo: resolved.computerNo });
+        res.status(201).json({ success: true, recordNo: result.recordNo, serialNo: 1, computerNo: result.computerNo });
     } catch (err) {
         console.error("❌ STOCK HOUSE SHIP ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to record shipment" });
@@ -461,67 +481,72 @@ router.post("/return", async (req, res) => {
             return res.status(400).json({ success: false, message: "storeNo is required" });
         }
 
-        const pool = await getSqlPool("stockhouse");
+        const sUser = await resolveUsername(req);
 
-        let resolvedProjectNo = "stock";
-        let resolvedProjectName = "Back";
-        if (projectNo) {
-            const project = await resolveProject(pool, projectNo);
-            if (!project) {
-                return res.status(404).json({ success: false, message: "Project not found" });
+        const result = await withSqlRetry("stockhouse", async (pool) => {
+            let resolvedProjectNo = "stock";
+            let resolvedProjectName = "Back";
+            if (projectNo) {
+                const project = await resolveProject(pool, projectNo);
+                if (!project) return { error: "noProject" };
+                resolvedProjectNo = projectNo;
+                resolvedProjectName = project.ProjectName;
             }
-            resolvedProjectNo = projectNo;
-            resolvedProjectName = project.ProjectName;
-        }
 
-        const resolved = await resolveComputerNo(pool, { profileNo, color, linthRe, storeNo, computerNo });
-        if (!resolved.computerNo) {
+            const resolved = await resolveComputerNo(pool, { profileNo, color, linthRe, storeNo, computerNo });
+            if (!resolved.computerNo) return { error: "noCode" };
+
+            const transaction = pool.transaction();
+            await transaction.begin();
+            let recordNo;
+            try {
+                const headerResult = await transaction.request()
+                    .input("projectNo", resolvedProjectNo)
+                    .input("projectName", resolvedProjectName)
+                    .input("productionNo", productionNo || null)
+                    .input("worker", worker || null)
+                    .input("storeNo", storeNo)
+                    .input("sUser", sUser)
+                    .query(`
+                        INSERT INTO guest.StockBackO (ProjectNO, ProjectName, ProductionNO, Date, Worker, StoreNo, SUser, SDate)
+                        OUTPUT INSERTED.RecordNO
+                        VALUES (@projectNo, @projectName, @productionNo, GETDATE(), @worker, @storeNo, @sUser, GETDATE())
+                    `);
+                recordNo = headerResult.recordset[0].RecordNO;
+
+                await transaction.request()
+                    .input("recordNo", recordNo)
+                    .input("profileNo", profileNo)
+                    .input("color", color)
+                    .input("linthRe", linthRe)
+                    .input("qtyOut", qtyBack)
+                    .input("computerNo", resolved.computerNo)
+                    .input("storeNo", storeNo)
+                    .input("sUser", sUser)
+                    .query(`
+                        INSERT INTO guest.StockBack
+                            (RecordNO, SerialNo, ProfileNO, Color, LinthRe, QtyOut, ComputerNO, StoreNo, SUser, SDate)
+                        VALUES
+                            (@recordNo, 1, @profileNo, @color, @linthRe, @qtyOut, @computerNo, @storeNo, @sUser, GETDATE())
+                    `);
+
+                await transaction.commit();
+            } catch (txErr) {
+                await transaction.rollback();
+                throw txErr;
+            }
+
+            return { recordNo, computerNo: resolved.computerNo };
+        });
+
+        if (result.error === "noProject") {
+            return res.status(404).json({ success: false, message: "Project not found" });
+        }
+        if (result.error === "noCode") {
             return res.status(400).json({ success: false, message: "No matching stock found for this profile/color/length in this store" });
         }
 
-        const sUser = await resolveUsername(req);
-
-        const transaction = pool.transaction();
-        await transaction.begin();
-        let recordNo;
-        try {
-            const headerResult = await transaction.request()
-                .input("projectNo", resolvedProjectNo)
-                .input("projectName", resolvedProjectName)
-                .input("productionNo", productionNo || null)
-                .input("worker", worker || null)
-                .input("storeNo", storeNo)
-                .input("sUser", sUser)
-                .query(`
-                    INSERT INTO guest.StockBackO (ProjectNO, ProjectName, ProductionNO, Date, Worker, StoreNo, SUser, SDate)
-                    OUTPUT INSERTED.RecordNO
-                    VALUES (@projectNo, @projectName, @productionNo, GETDATE(), @worker, @storeNo, @sUser, GETDATE())
-                `);
-            recordNo = headerResult.recordset[0].RecordNO;
-
-            await transaction.request()
-                .input("recordNo", recordNo)
-                .input("profileNo", profileNo)
-                .input("color", color)
-                .input("linthRe", linthRe)
-                .input("qtyOut", qtyBack)
-                .input("computerNo", resolved.computerNo)
-                .input("storeNo", storeNo)
-                .input("sUser", sUser)
-                .query(`
-                    INSERT INTO guest.StockBack
-                        (RecordNO, SerialNo, ProfileNO, Color, LinthRe, QtyOut, ComputerNO, StoreNo, SUser, SDate)
-                    VALUES
-                        (@recordNo, 1, @profileNo, @color, @linthRe, @qtyOut, @computerNo, @storeNo, @sUser, GETDATE())
-                `);
-
-            await transaction.commit();
-        } catch (txErr) {
-            await transaction.rollback();
-            throw txErr;
-        }
-
-        res.status(201).json({ success: true, recordNo, serialNo: 1, computerNo: resolved.computerNo });
+        res.status(201).json({ success: true, recordNo: result.recordNo, serialNo: 1, computerNo: result.computerNo });
     } catch (err) {
         console.error("❌ STOCK HOUSE RETURN ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to record return" });
@@ -562,81 +587,86 @@ router.post("/mix/send", async (req, res) => {
             return res.status(400).json({ success: false, message: "storeNo is required" });
         }
 
-        const pool = await getSqlPool("stockhouse");
+        const sUser = await resolveUsername(req);
 
-        const project = await resolveProject(pool, projectNo);
-        if (!project) {
+        const result = await withSqlRetry("stockhouse", async (pool) => {
+            const project = await resolveProject(pool, projectNo);
+            if (!project) return { error: "noProject" };
+
+            // Sending requires the mill-finish combination to already exist in
+            // this store — you can only send stock that's actually on hand.
+            const resolved = await resolveComputerNo(pool, { profileNo, color, linthRe, storeNo, computerNo });
+            if (!resolved.computerNo) return { error: "noCode" };
+
+            const transaction = pool.transaction();
+            await transaction.begin();
+            let recordNo;
+            try {
+                const headerResult = await transaction.request()
+                    .input("projectNo", projectNo)
+                    .input("projectName", project.ProjectName)
+                    .input("projectManger", project.ProjectManger)
+                    .input("stoukOfficer", stoukOfficer || null)
+                    .input("stouckManger", stouckManger || null)
+                    // Confirmed live via the legacy Access app's own VBA
+                    // (M1's NameRequstAC/NameRequstRequstOC subs): NameRequst
+                    // holds a real coating-company name for genuine sends —
+                    // 'IN'/'OUT' are separate sentinel values used for a
+                    // different MIXO record type entirely, filtered out by
+                    // those same subs, not something this code path writes.
+                    // Falls back to the previous 'MIX' placeholder only if the
+                    // caller genuinely didn't supply one, so existing API
+                    // callers don't break.
+                    .input("nameRequst", coatingCompany?.trim() || "MIX")
+                    .input("fullColor", fullColor)
+                    .input("serialNO", reservationRecordNo ? parseInt(reservationRecordNo, 10) : null)
+                    .input("storeNo", storeNo)
+                    .input("sUser", sUser)
+                    .query(`
+                        INSERT INTO guest.MIXO
+                            (RequstNo, DateRequst, NameRequst, ProjectNO, ProjectName, ProjectManger,
+                             StoukOfficer, StouckManger, DateSend, SerialNO, C, FullColor, StoreNO, SUser, SDate)
+                        OUTPUT INSERTED.RecordNO
+                        VALUES
+                            (NULL, GETDATE(), @nameRequst, @projectNo, @projectName, @projectManger,
+                             @stoukOfficer, @stouckManger, GETDATE(), @serialNO, 1, @fullColor, @storeNo, @sUser, GETDATE())
+                    `);
+                recordNo = headerResult.recordset[0].RecordNO;
+
+                await transaction.request()
+                    .input("recordNo", recordNo)
+                    .input("profileNo", profileNo)
+                    .input("profileName", resolved.profileName)
+                    .input("color", color)
+                    .input("linthRe", linthRe)
+                    .input("qtySend", qtySend)
+                    .input("computerNo", resolved.computerNo)
+                    .input("storeNo", storeNo)
+                    .input("sUser", sUser)
+                    .query(`
+                        INSERT INTO guest.MIX
+                            (RecordNO, SerialNo, ProfileNO, ProfileName, QtySend, Color, LinthRe, QtyAvl, QtyOut, ComputerNO, StoreNo, SUser, SDate)
+                        VALUES
+                            (@recordNo, 1, @profileNo, @profileName, @qtySend, @color, @linthRe, @qtySend, 0, @computerNo, @storeNo, @sUser, GETDATE())
+                    `);
+
+                await transaction.commit();
+            } catch (txErr) {
+                await transaction.rollback();
+                throw txErr;
+            }
+
+            return { recordNo };
+        });
+
+        if (result.error === "noProject") {
             return res.status(404).json({ success: false, message: "Project not found" });
         }
-
-        // Sending requires the mill-finish combination to already exist in
-        // this store — you can only send stock that's actually on hand.
-        const resolved = await resolveComputerNo(pool, { profileNo, color, linthRe, storeNo, computerNo });
-        if (!resolved.computerNo) {
+        if (result.error === "noCode") {
             return res.status(400).json({ success: false, message: "No matching mill stock found for this profile/color/length in this store" });
         }
 
-        const sUser = await resolveUsername(req);
-
-        const transaction = pool.transaction();
-        await transaction.begin();
-        let recordNo;
-        try {
-            const headerResult = await transaction.request()
-                .input("projectNo", projectNo)
-                .input("projectName", project.ProjectName)
-                .input("projectManger", project.ProjectManger)
-                .input("stoukOfficer", stoukOfficer || null)
-                .input("stouckManger", stouckManger || null)
-                // Confirmed live via the legacy Access app's own VBA
-                // (M1's NameRequstAC/NameRequstRequstOC subs): NameRequst
-                // holds a real coating-company name for genuine sends —
-                // 'IN'/'OUT' are separate sentinel values used for a
-                // different MIXO record type entirely, filtered out by
-                // those same subs, not something this code path writes.
-                // Falls back to the previous 'MIX' placeholder only if the
-                // caller genuinely didn't supply one, so existing API
-                // callers don't break.
-                .input("nameRequst", coatingCompany?.trim() || "MIX")
-                .input("fullColor", fullColor)
-                .input("serialNO", reservationRecordNo ? parseInt(reservationRecordNo, 10) : null)
-                .input("storeNo", storeNo)
-                .input("sUser", sUser)
-                .query(`
-                    INSERT INTO guest.MIXO
-                        (RequstNo, DateRequst, NameRequst, ProjectNO, ProjectName, ProjectManger,
-                         StoukOfficer, StouckManger, DateSend, SerialNO, C, FullColor, StoreNO, SUser, SDate)
-                    OUTPUT INSERTED.RecordNO
-                    VALUES
-                        (NULL, GETDATE(), @nameRequst, @projectNo, @projectName, @projectManger,
-                         @stoukOfficer, @stouckManger, GETDATE(), @serialNO, 1, @fullColor, @storeNo, @sUser, GETDATE())
-                `);
-            recordNo = headerResult.recordset[0].RecordNO;
-
-            await transaction.request()
-                .input("recordNo", recordNo)
-                .input("profileNo", profileNo)
-                .input("profileName", resolved.profileName)
-                .input("color", color)
-                .input("linthRe", linthRe)
-                .input("qtySend", qtySend)
-                .input("computerNo", resolved.computerNo)
-                .input("storeNo", storeNo)
-                .input("sUser", sUser)
-                .query(`
-                    INSERT INTO guest.MIX
-                        (RecordNO, SerialNo, ProfileNO, ProfileName, QtySend, Color, LinthRe, QtyAvl, QtyOut, ComputerNO, StoreNo, SUser, SDate)
-                    VALUES
-                        (@recordNo, 1, @profileNo, @profileName, @qtySend, @color, @linthRe, @qtySend, 0, @computerNo, @storeNo, @sUser, GETDATE())
-                `);
-
-            await transaction.commit();
-        } catch (txErr) {
-            await transaction.rollback();
-            throw txErr;
-        }
-
-        res.status(201).json({ success: true, mixRecordNo: recordNo, mixSerialNo: 1 });
+        res.status(201).json({ success: true, mixRecordNo: result.recordNo, mixSerialNo: 1 });
     } catch (err) {
         console.error("❌ STOCK HOUSE MIX SEND ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to record coating send-out" });
@@ -671,99 +701,115 @@ router.post("/mix/receive", async (req, res) => {
             return res.status(400).json({ success: false, message: "storeNo is required" });
         }
 
-        const pool = await getSqlPool("stockhouse");
+        const sUser = await resolveUsername(req);
 
-        const mixRow = await pool.request()
-            .input("recordNo", mixRn)
-            .input("serialNo", mixSn)
-            .input("storeNo", storeNo)
-            .query(`SELECT * FROM guest.MIX WHERE RecordNO = @recordNo AND SerialNo = @serialNo AND StoreNo = @storeNo`);
-        const mix = mixRow.recordset[0];
-        if (!mix) {
+        // withSqlRetry reruns this whole block on a transient failure. The
+        // QtyOut increment below is inside the same transaction as the
+        // EnterDou insert, so an ordinary rollback-and-retry re-reads the
+        // real alreadyReceived value and recomputes correctly — the only
+        // residual risk is the narrow "transaction actually committed but
+        // the ack was lost" case, same trade-off already accepted for
+        // glass.js's receive handler.
+        const result = await withSqlRetry("stockhouse", async (pool) => {
+            const mixRow = await pool.request()
+                .input("recordNo", mixRn)
+                .input("serialNo", mixSn)
+                .input("storeNo", storeNo)
+                .query(`SELECT * FROM guest.MIX WHERE RecordNO = @recordNo AND SerialNo = @serialNo AND StoreNo = @storeNo`);
+            const mix = mixRow.recordset[0];
+            if (!mix) return { error: "noMatch" };
+
+            const mixoRow = await pool.request().input("recordNo", mixRn).query(`SELECT FullColor FROM guest.MIXO WHERE RecordNO = @recordNo`);
+            const targetColor = mixoRow.recordset[0]?.FullColor;
+
+            // A coating batch can come back in more than one partial delivery —
+            // accumulate QtyOut across receive calls rather than overwriting it,
+            // and don't let the total exceed what was actually sent.
+            const alreadyReceived = mix.QtyOut || 0;
+            if (alreadyReceived + qtyReceived > mix.QtySend) {
+                return { error: "exceedsRemaining", remaining: mix.QtySend - alreadyReceived, sent: mix.QtySend, received: alreadyReceived };
+            }
+
+            // The coated combination (profile + target color + same length) is
+            // new stock, distinct from the mill-finish combination that was sent.
+            const resolved = await resolveComputerNo(pool, {
+                profileNo: mix.ProfileNO, color: targetColor, linthRe: mix.LinthRe, storeNo, computerNo,
+            });
+            const resolvedProfileName = profileName || resolved.profileName || mix.ProfileName;
+            if (!resolved.computerNo) return { error: "noCode" };
+            if (!resolvedProfileName) return { error: "noName" };
+
+            const transaction = pool.transaction();
+            await transaction.begin();
+            let recordNo;
+            try {
+                await transaction.request()
+                    .input("recordNo", mixRn)
+                    .input("serialNo", mixSn)
+                    .input("qtyOut", alreadyReceived + qtyReceived)
+                    .query(`UPDATE guest.MIX SET QtyOut = @qtyOut WHERE RecordNO = @recordNo AND SerialNo = @serialNo`);
+
+                const headerResult = await transaction.request()
+                    .input("storeNo", storeNo)
+                    .input("sUser", sUser)
+                    .query(`
+                        INSERT INTO guest.EnterDouO (WHouseOffice, DateWHouse, QCOffice, DateQC, QCTestNo, QCTestdate, QCTestResult, StoreNo, SUser, SDate)
+                        OUTPUT INSERTED.RecordNO
+                        VALUES (NULL, NULL, NULL, NULL, NULL, NULL, NULL, @storeNo, @sUser, GETDATE())
+                    `);
+                recordNo = headerResult.recordset[0].RecordNO;
+
+                await transaction.request()
+                    .input("recordNo", recordNo)
+                    .input("profileNo", mix.ProfileNO)
+                    .input("profileName", resolvedProfileName)
+                    .input("color", targetColor)
+                    .input("linthRe", mix.LinthRe)
+                    .input("qtyRe", qtyReceived)
+                    .input("computerNo", resolved.computerNo)
+                    .input("storeNo", storeNo)
+                    .input("sUser", sUser)
+                    .query(`
+                        INSERT INTO guest.EnterDou
+                            (RecordNO, SerialNo, ProfileNO, ProfileName, Color, LinthRe, QtyRe, ComputerNO, QtyOut, StoreNo, SUser, SDate)
+                        VALUES
+                            (@recordNo, 1, @profileNo, @profileName, @color, @linthRe, @qtyRe, @computerNo, 0, @storeNo, @sUser, GETDATE())
+                    `);
+
+                await transaction.commit();
+            } catch (txErr) {
+                await transaction.rollback();
+                throw txErr;
+            }
+
+            return { recordNo, computerNo: resolved.computerNo, color: targetColor };
+        });
+
+        if (result.error === "noMatch") {
             return res.status(404).json({ success: false, message: "No matching send-out record found for this store" });
         }
-
-        const mixoRow = await pool.request().input("recordNo", mixRn).query(`SELECT FullColor FROM guest.MIXO WHERE RecordNO = @recordNo`);
-        const targetColor = mixoRow.recordset[0]?.FullColor;
-
-        // A coating batch can come back in more than one partial delivery —
-        // accumulate QtyOut across receive calls rather than overwriting it,
-        // and don't let the total exceed what was actually sent.
-        const alreadyReceived = mix.QtyOut || 0;
-        if (alreadyReceived + qtyReceived > mix.QtySend) {
+        if (result.error === "exceedsRemaining") {
             return res.status(400).json({
                 success: false,
-                message: `Only ${mix.QtySend - alreadyReceived} unit(s) remaining to receive (sent ${mix.QtySend}, already received ${alreadyReceived})`,
+                message: `Only ${result.remaining} unit(s) remaining to receive (sent ${result.sent}, already received ${result.received})`,
             });
         }
-
-        // The coated combination (profile + target color + same length) is
-        // new stock, distinct from the mill-finish combination that was sent.
-        const resolved = await resolveComputerNo(pool, {
-            profileNo: mix.ProfileNO, color: targetColor, linthRe: mix.LinthRe, storeNo, computerNo,
-        });
-        const resolvedProfileName = profileName || resolved.profileName || mix.ProfileName;
-        if (!resolved.computerNo) {
+        if (result.error === "noCode") {
             return res.status(400).json({
                 success: false,
                 message: "No existing code found for this coated profile/color/length — computerNo is required for a new combination",
             });
         }
-        if (!resolvedProfileName) {
+        if (result.error === "noName") {
             return res.status(400).json({ success: false, message: "profileName is required for a new profile/color/length combination" });
-        }
-
-        const sUser = await resolveUsername(req);
-
-        const transaction = pool.transaction();
-        await transaction.begin();
-        let recordNo;
-        try {
-            await transaction.request()
-                .input("recordNo", mixRn)
-                .input("serialNo", mixSn)
-                .input("qtyOut", alreadyReceived + qtyReceived)
-                .query(`UPDATE guest.MIX SET QtyOut = @qtyOut WHERE RecordNO = @recordNo AND SerialNo = @serialNo`);
-
-            const headerResult = await transaction.request()
-                .input("storeNo", storeNo)
-                .input("sUser", sUser)
-                .query(`
-                    INSERT INTO guest.EnterDouO (WHouseOffice, DateWHouse, QCOffice, DateQC, QCTestNo, QCTestdate, QCTestResult, StoreNo, SUser, SDate)
-                    OUTPUT INSERTED.RecordNO
-                    VALUES (NULL, NULL, NULL, NULL, NULL, NULL, NULL, @storeNo, @sUser, GETDATE())
-                `);
-            recordNo = headerResult.recordset[0].RecordNO;
-
-            await transaction.request()
-                .input("recordNo", recordNo)
-                .input("profileNo", mix.ProfileNO)
-                .input("profileName", resolvedProfileName)
-                .input("color", targetColor)
-                .input("linthRe", mix.LinthRe)
-                .input("qtyRe", qtyReceived)
-                .input("computerNo", resolved.computerNo)
-                .input("storeNo", storeNo)
-                .input("sUser", sUser)
-                .query(`
-                    INSERT INTO guest.EnterDou
-                        (RecordNO, SerialNo, ProfileNO, ProfileName, Color, LinthRe, QtyRe, ComputerNO, QtyOut, StoreNo, SUser, SDate)
-                    VALUES
-                        (@recordNo, 1, @profileNo, @profileName, @color, @linthRe, @qtyRe, @computerNo, 0, @storeNo, @sUser, GETDATE())
-                `);
-
-            await transaction.commit();
-        } catch (txErr) {
-            await transaction.rollback();
-            throw txErr;
         }
 
         res.status(201).json({
             success: true,
-            enterRecordNo: recordNo,
+            enterRecordNo: result.recordNo,
             serialNo: 1,
-            computerNo: resolved.computerNo,
-            color: targetColor,
+            computerNo: result.computerNo,
+            color: result.color,
         });
     } catch (err) {
         console.error("❌ STOCK HOUSE MIX RECEIVE ERROR:", err);
@@ -785,36 +831,38 @@ router.get("/mix/outstanding", async (req, res) => {
         const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 25));
         const offset = (page - 1) * pageSize;
 
-        const pool = await getSqlPool("stockhouse");
-        const buildRequest = () => pool.request().input("storeNo", storeNo);
+        const { total, rows } = await withSqlRetry("stockhouse", async (pool) => {
+            const buildRequest = () => pool.request().input("storeNo", storeNo);
 
-        // Same > 0 filter (not <> 0) as /remaining's inCoating section, and
-        // for the same reason: some historical MIX rows from the old Access
-        // app never had QtySend populated consistently, which would
-        // otherwise show up here as nonsense negative-outstanding rows.
-        const whereClause = "WHERE (mx.QtySend - mx.QtyOut) > 0 AND (@storeNo IS NULL OR mx.StoreNo = @storeNo)";
+            // Same > 0 filter (not <> 0) as /remaining's inCoating section, and
+            // for the same reason: some historical MIX rows from the old Access
+            // app never had QtySend populated consistently, which would
+            // otherwise show up here as nonsense negative-outstanding rows.
+            const whereClause = "WHERE (mx.QtySend - mx.QtyOut) > 0 AND (@storeNo IS NULL OR mx.StoreNo = @storeNo)";
 
-        const countResult = await buildRequest().query(`
-            SELECT COUNT(*) AS total
-            FROM guest.MIX mx JOIN guest.MIXO mo ON mx.RecordNO = mo.RecordNO
-            ${whereClause}
-        `);
-        const total = countResult.recordset[0].total;
+            const countResult = await buildRequest().query(`
+                SELECT COUNT(*) AS total
+                FROM guest.MIX mx JOIN guest.MIXO mo ON mx.RecordNO = mo.RecordNO
+                ${whereClause}
+            `);
 
-        const listRequest = buildRequest();
-        listRequest.input("offset", offset).input("pageSize", pageSize);
-        const listResult = await listRequest.query(`
-            SELECT
-                mx.RecordNO, mx.SerialNo, mo.ProjectNO, mo.ProjectName, mo.FullColor AS targetColor,
-                mx.ProfileNO, mx.ProfileName, mx.Color AS millColor, mx.LinthRe, mx.StoreNo,
-                mx.QtySend, mx.QtyOut, (mx.QtySend - mx.QtyOut) AS outstanding, mx.SDate
-            FROM guest.MIX mx JOIN guest.MIXO mo ON mx.RecordNO = mo.RecordNO
-            ${whereClause}
-            ORDER BY mx.SDate DESC
-            OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY
-        `);
+            const listRequest = buildRequest();
+            listRequest.input("offset", offset).input("pageSize", pageSize);
+            const listResult = await listRequest.query(`
+                SELECT
+                    mx.RecordNO, mx.SerialNo, mo.ProjectNO, mo.ProjectName, mo.FullColor AS targetColor,
+                    mx.ProfileNO, mx.ProfileName, mx.Color AS millColor, mx.LinthRe, mx.StoreNo,
+                    mx.QtySend, mx.QtyOut, (mx.QtySend - mx.QtyOut) AS outstanding, mx.SDate
+                FROM guest.MIX mx JOIN guest.MIXO mo ON mx.RecordNO = mo.RecordNO
+                ${whereClause}
+                ORDER BY mx.SDate DESC
+                OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY
+            `);
 
-        res.json({ success: true, records: listResult.recordset, total, page, pageSize });
+            return { total: countResult.recordset[0].total, rows: listResult.recordset };
+        });
+
+        res.json({ success: true, records: rows, total, page, pageSize });
     } catch (err) {
         console.error("❌ STOCK HOUSE MIX OUTSTANDING ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to fetch outstanding coating records" });
@@ -839,32 +887,35 @@ router.get("/mix/:recordNo", async (req, res) => {
             return res.status(400).json({ success: false, message: "Invalid record number" });
         }
 
-        const pool = await getSqlPool("stockhouse");
+        const result = await withSqlRetry("stockhouse", async (pool) => {
+            const headerResult = await pool.request()
+                .input("recordNo", recordNo)
+                .query(`
+                    SELECT RecordNO, RequstNo, DateRequst, NameRequst, ProjectNO, ProjectName, ProjectManger,
+                           StoukOfficer, StouckManger, DateSend, FullColor, StoreNO
+                    FROM guest.MIXO
+                    WHERE RecordNO = @recordNo
+                `);
+            const header = headerResult.recordset[0];
+            if (!header) return null;
 
-        const headerResult = await pool.request()
-            .input("recordNo", recordNo)
-            .query(`
-                SELECT RecordNO, RequstNo, DateRequst, NameRequst, ProjectNO, ProjectName, ProjectManger,
-                       StoukOfficer, StouckManger, DateSend, FullColor, StoreNO
-                FROM guest.MIXO
-                WHERE RecordNO = @recordNo
-            `);
-        const header = headerResult.recordset[0];
-        if (!header) {
+            const itemsResult = await pool.request()
+                .input("recordNo", recordNo)
+                .query(`
+                    SELECT SerialNo, ProfileNO, ProfileName, Color, LinthRe, QtySend, QtyOut,
+                           (QtySend - QtyOut) AS outstanding
+                    FROM guest.MIX
+                    WHERE RecordNO = @recordNo
+                    ORDER BY SerialNo
+                `);
+
+            return { header, items: itemsResult.recordset };
+        });
+
+        if (!result) {
             return res.status(404).json({ success: false, message: "Record not found" });
         }
-
-        const itemsResult = await pool.request()
-            .input("recordNo", recordNo)
-            .query(`
-                SELECT SerialNo, ProfileNO, ProfileName, Color, LinthRe, QtySend, QtyOut,
-                       (QtySend - QtyOut) AS outstanding
-                FROM guest.MIX
-                WHERE RecordNO = @recordNo
-                ORDER BY SerialNo
-            `);
-
-        res.json({ success: true, header, items: itemsResult.recordset });
+        res.json({ success: true, header: result.header, items: result.items });
     } catch (err) {
         console.error("❌ STOCK HOUSE MIX RECORD ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to fetch coating record" });
@@ -882,31 +933,34 @@ router.get("/enter/:recordNo", async (req, res) => {
             return res.status(400).json({ success: false, message: "Invalid record number" });
         }
 
-        const pool = await getSqlPool("stockhouse");
+        const result = await withSqlRetry("stockhouse", async (pool) => {
+            const headerResult = await pool.request()
+                .input("recordNo", recordNo)
+                .query(`
+                    SELECT RecordNO, WHouseOffice, QCOffice, QCTestNo, QCTestResult, StoreNo, SUser, SDate
+                    FROM guest.EnterDouO
+                    WHERE RecordNO = @recordNo
+                `);
+            const header = headerResult.recordset[0];
+            if (!header) return null;
 
-        const headerResult = await pool.request()
-            .input("recordNo", recordNo)
-            .query(`
-                SELECT RecordNO, WHouseOffice, QCOffice, QCTestNo, QCTestResult, StoreNo, SUser, SDate
-                FROM guest.EnterDouO
-                WHERE RecordNO = @recordNo
-            `);
-        const header = headerResult.recordset[0];
-        if (!header) {
+            const itemsResult = await pool.request()
+                .input("recordNo", recordNo)
+                .query(`
+                    SELECT SerialNo, ProfileNO, ProfileName, Color, LinthRe, Supplier, ProjectNO,
+                           QtyRe, QtyEvl, QtyLs, QtyRej, ComputerNO, Weight, Unite
+                    FROM guest.EnterDou
+                    WHERE RecordNO = @recordNo
+                    ORDER BY SerialNo
+                `);
+
+            return { header, items: itemsResult.recordset };
+        });
+
+        if (!result) {
             return res.status(404).json({ success: false, message: "Record not found" });
         }
-
-        const itemsResult = await pool.request()
-            .input("recordNo", recordNo)
-            .query(`
-                SELECT SerialNo, ProfileNO, ProfileName, Color, LinthRe, Supplier, ProjectNO,
-                       QtyRe, QtyEvl, QtyLs, QtyRej, ComputerNO, Weight, Unite
-                FROM guest.EnterDou
-                WHERE RecordNO = @recordNo
-                ORDER BY SerialNo
-            `);
-
-        res.json({ success: true, header, items: itemsResult.recordset });
+        res.json({ success: true, header: result.header, items: result.items });
     } catch (err) {
         console.error("❌ STOCK HOUSE ENTER RECORD ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to fetch receive record" });
@@ -961,7 +1015,7 @@ router.get("/remaining", async (req, res) => {
         const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 25));
         const offset = (page - 1) * pageSize;
 
-        const pool = await getSqlPool("stockhouse");
+        const { items, itemsTotal, inCoating } = await withSqlRetry("stockhouse", async (pool) => {
         const buildItemsRequest = () => pool.request().input("projectNo", projectNo || null).input("storeNo", storeNo);
 
         // Grouped by project+profile+color+length only — NOT also by
@@ -1092,7 +1146,7 @@ router.get("/remaining", async (req, res) => {
         // negative "in coating" amount. Only genuinely outstanding sends —
         // this new app's own /mix/send always sets QtySend, so this only
         // affects legacy rows, not anything created going forward.
-        const inCoating = await coatingRequest.query(`
+        const inCoatingResult = await coatingRequest.query(`
             SELECT
                 mo.ProjectNO, MAX(mo.ProjectName) AS ProjectName,
                 mx.ProfileNO, MAX(mx.ProfileName) AS ProfileName,
@@ -1106,13 +1160,16 @@ router.get("/remaining", async (req, res) => {
             ORDER BY mo.ProjectNO, mx.ProfileNO
         `);
 
+            return { items: items.recordset, itemsTotal, inCoating: inCoatingResult.recordset };
+        });
+
         res.json({
             success: true,
-            items: items.recordset,
+            items,
             total: itemsTotal,
             page,
             pageSize,
-            inCoating: inCoating.recordset,
+            inCoating,
         });
     } catch (err) {
         console.error("❌ STOCK HOUSE REMAINING ERROR:", err);
@@ -1131,41 +1188,43 @@ router.get("/reservations", async (req, res) => {
         const offset = (page - 1) * pageSize;
         const storeNo = req.user.assignedStore || null;
 
-        const pool = await getSqlPool("stockhouse");
-        const filters = [];
-        const buildRequest = () => {
-            const request = pool.request();
-            if (search) {
-                request.input("search", `%${search}%`);
-                filters.length = 0;
-                filters.push("(ro.ProjectNO LIKE @search OR ro.ProjectName LIKE @search)");
-            }
-            if (storeNo) {
-                request.input("storeNo", storeNo);
-                filters.push("ro.StoreNo = @storeNo");
-            }
-            return request;
-        };
-        const whereClause = () => (filters.length ? `WHERE ${filters.join(" AND ")}` : "");
+        const { total, rows } = await withSqlRetry("stockhouse", async (pool) => {
+            const filters = [];
+            const buildRequest = () => {
+                const request = pool.request();
+                if (search) {
+                    request.input("search", `%${search}%`);
+                    filters.length = 0;
+                    filters.push("(ro.ProjectNO LIKE @search OR ro.ProjectName LIKE @search)");
+                }
+                if (storeNo) {
+                    request.input("storeNo", storeNo);
+                    filters.push("ro.StoreNo = @storeNo");
+                }
+                return request;
+            };
+            const whereClause = () => (filters.length ? `WHERE ${filters.join(" AND ")}` : "");
 
-        const countResult = await buildRequest().query(`SELECT COUNT(*) AS total FROM guest.ReservationO ro ${whereClause()}`);
-        const total = countResult.recordset[0].total;
+            const countResult = await buildRequest().query(`SELECT COUNT(*) AS total FROM guest.ReservationO ro ${whereClause()}`);
 
-        const listRequest = buildRequest();
-        listRequest.input("offset", offset).input("pageSize", pageSize);
-        const listResult = await listRequest.query(`
-            SELECT
-                ro.RecordNO, ro.ProjectNO, ro.ProjectName, ro.ProjectManger, ro.Date, ro.DateR, ro.StoreNo,
-                COUNT(r.SerialNo) AS lineCount, ISNULL(SUM(r.QtyRe), 0) AS totalQty
-            FROM guest.ReservationO ro
-            LEFT JOIN guest.Reservation r ON r.RecordNO = ro.RecordNO
-            ${whereClause()}
-            GROUP BY ro.RecordNO, ro.ProjectNO, ro.ProjectName, ro.ProjectManger, ro.Date, ro.DateR, ro.StoreNo
-            ORDER BY ro.RecordNO DESC
-            OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY
-        `);
+            const listRequest = buildRequest();
+            listRequest.input("offset", offset).input("pageSize", pageSize);
+            const listResult = await listRequest.query(`
+                SELECT
+                    ro.RecordNO, ro.ProjectNO, ro.ProjectName, ro.ProjectManger, ro.Date, ro.DateR, ro.StoreNo,
+                    COUNT(r.SerialNo) AS lineCount, ISNULL(SUM(r.QtyRe), 0) AS totalQty
+                FROM guest.ReservationO ro
+                LEFT JOIN guest.Reservation r ON r.RecordNO = ro.RecordNO
+                ${whereClause()}
+                GROUP BY ro.RecordNO, ro.ProjectNO, ro.ProjectName, ro.ProjectManger, ro.Date, ro.DateR, ro.StoreNo
+                ORDER BY ro.RecordNO DESC
+                OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY
+            `);
 
-        res.json({ success: true, reservations: listResult.recordset, total, page, pageSize });
+            return { total: countResult.recordset[0].total, rows: listResult.recordset };
+        });
+
+        res.json({ success: true, reservations: rows, total, page, pageSize });
     } catch (err) {
         console.error("❌ STOCK HOUSE RESERVATIONS LIST ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to fetch reservations" });
@@ -1182,20 +1241,21 @@ router.get("/reservations/:recordNo/items", async (req, res) => {
         }
         const storeNo = req.user.assignedStore || null;
 
-        const pool = await getSqlPool("stockhouse");
-        const request = pool.request().input("recordNo", recordNo);
-        let storeFilter = "";
-        if (storeNo) {
-            request.input("storeNo", storeNo);
-            storeFilter = "AND StoreNo = @storeNo";
-        }
+        const result = await withSqlRetry("stockhouse", (pool) => {
+            const request = pool.request().input("recordNo", recordNo);
+            let storeFilter = "";
+            if (storeNo) {
+                request.input("storeNo", storeNo);
+                storeFilter = "AND StoreNo = @storeNo";
+            }
 
-        const result = await request.query(`
-            SELECT SerialNo, ProfileNO, ProfileName, Color, QtyRe, LinthRe, Avl, ComputerNO, Note, StoreNo
-            FROM guest.Reservation
-            WHERE RecordNO = @recordNo ${storeFilter}
-            ORDER BY SerialNo
-        `);
+            return request.query(`
+                SELECT SerialNo, ProfileNO, ProfileName, Color, QtyRe, LinthRe, Avl, ComputerNO, Note, StoreNo
+                FROM guest.Reservation
+                WHERE RecordNO = @recordNo ${storeFilter}
+                ORDER BY SerialNo
+            `);
+        });
 
         res.json({ success: true, items: result.recordset });
     } catch (err) {
@@ -1276,79 +1336,84 @@ router.post("/reservation-f", async (req, res) => {
             return res.status(400).json({ success: false, message: "storeNo is required" });
         }
 
-        const pool = await getSqlPool("stockhouse");
-
-        const order = await resolveProductionOrder(pool, projectNo, productionNo);
-        if (!order) {
-            return res.status(404).json({
-                success: false,
-                message: "No production order found for this project/production number",
-            });
-        }
-
-        const resolved = await resolveComputerNo(pool, { profileNo, color, linthRe, storeNo, computerNo });
-        if (!resolved.computerNo) {
-            return res.status(400).json({ success: false, message: "No matching stock found for this profile/color/length in this store" });
-        }
-
-        const qtyAvl = await computeOnHand(pool, { profileNo, color, linthRe, storeNo, computerNo: resolved.computerNo });
-
         const sUser = await resolveUsername(req);
         // "No" mirrors the legacy form's ProjectNO+ProductionNO composite
         // search key (set in ProductionNO_AfterUpdate in the VBA).
         const no = `${projectNo}${productionNo}`;
 
-        const transaction = pool.transaction();
-        await transaction.begin();
-        let recordNo;
-        try {
-            const headerResult = await transaction.request()
-                .input("projectNo", projectNo)
-                .input("projectName", order.projName)
-                .input("productionNo", productionNo)
-                .input("no", no)
-                .input("storeNo", storeNo)
-                .input("sUser", sUser)
-                .query(`
-                    INSERT INTO guest.ReservationFO (ProjectNO, ProjectName, ProductionNO, Date, No, StoreNo, SUser, SDate)
-                    OUTPUT INSERTED.RecordNO
-                    VALUES (@projectNo, @projectName, @productionNo, GETDATE(), @no, @storeNo, @sUser, GETDATE())
-                `);
-            recordNo = headerResult.recordset[0].RecordNO;
+        const result = await withSqlRetry("stockhouse", async (pool) => {
+            const order = await resolveProductionOrder(pool, projectNo, productionNo);
+            if (!order) return { error: "noOrder" };
 
-            await transaction.request()
-                .input("recordNo", recordNo)
-                .input("profileNo", profileNo)
-                .input("color", color)
-                .input("linthRe", linthRe)
-                .input("qtyRe", qty)
-                .input("computerNo", resolved.computerNo)
-                .input("qtyAvl", qtyAvl)
-                .input("projectNORe", projectNORe || null)
-                .input("colorRe", colorRe || null)
-                .input("weight", weight !== undefined && weight !== null ? parseFloat(weight) : null)
-                .input("storeNo", storeNo)
-                .input("sUser", sUser)
-                .query(`
-                    INSERT INTO guest.ReservationF
-                        (RecordNO, SerialNo, ProfileNO, Color, LinthRe, QtyRe, ComputerNO, QtyAvl, QtyOut, ProjectNORe, ColorRe, Weight, StoreNo, SUser, SDate)
-                    VALUES
-                        (@recordNo, 1, @profileNo, @color, @linthRe, @qtyRe, @computerNo, @qtyAvl, 0, @projectNORe, @colorRe, @weight, @storeNo, @sUser, GETDATE())
-                `);
+            const resolved = await resolveComputerNo(pool, { profileNo, color, linthRe, storeNo, computerNo });
+            if (!resolved.computerNo) return { error: "noCode" };
 
-            await transaction.commit();
-        } catch (txErr) {
-            await transaction.rollback();
-            throw txErr;
+            const qtyAvl = await computeOnHand(pool, { profileNo, color, linthRe, storeNo, computerNo: resolved.computerNo });
+
+            const transaction = pool.transaction();
+            await transaction.begin();
+            let recordNo;
+            try {
+                const headerResult = await transaction.request()
+                    .input("projectNo", projectNo)
+                    .input("projectName", order.projName)
+                    .input("productionNo", productionNo)
+                    .input("no", no)
+                    .input("storeNo", storeNo)
+                    .input("sUser", sUser)
+                    .query(`
+                        INSERT INTO guest.ReservationFO (ProjectNO, ProjectName, ProductionNO, Date, No, StoreNo, SUser, SDate)
+                        OUTPUT INSERTED.RecordNO
+                        VALUES (@projectNo, @projectName, @productionNo, GETDATE(), @no, @storeNo, @sUser, GETDATE())
+                    `);
+                recordNo = headerResult.recordset[0].RecordNO;
+
+                await transaction.request()
+                    .input("recordNo", recordNo)
+                    .input("profileNo", profileNo)
+                    .input("color", color)
+                    .input("linthRe", linthRe)
+                    .input("qtyRe", qty)
+                    .input("computerNo", resolved.computerNo)
+                    .input("qtyAvl", qtyAvl)
+                    .input("projectNORe", projectNORe || null)
+                    .input("colorRe", colorRe || null)
+                    .input("weight", weight !== undefined && weight !== null ? parseFloat(weight) : null)
+                    .input("storeNo", storeNo)
+                    .input("sUser", sUser)
+                    .query(`
+                        INSERT INTO guest.ReservationF
+                            (RecordNO, SerialNo, ProfileNO, Color, LinthRe, QtyRe, ComputerNO, QtyAvl, QtyOut, ProjectNORe, ColorRe, Weight, StoreNo, SUser, SDate)
+                        VALUES
+                            (@recordNo, 1, @profileNo, @color, @linthRe, @qtyRe, @computerNo, @qtyAvl, 0, @projectNORe, @colorRe, @weight, @storeNo, @sUser, GETDATE())
+                    `);
+
+                await transaction.commit();
+            } catch (txErr) {
+                await transaction.rollback();
+                throw txErr;
+            }
+
+            return { recordNo, computerNo: resolved.computerNo, qtyAvl };
+        });
+
+        if (result.error === "noOrder") {
+            return res.status(404).json({
+                success: false,
+                message: "No production order found for this project/production number",
+            });
+        }
+        if (result.error === "noCode") {
+            return res.status(400).json({ success: false, message: "No matching stock found for this profile/color/length in this store" });
         }
 
         res.status(201).json({
             success: true,
-            recordNo,
+            recordNo: result.recordNo,
             serialNo: 1,
-            computerNo: resolved.computerNo,
-            qtyAvl,
-            feasible: qtyAvl >= qty,
+            computerNo: result.computerNo,
+            qtyAvl: result.qtyAvl,
+            feasible: result.qtyAvl >= qty,
         });
     } catch (err) {
         console.error("❌ STOCK HOUSE RESERVATION-F CREATE ERROR:", err);
@@ -1366,44 +1431,46 @@ router.get("/reservation-f", async (req, res) => {
         const offset = (page - 1) * pageSize;
         const storeNo = req.user.assignedStore || null;
 
-        const pool = await getSqlPool("stockhouse");
-        const filters = [];
-        const buildRequest = () => {
-            const request = pool.request();
-            if (search) {
-                request.input("search", `%${search}%`);
-                filters.length = 0;
-                filters.push("(fo.ProjectNO LIKE @search OR fo.ProjectName LIKE @search OR fo.ProductionNO LIKE @search)");
-            }
-            if (storeNo) {
-                request.input("storeNo", storeNo);
-                filters.push("fo.StoreNo = @storeNo");
-            }
-            return request;
-        };
-        const whereClause = () => (filters.length ? `WHERE ${filters.join(" AND ")}` : "");
+        const { total, rows } = await withSqlRetry("stockhouse", async (pool) => {
+            const filters = [];
+            const buildRequest = () => {
+                const request = pool.request();
+                if (search) {
+                    request.input("search", `%${search}%`);
+                    filters.length = 0;
+                    filters.push("(fo.ProjectNO LIKE @search OR fo.ProjectName LIKE @search OR fo.ProductionNO LIKE @search)");
+                }
+                if (storeNo) {
+                    request.input("storeNo", storeNo);
+                    filters.push("fo.StoreNo = @storeNo");
+                }
+                return request;
+            };
+            const whereClause = () => (filters.length ? `WHERE ${filters.join(" AND ")}` : "");
 
-        const countResult = await buildRequest().query(`SELECT COUNT(*) AS total FROM guest.ReservationFO fo ${whereClause()}`);
-        const total = countResult.recordset[0].total;
+            const countResult = await buildRequest().query(`SELECT COUNT(*) AS total FROM guest.ReservationFO fo ${whereClause()}`);
 
-        const listRequest = buildRequest();
-        listRequest.input("offset", offset).input("pageSize", pageSize);
-        const listResult = await listRequest.query(`
-            SELECT
-                fo.RecordNO, fo.ProjectNO, fo.ProjectName, fo.ProductionNO, fo.Date, fo.StoreNo,
-                COUNT(f.SerialNo) AS lineCount,
-                ISNULL(SUM(f.QtyRe), 0) AS totalQtyRe,
-                ISNULL(SUM(f.QtyAvl), 0) AS totalQtyAvl,
-                ISNULL(SUM(f.QtyOut), 0) AS totalQtyOut
-            FROM guest.ReservationFO fo
-            LEFT JOIN guest.ReservationF f ON f.RecordNO = fo.RecordNO
-            ${whereClause()}
-            GROUP BY fo.RecordNO, fo.ProjectNO, fo.ProjectName, fo.ProductionNO, fo.Date, fo.StoreNo
-            ORDER BY fo.RecordNO DESC
-            OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY
-        `);
+            const listRequest = buildRequest();
+            listRequest.input("offset", offset).input("pageSize", pageSize);
+            const listResult = await listRequest.query(`
+                SELECT
+                    fo.RecordNO, fo.ProjectNO, fo.ProjectName, fo.ProductionNO, fo.Date, fo.StoreNo,
+                    COUNT(f.SerialNo) AS lineCount,
+                    ISNULL(SUM(f.QtyRe), 0) AS totalQtyRe,
+                    ISNULL(SUM(f.QtyAvl), 0) AS totalQtyAvl,
+                    ISNULL(SUM(f.QtyOut), 0) AS totalQtyOut
+                FROM guest.ReservationFO fo
+                LEFT JOIN guest.ReservationF f ON f.RecordNO = fo.RecordNO
+                ${whereClause()}
+                GROUP BY fo.RecordNO, fo.ProjectNO, fo.ProjectName, fo.ProductionNO, fo.Date, fo.StoreNo
+                ORDER BY fo.RecordNO DESC
+                OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY
+            `);
 
-        res.json({ success: true, checks: listResult.recordset, total, page, pageSize });
+            return { total: countResult.recordset[0].total, rows: listResult.recordset };
+        });
+
+        res.json({ success: true, checks: rows, total, page, pageSize });
     } catch (err) {
         console.error("❌ STOCK HOUSE RESERVATION-F LIST ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to fetch feasibility checks" });
@@ -1420,20 +1487,21 @@ router.get("/reservation-f/:recordNo/items", async (req, res) => {
         }
         const storeNo = req.user.assignedStore || null;
 
-        const pool = await getSqlPool("stockhouse");
-        const request = pool.request().input("recordNo", recordNo);
-        let storeFilter = "";
-        if (storeNo) {
-            request.input("storeNo", storeNo);
-            storeFilter = "AND StoreNo = @storeNo";
-        }
+        const result = await withSqlRetry("stockhouse", (pool) => {
+            const request = pool.request().input("recordNo", recordNo);
+            let storeFilter = "";
+            if (storeNo) {
+                request.input("storeNo", storeNo);
+                storeFilter = "AND StoreNo = @storeNo";
+            }
 
-        const result = await request.query(`
-            SELECT SerialNo, ProfileNO, Color, LinthRe, QtyRe, ComputerNO, QtyAvl, QtyOut, ProjectNORe, ColorRe, Weight, StoreNo
-            FROM guest.ReservationF
-            WHERE RecordNO = @recordNo ${storeFilter}
-            ORDER BY SerialNo
-        `);
+            return request.query(`
+                SELECT SerialNo, ProfileNO, Color, LinthRe, QtyRe, ComputerNO, QtyAvl, QtyOut, ProjectNORe, ColorRe, Weight, StoreNo
+                FROM guest.ReservationF
+                WHERE RecordNO = @recordNo ${storeFilter}
+                ORDER BY SerialNo
+            `);
+        });
 
         res.json({ success: true, items: result.recordset });
     } catch (err) {
@@ -1468,103 +1536,106 @@ router.get("/card/:computerNo", async (req, res) => {
         const dateTo = req.query.dateTo || null;
         const storeNo = req.user.assignedStore || null;
 
-        const pool = await getSqlPool("stockhouse");
-
-        if (storeNo) {
-            const access = await pool.request().input("computerNo", computerNo).input("storeNo", storeNo).query(`
-                SELECT TOP 1 1 AS found FROM (
-                    SELECT StoreNo, ComputerNO FROM guest.EnterDou
-                    UNION ALL
-                    SELECT StoreNo, ComputerNO FROM guest.StockOut
-                    UNION ALL
-                    SELECT StoreNo, ComputerNO FROM guest.StockBack
-                    UNION ALL
-                    SELECT StoreNo, ComputerNO FROM guest.MIX
-                ) t
-                WHERE t.ComputerNO = @computerNo AND t.StoreNo = @storeNo
-            `);
-            if (!access.recordset.length) {
-                return res.status(404).json({ success: false, message: "No item found for this code in this store" });
+        const result = await withSqlRetry("stockhouse", async (pool) => {
+            if (storeNo) {
+                const access = await pool.request().input("computerNo", computerNo).input("storeNo", storeNo).query(`
+                    SELECT TOP 1 1 AS found FROM (
+                        SELECT StoreNo, ComputerNO FROM guest.EnterDou
+                        UNION ALL
+                        SELECT StoreNo, ComputerNO FROM guest.StockOut
+                        UNION ALL
+                        SELECT StoreNo, ComputerNO FROM guest.StockBack
+                        UNION ALL
+                        SELECT StoreNo, ComputerNO FROM guest.MIX
+                    ) t
+                    WHERE t.ComputerNO = @computerNo AND t.StoreNo = @storeNo
+                `);
+                if (!access.recordset.length) return { error: "noAccess" };
             }
+
+            // dateFrom/dateTo bound each branch by its own SDate — matches the
+            // legacy Access app's asd/asdDate forms (bound StockOut records by
+            // date before viewing/printing). Since the running balance below is
+            // computed only over the filtered rows, "balance" here means
+            // "balance within the selected date range," not true absolute
+            // on-hand — same as the legacy behavior (a bounded listing, not a
+            // carried-forward ledger), surfaced to the user via a caption in
+            // the frontend rather than silently implied.
+            const txResult = await pool.request()
+                .input("computerNo", computerNo)
+                .input("dateFrom", dateFrom)
+                .input("dateTo", dateTo)
+                .query(`
+                SELECT date, type, qty, ref, ProfileNO, ProfileName, Color, LinthRe, StoreNo, SUser,
+                       SUM(balanceQty) OVER (ORDER BY date, seq, RecordNO, SerialNo ROWS UNBOUNDED PRECEDING) AS balance
+                FROM (
+                    SELECT ed.SDate AS date, 'IN' AS type, ed.QtyRe AS qty, ed.QtyRe AS balanceQty, ed.ProjectNO AS ref,
+                           ed.ProfileNO, ed.ProfileName, ed.Color, ed.LinthRe, ed.StoreNo, ed.SUser,
+                           1 AS seq, ed.RecordNO, ed.SerialNo
+                    FROM guest.EnterDou ed
+                    WHERE ed.ComputerNO = @computerNo
+                      AND (@dateFrom IS NULL OR ed.SDate >= @dateFrom)
+                      AND (@dateTo IS NULL OR ed.SDate <= @dateTo)
+
+                    UNION ALL
+
+                    SELECT so.SDate, 'OUT', -so.QtyOut, -so.QtyOut, soo.ProjectNO,
+                           so.ProfileNO, NULL, so.Color, so.LinthRe, so.StoreNo, so.SUser,
+                           2, so.RecordNO, so.SerialNo
+                    FROM guest.StockOut so
+                    JOIN guest.StockOutO soo ON so.RecordNO = soo.RecordNO
+                    WHERE so.ComputerNO = @computerNo
+                      AND (@dateFrom IS NULL OR so.SDate >= @dateFrom)
+                      AND (@dateTo IS NULL OR so.SDate <= @dateTo)
+
+                    UNION ALL
+
+                    SELECT sb.SDate, 'RETURN', sb.QtyOut, sb.QtyOut, sbo.ProjectNO,
+                           sb.ProfileNO, NULL, sb.Color, sb.LinthRe, sb.StoreNo, sb.SUser,
+                           3, sb.RecordNO, sb.SerialNo
+                    FROM guest.StockBack sb
+                    JOIN guest.StockBackO sbo ON sb.RecordNO = sbo.RecordNO
+                    WHERE sb.ComputerNO = @computerNo
+                      AND (@dateFrom IS NULL OR sb.SDate >= @dateFrom)
+                      AND (@dateTo IS NULL OR sb.SDate <= @dateTo)
+
+                    UNION ALL
+
+                    -- Mill-finish stock sent out to the external coating company
+                    -- (guest.MIX/MIXO — see POST /mix/send), shown as an 'OUT' row
+                    -- so it's visible in the history, but deliberately excluded from
+                    -- the running balance (balanceQty = 0): confirmed against the
+                    -- legacy Access app's own M1.Card()/M1.RStock() — RStock's
+                    -- on-hand total is Sum(QtyIN)-Sum(QtyOut) only, with MIX's
+                    -- QtyAvl reported as a separate "currently at the coater" figure,
+                    -- never subtracted from on-hand. Netting MIX into this card's
+                    -- balance made it disagree with /stock-levels (Remaining Stock)
+                    -- for the same item — this keeps both reports consistent. Uses
+                    -- QtyAvl, not QtySend: checked live, 50,824 of 50,825 MIX rows
+                    -- have QtySend = 0 (the legacy Access app — still the primary
+                    -- writer of this table — has only ever populated QtyAvl for the
+                    -- sent quantity; QtySend appears vestigial). POST /mix/send
+                    -- (this app's own writer) sets both columns to the same value,
+                    -- so QtyAvl is correct for rows from either source.
+                    SELECT mx.SDate, 'OUT', -mx.QtyAvl, 0, mo.ProjectNO,
+                           mx.ProfileNO, mx.ProfileName, mx.Color, mx.LinthRe, mx.StoreNo, mx.SUser,
+                           4, mx.RecordNO, mx.SerialNo
+                    FROM guest.MIX mx
+                    JOIN guest.MIXO mo ON mx.RecordNO = mo.RecordNO
+                    WHERE mx.ComputerNO = @computerNo
+                      AND (@dateFrom IS NULL OR mx.SDate >= @dateFrom)
+                      AND (@dateTo IS NULL OR mx.SDate <= @dateTo)
+                ) t
+                ORDER BY date, seq, RecordNO, SerialNo
+            `);
+
+            return { transactions: txResult.recordset };
+        });
+
+        if (result.error === "noAccess") {
+            return res.status(404).json({ success: false, message: "No item found for this code in this store" });
         }
-
-        // dateFrom/dateTo bound each branch by its own SDate — matches the
-        // legacy Access app's asd/asdDate forms (bound StockOut records by
-        // date before viewing/printing). Since the running balance below is
-        // computed only over the filtered rows, "balance" here means
-        // "balance within the selected date range," not true absolute
-        // on-hand — same as the legacy behavior (a bounded listing, not a
-        // carried-forward ledger), surfaced to the user via a caption in
-        // the frontend rather than silently implied.
-        const result = await pool.request()
-            .input("computerNo", computerNo)
-            .input("dateFrom", dateFrom)
-            .input("dateTo", dateTo)
-            .query(`
-            SELECT date, type, qty, ref, ProfileNO, ProfileName, Color, LinthRe, StoreNo, SUser,
-                   SUM(balanceQty) OVER (ORDER BY date, seq, RecordNO, SerialNo ROWS UNBOUNDED PRECEDING) AS balance
-            FROM (
-                SELECT ed.SDate AS date, 'IN' AS type, ed.QtyRe AS qty, ed.QtyRe AS balanceQty, ed.ProjectNO AS ref,
-                       ed.ProfileNO, ed.ProfileName, ed.Color, ed.LinthRe, ed.StoreNo, ed.SUser,
-                       1 AS seq, ed.RecordNO, ed.SerialNo
-                FROM guest.EnterDou ed
-                WHERE ed.ComputerNO = @computerNo
-                  AND (@dateFrom IS NULL OR ed.SDate >= @dateFrom)
-                  AND (@dateTo IS NULL OR ed.SDate <= @dateTo)
-
-                UNION ALL
-
-                SELECT so.SDate, 'OUT', -so.QtyOut, -so.QtyOut, soo.ProjectNO,
-                       so.ProfileNO, NULL, so.Color, so.LinthRe, so.StoreNo, so.SUser,
-                       2, so.RecordNO, so.SerialNo
-                FROM guest.StockOut so
-                JOIN guest.StockOutO soo ON so.RecordNO = soo.RecordNO
-                WHERE so.ComputerNO = @computerNo
-                  AND (@dateFrom IS NULL OR so.SDate >= @dateFrom)
-                  AND (@dateTo IS NULL OR so.SDate <= @dateTo)
-
-                UNION ALL
-
-                SELECT sb.SDate, 'RETURN', sb.QtyOut, sb.QtyOut, sbo.ProjectNO,
-                       sb.ProfileNO, NULL, sb.Color, sb.LinthRe, sb.StoreNo, sb.SUser,
-                       3, sb.RecordNO, sb.SerialNo
-                FROM guest.StockBack sb
-                JOIN guest.StockBackO sbo ON sb.RecordNO = sbo.RecordNO
-                WHERE sb.ComputerNO = @computerNo
-                  AND (@dateFrom IS NULL OR sb.SDate >= @dateFrom)
-                  AND (@dateTo IS NULL OR sb.SDate <= @dateTo)
-
-                UNION ALL
-
-                -- Mill-finish stock sent out to the external coating company
-                -- (guest.MIX/MIXO — see POST /mix/send), shown as an 'OUT' row
-                -- so it's visible in the history, but deliberately excluded from
-                -- the running balance (balanceQty = 0): confirmed against the
-                -- legacy Access app's own M1.Card()/M1.RStock() — RStock's
-                -- on-hand total is Sum(QtyIN)-Sum(QtyOut) only, with MIX's
-                -- QtyAvl reported as a separate "currently at the coater" figure,
-                -- never subtracted from on-hand. Netting MIX into this card's
-                -- balance made it disagree with /stock-levels (Remaining Stock)
-                -- for the same item — this keeps both reports consistent. Uses
-                -- QtyAvl, not QtySend: checked live, 50,824 of 50,825 MIX rows
-                -- have QtySend = 0 (the legacy Access app — still the primary
-                -- writer of this table — has only ever populated QtyAvl for the
-                -- sent quantity; QtySend appears vestigial). POST /mix/send
-                -- (this app's own writer) sets both columns to the same value,
-                -- so QtyAvl is correct for rows from either source.
-                SELECT mx.SDate, 'OUT', -mx.QtyAvl, 0, mo.ProjectNO,
-                       mx.ProfileNO, mx.ProfileName, mx.Color, mx.LinthRe, mx.StoreNo, mx.SUser,
-                       4, mx.RecordNO, mx.SerialNo
-                FROM guest.MIX mx
-                JOIN guest.MIXO mo ON mx.RecordNO = mo.RecordNO
-                WHERE mx.ComputerNO = @computerNo
-                  AND (@dateFrom IS NULL OR mx.SDate >= @dateFrom)
-                  AND (@dateTo IS NULL OR mx.SDate <= @dateTo)
-            ) t
-            ORDER BY date, seq, RecordNO, SerialNo
-        `);
-
-        res.json({ success: true, transactions: result.recordset });
+        res.json({ success: true, transactions: result.transactions });
     } catch (err) {
         console.error("❌ STOCK HOUSE CARD ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to fetch item history" });
@@ -1584,7 +1655,7 @@ router.get("/stock-levels", async (req, res) => {
         const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 25));
         const offset = (page - 1) * pageSize;
 
-        const pool = await getSqlPool("stockhouse");
+        const { total, totalOnHand, rows } = await withSqlRetry("stockhouse", async (pool) => {
         const buildRequest = () => pool.request().input("profileNo", profileNo || null).input("storeNo", storeNo);
 
         // Grouping by ComputerNO (the item's real identity) instead of by
@@ -1653,7 +1724,10 @@ router.get("/stock-levels", async (req, res) => {
             OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY
         `);
 
-        res.json({ success: true, levels: listResult.recordset, total, totalOnHand, page, pageSize });
+            return { total, totalOnHand, rows: listResult.recordset };
+        });
+
+        res.json({ success: true, levels: rows, total, totalOnHand, page, pageSize });
     } catch (err) {
         console.error("❌ STOCK HOUSE STOCK LEVELS ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to fetch stock levels" });
@@ -1686,30 +1760,32 @@ router.get("/profile-assemblies", async (req, res) => {
         const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 25));
         const offset = (page - 1) * pageSize;
 
-        const pool = await getSqlPool("stockhouse");
-        const buildRequest = () => {
-            const request = pool.request();
-            if (search) request.input("search", `%${search}%`);
-            return request;
-        };
-        const whereClause = search
-            ? "WHERE ProfileNOA LIKE @search OR ProfileP1 LIKE @search OR ProfileP2 LIKE @search OR ProfileP3 LIKE @search OR ProfileP4 LIKE @search OR ProfileP5 LIKE @search"
-            : "";
+        const { total, rows } = await withSqlRetry("stockhouse", async (pool) => {
+            const buildRequest = () => {
+                const request = pool.request();
+                if (search) request.input("search", `%${search}%`);
+                return request;
+            };
+            const whereClause = search
+                ? "WHERE ProfileNOA LIKE @search OR ProfileP1 LIKE @search OR ProfileP2 LIKE @search OR ProfileP3 LIKE @search OR ProfileP4 LIKE @search OR ProfileP5 LIKE @search"
+                : "";
 
-        const countResult = await buildRequest().query(`SELECT COUNT(*) AS total FROM guest.ProfileNOA ${whereClause}`);
-        const total = countResult.recordset[0].total;
+            const countResult = await buildRequest().query(`SELECT COUNT(*) AS total FROM guest.ProfileNOA ${whereClause}`);
 
-        const listRequest = buildRequest();
-        listRequest.input("offset", offset).input("pageSize", pageSize);
-        const listResult = await listRequest.query(`
-            SELECT ID, ProfileNOA, ProfileP1, ProfileP2, ProfileP3, ProfileP4, ProfileP5, SUser, SDate
-            FROM guest.ProfileNOA
-            ${whereClause}
-            ORDER BY ID DESC
-            OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY
-        `);
+            const listRequest = buildRequest();
+            listRequest.input("offset", offset).input("pageSize", pageSize);
+            const listResult = await listRequest.query(`
+                SELECT ID, ProfileNOA, ProfileP1, ProfileP2, ProfileP3, ProfileP4, ProfileP5, SUser, SDate
+                FROM guest.ProfileNOA
+                ${whereClause}
+                ORDER BY ID DESC
+                OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY
+            `);
 
-        res.json({ success: true, assemblies: listResult.recordset, total, page, pageSize });
+            return { total: countResult.recordset[0].total, rows: listResult.recordset };
+        });
+
+        res.json({ success: true, assemblies: rows, total, page, pageSize });
     } catch (err) {
         console.error("❌ PROFILE ASSEMBLIES LIST ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to fetch profile assemblies" });
@@ -1725,9 +1801,8 @@ router.post("/profile-assemblies", async (req, res) => {
             return res.status(400).json({ success: false, message: "profileNOA is required" });
         }
 
-        const pool = await getSqlPool("stockhouse");
         const sUser = await resolveUsername(req);
-        const result = await pool.request()
+        const result = await withSqlRetry("stockhouse", (pool) => pool.request()
             .input("profileNOA", String(profileNOA).trim())
             .input("profileP1", profileP1 || null)
             .input("profileP2", profileP2 || null)
@@ -1739,7 +1814,7 @@ router.post("/profile-assemblies", async (req, res) => {
                 INSERT INTO guest.ProfileNOA (ProfileNOA, ProfileP1, ProfileP2, ProfileP3, ProfileP4, ProfileP5, SUser, SDate)
                 OUTPUT INSERTED.ID
                 VALUES (@profileNOA, @profileP1, @profileP2, @profileP3, @profileP4, @profileP5, @sUser, GETDATE())
-            `);
+            `));
 
         res.status(201).json({ success: true, id: result.recordset[0].ID });
     } catch (err) {
@@ -1761,9 +1836,8 @@ router.put("/profile-assemblies/:id", async (req, res) => {
             return res.status(400).json({ success: false, message: "profileNOA is required" });
         }
 
-        const pool = await getSqlPool("stockhouse");
         const sUser = await resolveUsername(req);
-        const result = await pool.request()
+        const result = await withSqlRetry("stockhouse", (pool) => pool.request()
             .input("id", id)
             .input("profileNOA", String(profileNOA).trim())
             .input("profileP1", profileP1 || null)
@@ -1778,7 +1852,7 @@ router.put("/profile-assemblies/:id", async (req, res) => {
                     ProfileP3 = @profileP3, ProfileP4 = @profileP4, ProfileP5 = @profileP5,
                     SUser = @sUser, SDate = GETDATE()
                 WHERE ID = @id
-            `);
+            `));
 
         if (!result.rowsAffected[0]) {
             return res.status(404).json({ success: false, message: "Profile assembly not found" });
@@ -1799,8 +1873,7 @@ router.delete("/profile-assemblies/:id", async (req, res) => {
             return res.status(400).json({ success: false, message: "Invalid id" });
         }
 
-        const pool = await getSqlPool("stockhouse");
-        const result = await pool.request().input("id", id).query(`DELETE FROM guest.ProfileNOA WHERE ID = @id`);
+        const result = await withSqlRetry("stockhouse", (pool) => pool.request().input("id", id).query(`DELETE FROM guest.ProfileNOA WHERE ID = @id`));
 
         if (!result.rowsAffected[0]) {
             return res.status(404).json({ success: false, message: "Profile assembly not found" });
@@ -1854,28 +1927,30 @@ router.get("/item-profiles", async (req, res) => {
         const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 25));
         const offset = (page - 1) * pageSize;
 
-        const pool = await getSqlPool("stockhouse");
-        const buildRequest = () => {
-            const request = pool.request();
-            if (search) request.input("search", `%${search}%`);
-            return request;
-        };
-        const whereClause = search ? "WHERE ProfileNO LIKE @search OR ProfileName LIKE @search" : "";
+        const { total, rows } = await withSqlRetry("stockhouse", async (pool) => {
+            const buildRequest = () => {
+                const request = pool.request();
+                if (search) request.input("search", `%${search}%`);
+                return request;
+            };
+            const whereClause = search ? "WHERE ProfileNO LIKE @search OR ProfileName LIKE @search" : "";
 
-        const countResult = await buildRequest().query(`SELECT COUNT(*) AS total FROM guest.ItemProfile ${whereClause}`);
-        const total = countResult.recordset[0].total;
+            const countResult = await buildRequest().query(`SELECT COUNT(*) AS total FROM guest.ItemProfile ${whereClause}`);
 
-        const listRequest = buildRequest();
-        listRequest.input("offset", offset).input("pageSize", pageSize);
-        const listResult = await listRequest.query(`
-            SELECT ID, ProfileNO, ProfileName, Details, PhotoUrl, SUser, SDate
-            FROM guest.ItemProfile
-            ${whereClause}
-            ORDER BY ID DESC
-            OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY
-        `);
+            const listRequest = buildRequest();
+            listRequest.input("offset", offset).input("pageSize", pageSize);
+            const listResult = await listRequest.query(`
+                SELECT ID, ProfileNO, ProfileName, Details, PhotoUrl, SUser, SDate
+                FROM guest.ItemProfile
+                ${whereClause}
+                ORDER BY ID DESC
+                OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY
+            `);
 
-        res.json({ success: true, profiles: listResult.recordset, total, page, pageSize });
+            return { total: countResult.recordset[0].total, rows: listResult.recordset };
+        });
+
+        res.json({ success: true, profiles: rows, total, page, pageSize });
     } catch (err) {
         console.error("❌ ITEM PROFILES LIST ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to fetch item profiles" });
@@ -1894,9 +1969,8 @@ router.post("/item-profiles", async (req, res) => {
             return res.status(400).json({ success: false, message: "profileName is required" });
         }
 
-        const pool = await getSqlPool("stockhouse");
         const sUser = await resolveUsername(req);
-        const result = await pool.request()
+        const result = await withSqlRetry("stockhouse", (pool) => pool.request()
             .input("profileNO", String(profileNO).trim())
             .input("profileName", String(profileName).trim())
             .input("details", details ? String(details).trim() : null)
@@ -1905,7 +1979,7 @@ router.post("/item-profiles", async (req, res) => {
                 INSERT INTO guest.ItemProfile (ProfileNO, ProfileName, Details, SUser, SDate)
                 OUTPUT INSERTED.ID
                 VALUES (@profileNO, @profileName, @details, @sUser, GETDATE())
-            `);
+            `));
 
         res.status(201).json({ success: true, id: result.recordset[0].ID });
     } catch (err) {
@@ -1930,9 +2004,8 @@ router.put("/item-profiles/:id", async (req, res) => {
             return res.status(400).json({ success: false, message: "profileName is required" });
         }
 
-        const pool = await getSqlPool("stockhouse");
         const sUser = await resolveUsername(req);
-        const result = await pool.request()
+        const result = await withSqlRetry("stockhouse", (pool) => pool.request()
             .input("id", id)
             .input("profileNO", String(profileNO).trim())
             .input("profileName", String(profileName).trim())
@@ -1943,7 +2016,7 @@ router.put("/item-profiles/:id", async (req, res) => {
                 SET ProfileNO = @profileNO, ProfileName = @profileName, Details = @details,
                     SUser = @sUser, SDate = GETDATE()
                 WHERE ID = @id
-            `);
+            `));
 
         if (!result.rowsAffected[0]) {
             return res.status(404).json({ success: false, message: "Item profile not found" });
@@ -1966,12 +2039,15 @@ router.delete("/item-profiles/:id", async (req, res) => {
             return res.status(400).json({ success: false, message: "Invalid id" });
         }
 
-        const pool = await getSqlPool("stockhouse");
-        const existing = await pool.request().input("id", id).query(`SELECT PhotoUrl FROM guest.ItemProfile WHERE ID = @id`);
-        const photoUrl = existing.recordset[0]?.PhotoUrl;
+        const { photoUrl, deleted } = await withSqlRetry("stockhouse", async (pool) => {
+            const existing = await pool.request().input("id", id).query(`SELECT PhotoUrl FROM guest.ItemProfile WHERE ID = @id`);
+            const photoUrl = existing.recordset[0]?.PhotoUrl;
 
-        const result = await pool.request().input("id", id).query(`DELETE FROM guest.ItemProfile WHERE ID = @id`);
-        if (!result.rowsAffected[0]) {
+            const result = await pool.request().input("id", id).query(`DELETE FROM guest.ItemProfile WHERE ID = @id`);
+            return { photoUrl, deleted: !!result.rowsAffected[0] };
+        });
+
+        if (!deleted) {
             return res.status(404).json({ success: false, message: "Item profile not found" });
         }
 
@@ -2002,21 +2078,26 @@ router.post("/item-profiles/:id/photo", itemPhotoUpload.single("photo"), async (
             return res.status(400).json({ success: false, message: "No image uploaded" });
         }
 
-        const pool = await getSqlPool("stockhouse");
-        const existing = await pool.request().input("id", id).query(`SELECT PhotoUrl FROM guest.ItemProfile WHERE ID = @id`);
-        if (!existing.recordset[0]) {
+        const result = await withSqlRetry("stockhouse", async (pool) => {
+            const existing = await pool.request().input("id", id).query(`SELECT PhotoUrl FROM guest.ItemProfile WHERE ID = @id`);
+            if (!existing.recordset[0]) return { notFound: true };
+
+            const oldPhotoUrl = existing.recordset[0].PhotoUrl;
+            await pool.request()
+                .input("id", id)
+                .input("photoUrl", req.file.filename)
+                .query(`UPDATE guest.ItemProfile SET PhotoUrl = @photoUrl WHERE ID = @id`);
+
+            return { oldPhotoUrl };
+        });
+
+        if (result.notFound) {
             fs.unlinkSync(req.file.path);
             return res.status(404).json({ success: false, message: "Item profile not found" });
         }
 
-        const oldPhotoUrl = existing.recordset[0].PhotoUrl;
-        await pool.request()
-            .input("id", id)
-            .input("photoUrl", req.file.filename)
-            .query(`UPDATE guest.ItemProfile SET PhotoUrl = @photoUrl WHERE ID = @id`);
-
-        if (oldPhotoUrl) {
-            const oldPath = path.join(itemPhotosDir, path.basename(oldPhotoUrl));
+        if (result.oldPhotoUrl) {
+            const oldPath = path.join(itemPhotosDir, path.basename(result.oldPhotoUrl));
             if (fs.existsSync(oldPath)) fs.unlinkSync(oldPath);
         }
 
@@ -2044,22 +2125,24 @@ router.get("/item-profiles/:id/computer-numbers", async (req, res) => {
             return res.status(400).json({ success: false, message: "Invalid id" });
         }
 
-        const pool = await getSqlPool("stockhouse");
-        const profile = await pool.request().input("id", id)
-            .query("SELECT ProfileNO FROM guest.ItemProfile WHERE ID = @id");
-        if (!profile.recordset[0]) {
+        const result = await withSqlRetry("stockhouse", async (pool) => {
+            const profile = await pool.request().input("id", id)
+                .query("SELECT ProfileNO FROM guest.ItemProfile WHERE ID = @id");
+            if (!profile.recordset[0]) return null;
+
+            return pool.request()
+                .input("profileNO", profile.recordset[0].ProfileNO)
+                .query(`
+                    SELECT DISTINCT ComputerNO, Color, LinthRe, StoreNo
+                    FROM dbo.EnterDouC
+                    WHERE ProfileNO = @profileNO AND ComputerNO IS NOT NULL
+                    ORDER BY StoreNo, Color, LinthRe
+                `);
+        });
+
+        if (!result) {
             return res.status(404).json({ success: false, message: "Item profile not found" });
         }
-
-        const result = await pool.request()
-            .input("profileNO", profile.recordset[0].ProfileNO)
-            .query(`
-                SELECT DISTINCT ComputerNO, Color, LinthRe, StoreNo
-                FROM dbo.EnterDouC
-                WHERE ProfileNO = @profileNO AND ComputerNO IS NOT NULL
-                ORDER BY StoreNo, Color, LinthRe
-            `);
-
         res.json({ success: true, computerNumbers: result.recordset });
     } catch (err) {
         console.error("❌ ITEM PROFILE COMPUTER NUMBERS ERROR:", err);
