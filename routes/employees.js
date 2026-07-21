@@ -1,5 +1,5 @@
 ﻿import express from 'express';
-import { getSqlPool } from '../config/db.js';
+import { withSqlRetry } from '../config/db.js';
 import { authenticateToken, authorizeRoles } from '../middleware/auth.js';
 
 const router = express.Router();
@@ -15,10 +15,8 @@ router.use(authorizeRoles('installation_manager', 'admin'));
  */
 router.get('/', async (req, res) => {
     try {
-        const pool = await getSqlPool('erp');
-
-        const result = await pool.request().query(`
-            SELECT 
+        const result = await withSqlRetry('erp', (pool) => pool.request().query(`
+            SELECT
                 e.Emp_num AS empNo,
                 e.EmpEngName AS name_en,
                 e.EmpName AS name_ar,
@@ -34,7 +32,7 @@ router.get('/', async (req, res) => {
             WHERE e.Work_status = '1'
               AND e.Work_place = '7200'
             ORDER BY e.EmpName
-        `);
+        `));
 
         res.set('Cache-Control', 'no-store');
         res.json({
@@ -57,10 +55,8 @@ router.get('/', async (req, res) => {
  */
 router.get('/available', async (req, res) => {
     try {
-        const pool = await getSqlPool('erp');
-
-        const result = await pool.request().query(`
-            SELECT 
+        const result = await withSqlRetry('erp', (pool) => pool.request().query(`
+            SELECT
                 e.Emp_num AS empNo,
                 e.EmpEngName AS name_en,
                 e.EmpName AS name_ar,
@@ -79,7 +75,7 @@ router.get('/available', async (req, res) => {
                   SELECT emp_no FROM stockhouse.team_members
               )
             ORDER BY e.EmpName
-        `);
+        `));
 
         res.set('Cache-Control', 'no-store');
         res.json({ success: true, data: result.recordset });

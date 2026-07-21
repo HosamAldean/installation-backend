@@ -1,6 +1,6 @@
 ﻿//backend/routes/followUp.js
 import express from "express";
-import { sequelize, sequelize2, getSqlPool } from "../config/db.js";
+import { sequelize, sequelize2, withSqlRetry } from "../config/db.js";
 import { QueryTypes } from "sequelize";
 import { authenticateToken, authorizeRoles } from "../middleware/auth.js";
 import multer from "multer";
@@ -785,15 +785,13 @@ router.get("/scan-basic/:barcode", authenticateToken, async (req, res) => {
 
         const empNo = req.user.assignedEmpNo;
 
-        const pool = await getSqlPool("minstock");
-
-        const stockResult = await pool.request()
+        const stockResult = await withSqlRetry("minstock", (pool) => pool.request()
             .input("barcode", cleanBarcode)
             .query(`
                 SELECT TOP 1 *
                 FROM out
                 WHERE barcode = @barcode
-            `);
+            `));
 
         if (!stockResult.recordset.length) {
             return res.json({
@@ -943,9 +941,7 @@ router.get('/delivered-items', authenticateToken, async (req, res) => {
         // ===============================
         // MINSTOCK DATA
         // ===============================
-        const pool = await getSqlPool('minstock');
-
-        const result = await pool.request().query(`
+        const result = await withSqlRetry('minstock', (pool) => pool.request().query(`
             SELECT
                 [A],
                 [orderNo],
@@ -967,7 +963,7 @@ router.get('/delivered-items', authenticateToken, async (req, res) => {
             WHERE LEFT([projNo], CHARINDEX('-', [projNo] + '-') - 1)
                   IN (${quoted})
             ORDER BY [projNo] DESC
-        `);
+        `));
 
         // ===============================
         // DELIVERED
@@ -1068,11 +1064,9 @@ async function confirmDeliveryLogic(barcode, note, empNo, status = 'DELIVERED', 
         err.statusCode = 404;
         throw err;
     }
-    const pool = await getSqlPool("minstock");
-
-    const stockResult = await pool.request()
+    const stockResult = await withSqlRetry("minstock", (pool) => pool.request()
         .input('barcode', cleanBarcode)
-        .query(`SELECT TOP 1 projNo FROM out WHERE barcode = @barcode`);
+        .query(`SELECT TOP 1 projNo FROM out WHERE barcode = @barcode`));
 
     const stockItem = stockResult.recordset[0];
     if (!stockItem) {
@@ -1529,8 +1523,7 @@ router.get('/reports/delivery-lag', authenticateToken, authorizeRoles('installat
         }
 
         const barcodes = delivered.map(d => String(d.Insbarcode).trim());
-        const pool = await getSqlPool('minstock');
-        const stockRows = await fetchUnoByBarcodeChunked(pool, barcodes, 'barcode, UNO');
+        const stockRows = await withSqlRetry('minstock', (pool) => fetchUnoByBarcodeChunked(pool, barcodes, 'barcode, UNO'));
         const unoByBarcode = new Map(
             stockRows.map(r => [String(r.barcode).trim(), String(r.UNO ?? '').trim()])
         );
@@ -1727,8 +1720,7 @@ router.get('/reports/delivery-status', authenticateToken, authorizeRoles('instal
         const deliveredUnoSet = new Set();
         if (delivered.length) {
             const barcodes = delivered.map(d => String(d.Insbarcode).trim());
-            const pool = await getSqlPool('minstock');
-            const stockRows = await fetchUnoByBarcodeChunked(pool, barcodes, 'UNO');
+            const stockRows = await withSqlRetry('minstock', (pool) => fetchUnoByBarcodeChunked(pool, barcodes, 'UNO'));
             stockRows.forEach(r => {
                 const uno = String(r.UNO ?? '').trim();
                 if (uno) deliveredUnoSet.add(uno);
