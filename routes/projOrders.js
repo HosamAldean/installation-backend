@@ -124,6 +124,44 @@ router.post("/", async (req, res) => {
     }
 });
 
+// PUT /api/proj-orders/:orderNo — edit projName/projMgr only. projNo and
+// ProdctionNO are excluded: stockHouse.js's resolveProductionOrder and this
+// file's own resolveOrderByProduction/department-log lookups join on them,
+// so changing either after material has been reserved/checked against the
+// old value would silently break that cross-database link. Color and
+// ProdctionDate are excluded too, per the extra caution warranted here —
+// dbo.orders/dbo.orderdetails are still actively written day-to-day by a
+// live legacy MS Access app with no optimistic-concurrency column, so any
+// edit here is a plain last-write-wins UPDATE against that app's own
+// concurrent edits, same risk profile the Access app's own multi-user
+// editing already has.
+router.put("/:orderNo", async (req, res) => {
+    const orderNo = parseInt(req.params.orderNo, 10);
+    if (!Number.isInteger(orderNo)) {
+        return res.status(400).json({ success: false, message: "Invalid orderNo" });
+    }
+    const { projName, projMgr } = req.body;
+
+    try {
+        const result = await withSqlRetry("proj", (pool) => pool.request()
+            .input("orderNo", orderNo)
+            .input("projName", projName || null)
+            .input("projMgr", projMgr || null)
+            .query(`
+                UPDATE dbo.orders
+                SET projName = @projName, projMgr = @projMgr
+                WHERE orderNo = @orderNo
+            `));
+        if (!result.rowsAffected[0]) {
+            return res.status(404).json({ success: false, message: "Order not found" });
+        }
+        res.json({ success: true });
+    } catch (err) {
+        console.error("❌ PROJ ORDER UPDATE ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to update order" });
+    }
+});
+
 // GET /api/proj-orders/:orderNo/items — orderdetails lines for an order.
 router.get("/:orderNo/items", async (req, res) => {
     try {
@@ -136,7 +174,7 @@ router.get("/:orderNo/items", async (req, res) => {
         const result = await pool.request()
             .input("orderNo", orderNo)
             .query(`
-                SELECT orderNo, serialNo, Prudact, [1], [2], itemNo, note, barcode
+                SELECT orderNo, serialNo, Prudact, [1] AS field1, [2] AS field2, itemNo, note, barcode
                 FROM dbo.orderdetails
                 WHERE orderNo = @orderNo
                 ORDER BY serialNo ASC
@@ -205,6 +243,42 @@ router.post("/:orderNo/items", async (req, res) => {
         if (transaction) { try { await transaction.rollback(); } catch { /* already rolled back */ } }
         console.error("❌ PROJ ORDER ITEM CREATE ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to create order item" });
+    }
+});
+
+// PUT /api/proj-orders/:orderNo/items/:serialNo — edit an order line.
+// Confirmed none of Prudact/[1]/[2]/itemNo/note are read into any
+// calculation in this file — all five are opaque descriptive fields, so
+// unlike the order header above, no field needs to be excluded here.
+router.put("/:orderNo/items/:serialNo", async (req, res) => {
+    const orderNo = parseInt(req.params.orderNo, 10);
+    const serialNo = parseInt(req.params.serialNo, 10);
+    if (!Number.isInteger(orderNo) || !Number.isInteger(serialNo)) {
+        return res.status(400).json({ success: false, message: "Invalid orderNo or serialNo" });
+    }
+    const { Prudact, field1, field2, itemNo, note } = req.body;
+
+    try {
+        const result = await withSqlRetry("proj", (pool) => pool.request()
+            .input("orderNo", orderNo)
+            .input("serialNo", serialNo)
+            .input("Prudact", Prudact || null)
+            .input("field1", field1 || null)
+            .input("field2", field2 || null)
+            .input("itemNo", itemNo || null)
+            .input("note", note || null)
+            .query(`
+                UPDATE dbo.orderdetails
+                SET Prudact = @Prudact, [1] = @field1, [2] = @field2, itemNo = @itemNo, note = @note
+                WHERE orderNo = @orderNo AND serialNo = @serialNo
+            `));
+        if (!result.rowsAffected[0]) {
+            return res.status(404).json({ success: false, message: "Item not found" });
+        }
+        res.json({ success: true });
+    } catch (err) {
+        console.error("❌ PROJ ORDER ITEM UPDATE ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to update order item" });
     }
 });
 
