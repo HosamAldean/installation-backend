@@ -1105,6 +1105,119 @@ router.post("/:orderNo/units/:serialNo/progress/:stage", async (req, res) => {
     }
 });
 
+// --- Per-unit cutting/collecting status (dbo.Process) -----------------------
+// A second, separate per-unit tracking mechanism from dbo.details above —
+// confirmed live these are genuinely different tables/concepts (57,373 live
+// Process rows, one per unit, tracked independently of the 15-stage details
+// checklist). Only ever exposed before as an order-level average via
+// OrderCH's Expr1/Expr2 (cutting %/collecting %) — no per-unit view/edit
+// existed. Field captions confirmed via Design-view COM inspection of the
+// legacy "Process" form (the app's own VBA project is password-protected,
+// so sub-level code couldn't be read, but control Captions/RecordSource are
+// unaffected by that lock): Cuting="القص" (cutting), Colcting="الجمع"
+// (collecting/assembly — a different word from Iron's own ProcessI.Colcting,
+// which is "التجهيز"/preparation; don't assume the two modules mean the same
+// thing despite the shared column name). note="ملاحظات خلال عملية الانتاج"
+// (notes during the production process). DateFinsh/finaldate map to two
+// distinct captions — "تارخ الانجاز" (completion date) and "موعد الانتهاء"
+// (finish appointment/target date) respectively — inferred pairing (not
+// 100% confirmed since the VBA lock prevents seeing which control is bound
+// to which field), exposed as separate date/targetDate fields rather than
+// guessed-and-merged. Tik1-4 (paired "Ready"/"Stopped" toggles for
+// Aluminum/Accessory work, per the form's own Label55/57/59/61/64/65
+// captions) are confirmed live to be 100% unused (0 non-null across all
+// 57,373 rows) — not exposed here, same treatment as Iron's xc4/xc5.
+router.get("/:orderNo/units/:serialNo/process", async (req, res) => {
+    const orderNo = parseInt(req.params.orderNo, 10);
+    const serialNo = parseInt(req.params.serialNo, 10);
+    if (!Number.isInteger(orderNo) || !Number.isInteger(serialNo)) {
+        return res.status(400).json({ success: false, message: "Invalid orderNo or serialNo" });
+    }
+
+    try {
+        const result = await withSqlRetry("proj", (pool) => pool.request()
+            .input("orderNo", orderNo)
+            .input("serialNo", serialNo)
+            .query("SELECT Cuting, Colcting, Date, note, DateFinsh, finaldate FROM dbo.Process WHERE orderNo = @orderNo AND serialNo = @serialNo"));
+        const row = result.recordset[0] || null;
+
+        res.json({
+            success: true,
+            status: {
+                cuting: row ? !!row.Cuting : false,
+                colcting: row ? !!row.Colcting : false,
+                date: row ? row.Date : null,
+                note: row ? row.note : null,
+                completionDate: row ? row.DateFinsh : null,
+                targetDate: row ? row.finaldate : null,
+            },
+        });
+    } catch (err) {
+        console.error("❌ PROJ UNIT PROCESS STATUS ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to fetch unit process status" });
+    }
+});
+
+router.post("/:orderNo/units/:serialNo/process", async (req, res) => {
+    const orderNo = parseInt(req.params.orderNo, 10);
+    const serialNo = parseInt(req.params.serialNo, 10);
+    if (!Number.isInteger(orderNo) || !Number.isInteger(serialNo)) {
+        return res.status(400).json({ success: false, message: "Invalid orderNo or serialNo" });
+    }
+    const { cuting, colcting, note, completionDate, targetDate } = req.body;
+
+    try {
+        const cutingVal = cuting ? 1 : 0;
+        const colctingVal = colcting ? 1 : 0;
+
+        // Fully idempotent (sets absolute values, no increment) so safe to
+        // retry the whole existing-check + update-or-insert as one block.
+        await withSqlRetry("proj", async (pool) => {
+            const existing = await pool.request()
+                .input("orderNo", orderNo)
+                .input("serialNo", serialNo)
+                .query("SELECT orderNo FROM dbo.Process WHERE orderNo = @orderNo AND serialNo = @serialNo");
+
+            if (existing.recordset[0]) {
+                await pool.request()
+                    .input("orderNo", orderNo)
+                    .input("serialNo", serialNo)
+                    .input("cuting", cutingVal)
+                    .input("colcting", colctingVal)
+                    .input("note", note || null)
+                    .input("completionDate", completionDate || null)
+                    .input("targetDate", targetDate || null)
+                    .input("date", new Date())
+                    .query(`
+                        UPDATE dbo.Process
+                        SET Cuting = @cuting, Colcting = @colcting, note = @note,
+                            DateFinsh = @completionDate, finaldate = @targetDate, Date = @date
+                        WHERE orderNo = @orderNo AND serialNo = @serialNo
+                    `);
+            } else {
+                await pool.request()
+                    .input("orderNo", orderNo)
+                    .input("serialNo", serialNo)
+                    .input("cuting", cutingVal)
+                    .input("colcting", colctingVal)
+                    .input("note", note || null)
+                    .input("completionDate", completionDate || null)
+                    .input("targetDate", targetDate || null)
+                    .input("date", new Date())
+                    .query(`
+                        INSERT INTO dbo.Process (orderNo, serialNo, Cuting, Colcting, note, DateFinsh, finaldate, Date)
+                        VALUES (@orderNo, @serialNo, @cuting, @colcting, @note, @completionDate, @targetDate, @date)
+                    `);
+            }
+        });
+
+        res.json({ success: true });
+    } catch (err) {
+        console.error("❌ PROJ UNIT PROCESS UPDATE ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to update unit process status" });
+    }
+});
+
 // --- Per-department event log (dbo.x1 - dbo.x5) ----------------------------
 // Confirmed live via read-only Design-view COM inspection of the legacy
 // forms "x1".."x5" (never opened in Form/Datasheet view, no macros/VBA
