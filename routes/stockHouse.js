@@ -271,6 +271,70 @@ router.post("/enter", async (req, res) => {
     }
 });
 
+// PUT /api/stock-house/enter/:recordNo — edit a small set of non-ledger
+// fields on an existing receipt (supplier/project attribution and the
+// QC/warehouse-office sign-off). Deliberately excludes profileNo/color/
+// linthRe/computerNo (identity keys other endpoints join on via
+// EnterDouC) and every quantity/weight/unite field (ledger inputs feeding
+// /remaining's on-hand calculation). profileName is excluded too:
+// EnterDouC's lookup can return any row matching profile+color+length+
+// store, so editing one row's name inconsistently vs. its siblings would
+// desync the shared lookup. Original DateWHouse/DateQC/QCTestdate stamps
+// are left untouched on edit — they record when the sign-off first
+// happened, not when someone later corrected a typo.
+router.put("/enter/:recordNo", async (req, res) => {
+    try {
+        const recordNo = parseInt(req.params.recordNo, 10);
+        if (!Number.isInteger(recordNo)) {
+            return res.status(400).json({ success: false, message: "Invalid recordNo" });
+        }
+        const { supplier, projectNo, whouseOffice, qcOffice, qcTestNo, qcTestResult } = req.body;
+
+        const result = await withSqlRetry("stockhouse", async (pool) => {
+            const existing = await pool.request()
+                .input("recordNo", recordNo)
+                .query("SELECT StoreNo FROM guest.EnterDouO WHERE RecordNO = @recordNo");
+            const row = existing.recordset[0];
+            if (!row) return { error: "notFound" };
+            if (req.user.assignedStore && row.StoreNo !== req.user.assignedStore) return { error: "forbidden" };
+
+            await pool.request()
+                .input("recordNo", recordNo)
+                .input("whouseOffice", whouseOffice || null)
+                .input("qcOffice", qcOffice || null)
+                .input("qcTestNo", qcTestNo || null)
+                .input("qcTestResult", qcTestResult || null)
+                .query(`
+                    UPDATE guest.EnterDouO
+                    SET WHouseOffice = @whouseOffice, QCOffice = @qcOffice,
+                        QCTestNo = @qcTestNo, QCTestResult = @qcTestResult
+                    WHERE RecordNO = @recordNo
+                `);
+            await pool.request()
+                .input("recordNo", recordNo)
+                .input("supplier", supplier || null)
+                .input("projectNo", projectNo || null)
+                .query(`
+                    UPDATE guest.EnterDou
+                    SET Supplier = @supplier, ProjectNO = @projectNo
+                    WHERE RecordNO = @recordNo AND SerialNo = 1
+                `);
+            return { ok: true };
+        });
+
+        if (result.error === "notFound") {
+            return res.status(404).json({ success: false, message: "Record not found" });
+        }
+        if (result.error === "forbidden") {
+            return res.status(403).json({ success: false, message: "Not accessible from your store" });
+        }
+        res.json({ success: true });
+    } catch (err) {
+        console.error("❌ STOCK HOUSE ENTER UPDATE ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to update record" });
+    }
+});
+
 // POST /api/stock-house/reserve — reserve stock for a project. Creates a
 // ReservationO header (RecordNO, one per reservation event) with a single
 // Reservation detail line. ProjectName/ProjectManger are looked up from the
@@ -367,6 +431,47 @@ router.post("/reserve", async (req, res) => {
     }
 });
 
+// PUT /api/stock-house/reserve/:recordNo — edit a reservation's note only.
+// projectNo is excluded: it drives /remaining's ledger grouping key, so
+// reattributing a reservation to a different project after the fact would
+// misattribute an outstanding balance. Identity/qty fields excluded for
+// the same reasons as every other entity in this file.
+router.put("/reserve/:recordNo", async (req, res) => {
+    try {
+        const recordNo = parseInt(req.params.recordNo, 10);
+        if (!Number.isInteger(recordNo)) {
+            return res.status(400).json({ success: false, message: "Invalid recordNo" });
+        }
+        const { note } = req.body;
+
+        const result = await withSqlRetry("stockhouse", async (pool) => {
+            const existing = await pool.request()
+                .input("recordNo", recordNo)
+                .query("SELECT StoreNo FROM guest.ReservationO WHERE RecordNO = @recordNo");
+            const row = existing.recordset[0];
+            if (!row) return { error: "notFound" };
+            if (req.user.assignedStore && row.StoreNo !== req.user.assignedStore) return { error: "forbidden" };
+
+            await pool.request()
+                .input("recordNo", recordNo)
+                .input("note", note || null)
+                .query("UPDATE guest.Reservation SET Note = @note WHERE RecordNO = @recordNo AND SerialNo = 1");
+            return { ok: true };
+        });
+
+        if (result.error === "notFound") {
+            return res.status(404).json({ success: false, message: "Reservation not found" });
+        }
+        if (result.error === "forbidden") {
+            return res.status(403).json({ success: false, message: "Not accessible from your store" });
+        }
+        res.json({ success: true });
+    } catch (err) {
+        console.error("❌ STOCK HOUSE RESERVE UPDATE ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to update reservation" });
+    }
+});
+
 // POST /api/stock-house/ship — record material physically leaving the
 // store for a project/production order. Creates a StockOutO header with a
 // single StockOut detail line.
@@ -455,6 +560,46 @@ router.post("/ship", async (req, res) => {
     } catch (err) {
         console.error("❌ STOCK HOUSE SHIP ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to record shipment" });
+    }
+});
+
+// PUT /api/stock-house/ship/:recordNo — edit worker/productionNo only.
+// projectNo excluded: feeds /remaining's `shipped` aggregate. Identity/qty
+// fields excluded for the same reasons as every other entity in this file.
+router.put("/ship/:recordNo", async (req, res) => {
+    try {
+        const recordNo = parseInt(req.params.recordNo, 10);
+        if (!Number.isInteger(recordNo)) {
+            return res.status(400).json({ success: false, message: "Invalid recordNo" });
+        }
+        const { worker, productionNo } = req.body;
+
+        const result = await withSqlRetry("stockhouse", async (pool) => {
+            const existing = await pool.request()
+                .input("recordNo", recordNo)
+                .query("SELECT StoreNo FROM guest.StockOutO WHERE RecordNO = @recordNo");
+            const row = existing.recordset[0];
+            if (!row) return { error: "notFound" };
+            if (req.user.assignedStore && row.StoreNo !== req.user.assignedStore) return { error: "forbidden" };
+
+            await pool.request()
+                .input("recordNo", recordNo)
+                .input("worker", worker || null)
+                .input("productionNo", productionNo || null)
+                .query("UPDATE guest.StockOutO SET Worker = @worker, ProductionNO = @productionNo WHERE RecordNO = @recordNo");
+            return { ok: true };
+        });
+
+        if (result.error === "notFound") {
+            return res.status(404).json({ success: false, message: "Shipment not found" });
+        }
+        if (result.error === "forbidden") {
+            return res.status(403).json({ success: false, message: "Not accessible from your store" });
+        }
+        res.json({ success: true });
+    } catch (err) {
+        console.error("❌ STOCK HOUSE SHIP UPDATE ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to update shipment" });
     }
 });
 
@@ -550,6 +695,45 @@ router.post("/return", async (req, res) => {
     } catch (err) {
         console.error("❌ STOCK HOUSE RETURN ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to record return" });
+    }
+});
+
+// PUT /api/stock-house/return/:recordNo — edit worker/productionNo only,
+// same reasoning as PUT /ship/:recordNo above.
+router.put("/return/:recordNo", async (req, res) => {
+    try {
+        const recordNo = parseInt(req.params.recordNo, 10);
+        if (!Number.isInteger(recordNo)) {
+            return res.status(400).json({ success: false, message: "Invalid recordNo" });
+        }
+        const { worker, productionNo } = req.body;
+
+        const result = await withSqlRetry("stockhouse", async (pool) => {
+            const existing = await pool.request()
+                .input("recordNo", recordNo)
+                .query("SELECT StoreNo FROM guest.StockBackO WHERE RecordNO = @recordNo");
+            const row = existing.recordset[0];
+            if (!row) return { error: "notFound" };
+            if (req.user.assignedStore && row.StoreNo !== req.user.assignedStore) return { error: "forbidden" };
+
+            await pool.request()
+                .input("recordNo", recordNo)
+                .input("worker", worker || null)
+                .input("productionNo", productionNo || null)
+                .query("UPDATE guest.StockBackO SET Worker = @worker, ProductionNO = @productionNo WHERE RecordNO = @recordNo");
+            return { ok: true };
+        });
+
+        if (result.error === "notFound") {
+            return res.status(404).json({ success: false, message: "Return record not found" });
+        }
+        if (result.error === "forbidden") {
+            return res.status(403).json({ success: false, message: "Not accessible from your store" });
+        }
+        res.json({ success: true });
+    } catch (err) {
+        console.error("❌ STOCK HOUSE RETURN UPDATE ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to update return record" });
     }
 });
 
@@ -670,6 +854,53 @@ router.post("/mix/send", async (req, res) => {
     } catch (err) {
         console.error("❌ STOCK HOUSE MIX SEND ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to record coating send-out" });
+    }
+});
+
+// PUT /api/stock-house/mix/:recordNo — edit the coating-company name and
+// sign-off officers only. fullColor is excluded even though it looks
+// descriptive: /mix/receive's resolveComputerNo call uses it as the target
+// color to identify the coated stock coming back, so it functions as a
+// ledger key for this entity, not a free-text attribute.
+router.put("/mix/:recordNo", async (req, res) => {
+    try {
+        const recordNo = parseInt(req.params.recordNo, 10);
+        if (!Number.isInteger(recordNo)) {
+            return res.status(400).json({ success: false, message: "Invalid recordNo" });
+        }
+        const { coatingCompany, stoukOfficer, stouckManger } = req.body;
+
+        const result = await withSqlRetry("stockhouse", async (pool) => {
+            const existing = await pool.request()
+                .input("recordNo", recordNo)
+                .query("SELECT StoreNO FROM guest.MIXO WHERE RecordNO = @recordNo");
+            const row = existing.recordset[0];
+            if (!row) return { error: "notFound" };
+            if (req.user.assignedStore && row.StoreNO !== req.user.assignedStore) return { error: "forbidden" };
+
+            await pool.request()
+                .input("recordNo", recordNo)
+                .input("nameRequst", coatingCompany?.trim() || "MIX")
+                .input("stoukOfficer", stoukOfficer || null)
+                .input("stouckManger", stouckManger || null)
+                .query(`
+                    UPDATE guest.MIXO
+                    SET NameRequst = @nameRequst, StoukOfficer = @stoukOfficer, StouckManger = @stouckManger
+                    WHERE RecordNO = @recordNo
+                `);
+            return { ok: true };
+        });
+
+        if (result.error === "notFound") {
+            return res.status(404).json({ success: false, message: "Coating send-out record not found" });
+        }
+        if (result.error === "forbidden") {
+            return res.status(403).json({ success: false, message: "Not accessible from your store" });
+        }
+        res.json({ success: true });
+    } catch (err) {
+        console.error("❌ STOCK HOUSE MIX UPDATE ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to update coating send-out record" });
     }
 });
 

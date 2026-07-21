@@ -129,6 +129,41 @@ router.post("/orders", async (req, res) => {
     }
 });
 
+// PUT /api/glass/orders/:orderNo — edit a small set of non-ledger fields.
+// projNo is excluded: it groups /reports/status and /reports/billing
+// totals, so reattributing an order after invoices exist would corrupt
+// those reports. ProdctionNO is excluded: the receive handler reads it to
+// gate the push into Main Stock (pushFinishedUnitToMinStock) — editing it
+// mid-order, after some items already synced under the old value, would
+// desync Main Stock's record of what production order a unit belongs to.
+router.put("/orders/:orderNo", async (req, res) => {
+    const orderNo = parseInt(req.params.orderNo);
+    if (!Number.isInteger(orderNo)) {
+        return res.status(400).json({ success: false, message: "Invalid orderNo" });
+    }
+    const { projName, projMgr, JPO } = req.body;
+
+    try {
+        const result = await withSqlRetry("glass", (pool) => pool.request()
+            .input("orderNo", orderNo)
+            .input("projName", projName || null)
+            .input("projMgr", projMgr || null)
+            .input("JPO", JPO || null)
+            .query(`
+                UPDATE Sorders
+                SET projName = @projName, projMgr = @projMgr, JPO = @JPO
+                WHERE orderNo = @orderNo
+            `));
+        if (!result.rowsAffected[0]) {
+            return res.status(404).json({ success: false, message: "Order not found" });
+        }
+        res.json({ success: true });
+    } catch (err) {
+        console.error("❌ GLASS UPDATE ORDER ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to update glass order" });
+    }
+});
+
 // GET /api/glass/orders/:orderNo/items — Sorderdetails lines for an order,
 // joined with SSTOCK for received qty and a computed area in m^2 (matches
 // the Access app's Round(height*width*qty/10000, 2) area expression used
@@ -245,6 +280,58 @@ router.post("/orders/:orderNo/items", async (req, res) => {
     } catch (err) {
         console.error("❌ GLASS CREATE ITEM ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to create glass item" });
+    }
+});
+
+// PUT /api/glass/orders/:orderNo/items/:serialNo — edit a small set of
+// non-billing, non-quantity fields. height/width/qty excluded per policy.
+// intype/outtype/spacer are ALSO excluded even though they look like plain
+// color/type selections: computeBilling() below reads them directly —
+// intype/outtype drive frostedCost, spacer indexes the PU/SG/SCHOCO rate
+// tables into totalPU — so they're billing-calculation inputs, not free
+// descriptive text. expectdate is excluded too: it gates /reports/overdue
+// and /not-received's bucketing, so editing it after the fact could hide
+// or manufacture an overdue item.
+router.put("/orders/:orderNo/items/:serialNo", async (req, res) => {
+    const orderNo = parseInt(req.params.orderNo);
+    const serialNo = parseInt(req.params.serialNo);
+    if (!Number.isInteger(orderNo) || !Number.isInteger(serialNo)) {
+        return res.status(400).json({ success: false, message: "Invalid orderNo or serialNo" });
+    }
+    const {
+        itemNo, incolor, inthickness, outcolor, outthickness,
+        section, shape, note, status, person, dept,
+    } = req.body;
+
+    try {
+        const result = await withSqlRetry("glass", (pool) => pool.request()
+            .input("orderNo", orderNo)
+            .input("serialNo", serialNo)
+            .input("itemNo", itemNo || null)
+            .input("incolor", incolor || null)
+            .input("inthickness", inthickness ? parseFloat(inthickness) : null)
+            .input("outcolor", outcolor || null)
+            .input("outthickness", outthickness || null)
+            .input("section", section || null)
+            .input("shape", shape || null)
+            .input("note", note || null)
+            .input("status", status || null)
+            .input("person", person || null)
+            .input("dept", dept || null)
+            .query(`
+                UPDATE Sorderdetails
+                SET itemNo = @itemNo, incolor = @incolor, inthickness = @inthickness,
+                    outcolor = @outcolor, outthickness = @outthickness, section = @section,
+                    shape = @shape, note = @note, status = @status, person = @person, dept = @dept
+                WHERE orderNo = @orderNo AND serialNo = @serialNo
+            `));
+        if (!result.rowsAffected[0]) {
+            return res.status(404).json({ success: false, message: "Item not found" });
+        }
+        res.json({ success: true });
+    } catch (err) {
+        console.error("❌ GLASS UPDATE ITEM ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to update glass item" });
     }
 });
 
