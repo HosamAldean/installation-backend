@@ -511,12 +511,12 @@ router.put("/orders/:orderNo/appointments", async (req, res) => {
             totalQut, qut, qutIN, qutun, brcode, notic,
         } = req.body;
 
-        const orderFound = await withSqlRetry("glass", async (pool) => {
+        const order = await withSqlRetry("glass", async (pool) => {
             const orderResult = await pool.request()
                 .input("orderNo", orderNo)
-                .query("SELECT orderNo, projNo, ProdctionNO FROM Sorders WHERE orderNo = @orderNo");
+                .query("SELECT orderNo, projNo, projName, projMgr, ProdctionNO FROM Sorders WHERE orderNo = @orderNo");
             const order = orderResult.recordset[0];
-            if (!order) return false;
+            if (!order) return null;
 
             const existing = await pool.request()
                 .input("orderNo", orderNo)
@@ -560,11 +560,82 @@ router.put("/orders/:orderNo/appointments", async (req, res) => {
                 `);
             }
 
-            return true;
+            return order;
         });
 
-        if (!orderFound) {
+        if (!order) {
             return res.status(404).json({ success: false, message: "Order not found" });
+        }
+
+        // Factory-finished (finshed2 set) means the glass is ready to ship
+        // directly from the glass store, without waiting for a separate
+        // manual per-item receive first -- auto-run the same receive +
+        // Main-Stock-push logic /items/:serialNo/receive already uses, for
+        // every item on this order not yet fully received. Idempotent (only
+        // touches items where receivedQty < qty), so calling this endpoint
+        // again later (e.g. just editing Notic) is a safe no-op for items
+        // already pushed. Best-effort per item, same trade-off as the manual
+        // receive handler: a Main Stock sync failure here must not fail the
+        // appointment save itself, since [Dat Orders] already committed.
+        if (finshed2 && order.projNo && order.ProdctionNO) {
+            try {
+                const itemsResult = await withSqlRetry("glass", (pool) => pool.request()
+                    .input("orderNo", orderNo)
+                    .query(`
+                        SELECT d.serialNo, d.barcode, d.itemNo, d.height, d.width, d.qty, d.outcolor,
+                               ISNULL(s.QTYIN, 0) AS receivedQty
+                        FROM Sorderdetails d
+                        LEFT JOIN SSTOCK s ON s.OrderNo = d.orderNo AND s.SerialNo = d.serialNo
+                        WHERE d.orderNo = @orderNo
+                    `));
+                const pending = itemsResult.recordset.filter((it) => it.receivedQty < (it.qty || 0));
+
+                for (const item of pending) {
+                    try {
+                        await withSqlRetry("glass", async (pool) => {
+                            const existing = await pool.request()
+                                .input("orderNo", orderNo)
+                                .input("serialNo", item.serialNo)
+                                .query("SELECT QTYIN FROM SSTOCK WHERE OrderNo = @orderNo AND SerialNo = @serialNo");
+                            if (existing.recordset[0]) {
+                                await pool.request()
+                                    .input("orderNo", orderNo)
+                                    .input("serialNo", item.serialNo)
+                                    .input("qtyIn", item.qty)
+                                    .query("UPDATE SSTOCK SET QTYIN = @qtyIn WHERE OrderNo = @orderNo AND SerialNo = @serialNo");
+                            } else {
+                                await pool.request()
+                                    .input("orderNo", orderNo)
+                                    .input("serialNo", item.serialNo)
+                                    .input("barcode", item.barcode)
+                                    .input("qtyIn", item.qty)
+                                    .query(`
+                                        INSERT INTO SSTOCK (BARCODE, ORDER_DATE, QTYIN, OrderNo, SerialNo)
+                                        VALUES (@barcode, GETDATE(), @qtyIn, @orderNo, @serialNo)
+                                    `);
+                            }
+                        });
+
+                        await pushFinishedUnitToMinStock({
+                            projNo: order.projNo,
+                            projName: order.projName,
+                            ProdctionNO: order.ProdctionNO,
+                            projMgr: order.projMgr,
+                            category: 2,
+                            sourceKey: `GLASS:${orderNo}:${item.serialNo}`,
+                            description: [item.itemNo, item.height && item.width ? `${item.height}x${item.width}` : null, item.outcolor]
+                                .filter(Boolean).join(" "),
+                            qty: item.qty,
+                            unitNo: item.barcode || item.serialNo,
+                            barcode: item.barcode || undefined,
+                        });
+                    } catch (itemErr) {
+                        console.error(`⚠️ GLASS AUTO-RECEIVE FAILED for item ${orderNo}:${item.serialNo} (appointment save still succeeded):`, itemErr);
+                    }
+                }
+            } catch (syncErr) {
+                console.error("⚠️ GLASS AUTO-RECEIVE (factory-finished) FAILED (appointment save still succeeded):", syncErr);
+            }
         }
 
         res.json({ success: true });
@@ -1078,6 +1149,17 @@ router.get("/reports/overdue", async (req, res) => {
 // the late-bucket check. Confirmed live against the real table: 42 rows
 // across its full history have finshed1 set without finshed2, so
 // underWork is a real, if small, bucket rather than dead code.
+//
+// finshed2 (not taken) is "Finished" -- all items done at the external
+// Ittihad factory, per the factory's own form ("completion end date").
+// taken is a distinct, later step -- the glass physically reserved into
+// our own store ("receipt date") -- kept as its own bucket rather than
+// folded into "finished" so the two real states aren't conflated. See
+// PUT .../appointments below: setting finshed2 now also auto-pushes
+// every not-yet-received item on the order into Main Stock, so
+// "Finished" items are actually shippable (directly from the glass
+// store) the moment this bucket applies, not only after someone
+// separately marks them taken.
 router.get("/reports/factory-status", async (req, res) => {
     try {
         const { dateFrom, dateTo, projNo } = req.query;
@@ -1095,8 +1177,9 @@ router.get("/reports/factory-status", async (req, res) => {
                     d.datOrder, d.dat1, d.dat2, d.dat3, d.finshed1, d.finshed2, d.taken,
                     CASE
                         WHEN d.orderNo IS NULL OR (d.datOrder IS NULL AND d.dat1 IS NULL AND d.dat2 IS NULL AND d.dat3 IS NULL) THEN 'noDate'
-                        WHEN d.taken IS NOT NULL THEN 'finished'
-                        WHEN d.finshed1 IS NOT NULL AND d.finshed2 IS NULL THEN 'underWork'
+                        WHEN d.taken IS NOT NULL THEN 'taken'
+                        WHEN d.finshed2 IS NOT NULL THEN 'finished'
+                        WHEN d.finshed1 IS NOT NULL THEN 'underWork'
                         WHEN COALESCE(d.dat3, d.dat2, d.dat1, d.datOrder) < CAST(GETDATE() AS date) THEN 'late'
                         ELSE 'onTrack'
                     END AS bucket
@@ -1111,7 +1194,7 @@ router.get("/reports/factory-status", async (req, res) => {
         const totals = orders.reduce((acc, o) => {
             acc[o.bucket] = (acc[o.bucket] || 0) + 1;
             return acc;
-        }, { noDate: 0, late: 0, underWork: 0, finished: 0, onTrack: 0 });
+        }, { noDate: 0, late: 0, underWork: 0, finished: 0, taken: 0, onTrack: 0 });
 
         res.json({ success: true, orders, totals });
     } catch (err) {
