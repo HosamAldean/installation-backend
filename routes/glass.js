@@ -1218,6 +1218,27 @@ router.get("/reports/factory-status", async (req, res) => {
 // a driver name on shipment (mirroring thenewstore's driver-dispatch
 // log), this single dashboard replaces the legacy storeQ -> STORENEW ->
 // thenewstore flow end to end.
+//
+// --- Backfill history (2026-07-21) ---
+// This endpoint only shows items pushed to Main Stock going forward (via
+// the finshed2 auto-receive above) -- orders finished before that code
+// existed were never pushed, so a one-time backfill was run to catch up
+// the backlog. Naively backfilling every [Dat Orders] row with finshed2
+// set (6,892 live-range rows) would have been wrong: the vast majority of
+// those were already received into SSTOCK *and* already shipped out
+// historically via the legacy thenewstore ledger, long before this
+// report existed. Backfilling from finshed2 alone would have
+// re-surfaced already-shipped glass as "available to ship" here.
+// Instead, the backfill queried Server.storenew1Query directly -- the
+// legacy app's own trusted "QTYIN minus already-shipped" calculation --
+// restricted to the live order range (orderNo >= 323097), which found
+// the real, much smaller scope: 16 line items across 12 orders / 10
+// projects, 19 units total genuinely still in the glass store. Each was
+// pushed via pushFinishedUnitToMinStock with qty = the view's own
+// remaining-quantity figure (not the full original QTYIN), so any
+// partial shipment already logged historically was correctly excluded.
+// Verified live afterward: report showed Projects=10, In Store=19,
+// matching the backfill exactly.
 router.get("/reports/store", async (req, res) => {
     try {
         const { projNo } = req.query;
