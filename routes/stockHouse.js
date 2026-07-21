@@ -272,7 +272,7 @@ router.post("/enter", async (req, res) => {
 });
 
 // PUT /api/stock-house/enter/:recordNo — edit a small set of non-ledger
-// fields on an existing receipt (supplier/project attribution and the
+// fields on an existing receipt (supplier attribution and the
 // QC/warehouse-office sign-off). Deliberately excludes profileNo/color/
 // linthRe/computerNo (identity keys other endpoints join on via
 // EnterDouC) and every quantity/weight/unite field (ledger inputs feeding
@@ -282,13 +282,22 @@ router.post("/enter", async (req, res) => {
 // desync the shared lookup. Original DateWHouse/DateQC/QCTestdate stamps
 // are left untouched on edit — they record when the sign-off first
 // happened, not when someone later corrected a typo.
+//
+// CORRECTED: projectNo was previously (wrongly) whitelisted here as a
+// "non-ledger" attribution field. Confirmed live while building the
+// direct-receipt allocation fix in GET /remaining that EnterDou.ProjectNO
+// genuinely IS a ledger-driving field — it's summed directly into a
+// project's "remaining" balance there (61k+ live rows, same class of
+// field as Reservation.QtyRe). Editing it after the fact would silently
+// reattribute material's ledger ownership, same risk already correctly
+// applied to identity/quantity fields — so it's excluded here too now.
 router.put("/enter/:recordNo", async (req, res) => {
     try {
         const recordNo = parseInt(req.params.recordNo, 10);
         if (!Number.isInteger(recordNo)) {
             return res.status(400).json({ success: false, message: "Invalid recordNo" });
         }
-        const { supplier, projectNo, whouseOffice, qcOffice, qcTestNo, qcTestResult } = req.body;
+        const { supplier, whouseOffice, qcOffice, qcTestNo, qcTestResult } = req.body;
 
         const result = await withSqlRetry("stockhouse", async (pool) => {
             const existing = await pool.request()
@@ -313,10 +322,9 @@ router.put("/enter/:recordNo", async (req, res) => {
             await pool.request()
                 .input("recordNo", recordNo)
                 .input("supplier", supplier || null)
-                .input("projectNo", projectNo || null)
                 .query(`
                     UPDATE guest.EnterDou
-                    SET Supplier = @supplier, ProjectNO = @projectNo
+                    SET Supplier = @supplier
                     WHERE RecordNO = @recordNo AND SerialNo = 1
                 `);
             return { ok: true };
@@ -1282,6 +1290,24 @@ router.get("/remaining", async (req, res) => {
                 JOIN guest.ReservationO ro ON r.RecordNO = ro.RecordNO
                 GROUP BY ro.ProjectNO, r.ProfileNO, r.Color, r.LinthRe
             ),
+            -- Material received directly for a project (EnterDou.ProjectNO
+            -- set at receipt time) — a second, independent way material
+            -- gets earmarked for a project, alongside formal Reservation.
+            -- Confirmed live against the legacy dashboard's own view chain
+            -- (dbo.Dou2/Prodection/Details): this is a real, actively
+            -- written allocation path (61k+ live rows across 1,300+
+            -- projects) that reservedBase alone never captures. Excludes
+            -- the "stock" sentinel (a generic, non-project receipt) and
+            -- blanks, same exclusion convention as receivedTransfer below.
+            directReceipt AS (
+                SELECT
+                    ProjectNO, ProfileNO, Color, LinthRe, MAX(StoreNo) AS StoreNo,
+                    SUM(QtyEvl) AS receivedDirect
+                FROM guest.EnterDou
+                WHERE ProjectNO IS NOT NULL AND LTRIM(RTRIM(ProjectNO)) <> ''
+                      AND LOWER(LTRIM(RTRIM(ProjectNO))) <> 'stock'
+                GROUP BY ProjectNO, ProfileNO, Color, LinthRe
+            ),
             releasedAway AS (
                 -- Material released FROM a project's own reservation, to
                 -- Stock or to another project — either way it's no longer
@@ -1303,11 +1329,13 @@ router.get("/remaining", async (req, res) => {
                 GROUP BY ProjectNORe, ProfileNO, Color, LinthRe
             ),
             projectItems AS (
-                -- Every (project, item) combination with either an
-                -- original reservation or a received transfer, so a
-                -- project that only ever received material via transfer
-                -- (no reservation of its own for that item) still shows up.
+                -- Every (project, item) combination with a reservation, a
+                -- direct receipt, or a received transfer, so a project that
+                -- only ever got material via one of these three paths still
+                -- shows up.
                 SELECT ProjectNO, ProfileNO, Color, LinthRe FROM reservedBase
+                UNION
+                SELECT ProjectNO, ProfileNO, Color, LinthRe FROM directReceipt
                 UNION
                 SELECT ProjectNO, ProfileNO, Color, LinthRe FROM receivedTransfer
             ),
@@ -1317,16 +1345,18 @@ router.get("/remaining", async (req, res) => {
                     COALESCE(MAX(rb.ProjectName), MAX(rt.ProjectName)) AS ProjectName,
                     pi.ProfileNO, MAX(rb.ProfileName) AS ProfileName,
                     pi.Color, pi.LinthRe,
-                    COALESCE(MAX(rb.StoreNo), MAX(rt.StoreNo), MAX(ra.StoreNo)) AS StoreNo,
+                    COALESCE(MAX(rb.StoreNo), MAX(dr.StoreNo), MAX(rt.StoreNo), MAX(ra.StoreNo)) AS StoreNo,
                     ISNULL(MAX(rb.reserved), 0) AS reserved,
+                    ISNULL(MAX(dr.receivedDirect), 0) AS receivedDirect,
                     ISNULL(MAX(ra.releasedQty), 0) AS releasedAway,
                     ISNULL(MAX(rt.receivedQty), 0) AS receivedTransfer,
                     MAX(ISNULL(so.shipped, 0)) AS shipped,
                     MAX(ISNULL(sb.returned, 0)) AS returned,
-                    ISNULL(MAX(rb.reserved), 0) - ISNULL(MAX(ra.releasedQty), 0) + ISNULL(MAX(rt.receivedQty), 0)
+                    ISNULL(MAX(rb.reserved), 0) + ISNULL(MAX(dr.receivedDirect), 0) - ISNULL(MAX(ra.releasedQty), 0) + ISNULL(MAX(rt.receivedQty), 0)
                         - MAX(ISNULL(so.shipped, 0)) + MAX(ISNULL(sb.returned, 0)) AS remaining
                 FROM projectItems pi
                 LEFT JOIN reservedBase rb ON rb.ProjectNO = pi.ProjectNO AND rb.ProfileNO = pi.ProfileNO AND rb.Color = pi.Color AND rb.LinthRe = pi.LinthRe
+                LEFT JOIN directReceipt dr ON dr.ProjectNO = pi.ProjectNO AND dr.ProfileNO = pi.ProfileNO AND dr.Color = pi.Color AND dr.LinthRe = pi.LinthRe
                 LEFT JOIN releasedAway ra ON ra.ProjectNO = pi.ProjectNO AND ra.ProfileNO = pi.ProfileNO AND ra.Color = pi.Color AND ra.LinthRe = pi.LinthRe
                 LEFT JOIN receivedTransfer rt ON rt.ProjectNO = pi.ProjectNO AND rt.ProfileNO = pi.ProfileNO AND rt.Color = pi.Color AND rt.LinthRe = pi.LinthRe
                 LEFT JOIN (
@@ -1335,15 +1365,20 @@ router.get("/remaining", async (req, res) => {
                     GROUP BY soo.ProjectNO, so.ProfileNO, so.Color, so.LinthRe
                 ) so ON so.ProjectNO = pi.ProjectNO AND so.ProfileNO = pi.ProfileNO AND so.Color = pi.Color AND so.LinthRe = pi.LinthRe
                 LEFT JOIN (
-                    SELECT sbo.ProjectNO, sb.ProfileNO, sb.Color, sb.LinthRe, SUM(sb.QtyOut) AS returned
+                    -- StockBack.QtyOut is confirmed live to be essentially
+                    -- always 0 (2,717 of 2,743 rows) -- the real returned
+                    -- quantity the legacy app's own DBack1 view reads is
+                    -- QtyAvl. Using QtyOut here (as this endpoint used to)
+                    -- meant returns were almost never actually counted.
+                    SELECT sbo.ProjectNO, sb.ProfileNO, sb.Color, sb.LinthRe, SUM(sb.QtyAvl) AS returned
                     FROM guest.StockBack sb JOIN guest.StockBackO sbo ON sb.RecordNO = sbo.RecordNO
                     GROUP BY sbo.ProjectNO, sb.ProfileNO, sb.Color, sb.LinthRe
                 ) sb ON sb.ProjectNO = pi.ProjectNO AND sb.ProfileNO = pi.ProfileNO AND sb.Color = pi.Color AND sb.LinthRe = pi.LinthRe
                 WHERE (@projectNo IS NULL OR pi.ProjectNO = @projectNo)
                 GROUP BY pi.ProjectNO, pi.ProfileNO, pi.Color, pi.LinthRe
-                HAVING ISNULL(MAX(rb.reserved), 0) - ISNULL(MAX(ra.releasedQty), 0) + ISNULL(MAX(rt.receivedQty), 0)
+                HAVING ISNULL(MAX(rb.reserved), 0) + ISNULL(MAX(dr.receivedDirect), 0) - ISNULL(MAX(ra.releasedQty), 0) + ISNULL(MAX(rt.receivedQty), 0)
                            - MAX(ISNULL(so.shipped, 0)) + MAX(ISNULL(sb.returned, 0)) <> 0
-                   AND (@storeNo IS NULL OR MAX(CASE WHEN COALESCE(rb.StoreNo, rt.StoreNo, ra.StoreNo) = @storeNo THEN 1 ELSE 0 END) = 1)
+                   AND (@storeNo IS NULL OR MAX(CASE WHEN COALESCE(rb.StoreNo, dr.StoreNo, rt.StoreNo, ra.StoreNo) = @storeNo THEN 1 ELSE 0 END) = 1)
             )
         `;
 
