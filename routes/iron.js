@@ -803,6 +803,17 @@ router.get("/report", async (req, res) => {
 // dated within the last day) — it's schema-qualified as guest.QL2IRon, not
 // dbo.QL2IRon. Queried directly rather than reconstructed from Stock/STOCKO
 // by hand, since it's the real legacy view and already correctly scoped.
+//
+// QL2IRon.QTY is the item's original total, not what's still on hand — the
+// view itself already computes Expr1 (shipped, via guest.OUTSUM) and Expr4
+// (QTY - Expr1, the real remaining balance). Selecting raw QTY here was
+// wrong: confirmed live that 14,112 of 14,168 rows (99.6%) have Expr4 <= 0
+// (fully shipped already), so an unfiltered "current stock" list was
+// almost entirely showing goods that already left. Same class of bug
+// already fixed in mainStock.js's /orders/:orderNo/items (QTY - shipped)
+// and glass.js's SQTY — applied here too: expose remaining/shipped and
+// filter to genuinely on-hand rows, since this endpoint's whole purpose
+// (unlike mainStock.js's per-order history view) is "what's in stock now."
 router.get("/stock", async (req, res) => {
     try {
         const search = String(req.query.search || "").trim();
@@ -810,7 +821,9 @@ router.get("/stock", async (req, res) => {
         const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 25));
         const offset = (page - 1) * pageSize;
 
-        const whereClause = search ? "WHERE (projNo LIKE @search OR projName LIKE @search OR Prodc LIKE @search)" : "";
+        const conditions = ["Expr4 > 0"];
+        if (search) conditions.push("(projNo LIKE @search OR projName LIKE @search OR Prodc LIKE @search)");
+        const whereClause = `WHERE ${conditions.join(" AND ")}`;
 
         const { total, rows } = await withSqlRetry("minstock", async (pool) => {
             const countRequest = pool.request();
@@ -821,7 +834,8 @@ router.get("/stock", async (req, res) => {
             listRequest.input("offset", offset).input("pageSize", pageSize);
             if (search) listRequest.input("search", `%${search}%`);
             const listResult = await listRequest.query(`
-                SELECT orderNo, serialNo, projNo, projName, Worker, Prodc, ProdctionNO, UNO, QTY, Date, Note
+                SELECT orderNo, serialNo, projNo, projName, Worker, Prodc, ProdctionNO, UNO, QTY,
+                       Expr1 AS shipped, Expr4 AS remaining, Date, Note
                 FROM guest.QL2IRon
                 ${whereClause}
                 ORDER BY Date DESC
