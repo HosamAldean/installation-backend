@@ -160,7 +160,7 @@ router.put("/leave-requests/:id/manager-decision", authenticateToken, async (req
     }
 });
 
-router.put("/leave-requests/:id/hr-decision", authenticateToken, authorizeRoles("hr", "admin"), async (req, res) => {
+router.put("/leave-requests/:id/hr-decision", authenticateToken, authorizeRoles("hr", "hr_manager", "admin"), async (req, res) => {
     const { decision, note } = req.body;
     if (!["approved", "rejected"].includes(decision)) {
         return res.status(400).json({ success: false, message: "decision must be 'approved' or 'rejected'" });
@@ -243,7 +243,7 @@ router.put("/attendance-corrections/:id/manager-decision", authenticateToken, as
     }
 });
 
-router.put("/attendance-corrections/:id/hr-decision", authenticateToken, authorizeRoles("hr", "admin"), async (req, res) => {
+router.put("/attendance-corrections/:id/hr-decision", authenticateToken, authorizeRoles("hr", "hr_manager", "admin"), async (req, res) => {
     const { decision, note } = req.body;
     if (!["approved", "rejected"].includes(decision)) {
         return res.status(400).json({ success: false, message: "decision must be 'approved' or 'rejected'" });
@@ -342,7 +342,7 @@ router.put("/transport-requests/:id/manager-decision", authenticateToken, async 
     }
 });
 
-router.put("/transport-requests/:id/hr-decision", authenticateToken, authorizeRoles("hr", "admin"), async (req, res) => {
+router.put("/transport-requests/:id/hr-decision", authenticateToken, authorizeRoles("hr", "hr_manager", "admin"), async (req, res) => {
     const { decision, note } = req.body;
     if (!["approved", "rejected"].includes(decision)) {
         return res.status(400).json({ success: false, message: "decision must be 'approved' or 'rejected'" });
@@ -367,7 +367,7 @@ router.put("/transport-requests/:id/hr-decision", authenticateToken, authorizeRo
     }
 });
 
-router.put("/transport-requests/:id/finance-decision", authenticateToken, authorizeRoles("accounting", "admin"), async (req, res) => {
+router.put("/transport-requests/:id/finance-decision", authenticateToken, authorizeRoles("accounting", "accounting_manager", "admin"), async (req, res) => {
     const { decision, note, kmRate, additionalAmount, additionalAmountNote } = req.body;
     if (!["approved", "rejected"].includes(decision)) {
         return res.status(400).json({ success: false, message: "decision must be 'approved' or 'rejected'" });
@@ -424,7 +424,7 @@ router.put("/transport-requests/:id/finance-decision", authenticateToken, author
 // off) since those are two different real-world events that can happen
 // at different times (approval today, bank transfer next week).
 // ============================================================
-router.put("/transport-requests/:id/mark-paid", authenticateToken, authorizeRoles("accounting", "admin"), async (req, res) => {
+router.put("/transport-requests/:id/mark-paid", authenticateToken, authorizeRoles("accounting", "accounting_manager", "admin"), async (req, res) => {
     try {
         const request = await HrTransportRequest.findByPk(req.params.id);
         if (!request) return res.status(404).json({ success: false, message: "Request not found" });
@@ -508,7 +508,7 @@ router.get("/manager-approvals", authenticateToken, async (req, res) => {
 // ============================================================
 // GET /hr-queue -- everything awaiting HR review, all 3 types
 // ============================================================
-router.get("/hr-queue", authenticateToken, authorizeRoles("hr", "admin"), async (req, res) => {
+router.get("/hr-queue", authenticateToken, authorizeRoles("hr", "hr_manager", "admin"), async (req, res) => {
     try {
         const [leave, attendance, transport] = await Promise.all([
             HrLeaveRequest.findAll({ where: { status: "pending_hr" }, order: [["createdAt", "ASC"]] }),
@@ -530,7 +530,7 @@ router.get("/hr-queue", authenticateToken, authorizeRoles("hr", "admin"), async 
 // ============================================================
 // GET /finance-queue -- transport requests awaiting finance approval
 // ============================================================
-router.get("/finance-queue", authenticateToken, authorizeRoles("accounting", "admin"), async (req, res) => {
+router.get("/finance-queue", authenticateToken, authorizeRoles("accounting", "accounting_manager", "admin"), async (req, res) => {
     try {
         const transport = await HrTransportRequest.findAll({
             where: { status: "pending_finance" },

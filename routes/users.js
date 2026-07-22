@@ -27,17 +27,19 @@ const requireAdmin = authorizeRoles('admin');
 // in routes/hrRequests.js) rather than role-based: any employee who
 // supervises at least one other employee can create/manage accounts for
 // their own reports, but granting hr/admin, or touching an existing
-// hr/admin account at all, stays admin-only.
-const PRIVILEGED_ROLES = ['admin', 'hr'];
+// hr/admin account at all, stays admin-only. hr_manager is treated
+// identically to hr throughout this file (same company-wide scope, same
+// privilege) -- it's a senior HR role, not a differently-scoped one.
+const PRIVILEGED_ROLES = ['admin', 'hr', 'hr_manager'];
 
-// admin and hr get company-wide scope (any employee, not just their own
-// reports) for listing/creating/managing user accounts -- HR realistically
-// onboards people across the whole company, not just people who report to
-// HR itself. Granting the admin/hr role to someone else is still
-// admin-only (see PRIVILEGED_ROLES above) -- this is about *whose*
+// admin and hr(_manager) get company-wide scope (any employee, not just
+// their own reports) for listing/creating/managing user accounts -- HR
+// realistically onboards people across the whole company, not just people
+// who report to HR itself. Granting the admin/hr role to someone else is
+// still admin-only (see PRIVILEGED_ROLES above) -- this is about *whose*
 // accounts you can touch, not *what* you can turn them into.
 function hasCompanyWideScope(role) {
-    return role === 'admin' || role === 'hr';
+    return role === 'admin' || role === 'hr' || role === 'hr_manager';
 }
 
 /* ----------------------------------

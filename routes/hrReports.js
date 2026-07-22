@@ -67,7 +67,7 @@ function countByStatus(rows) {
 // GET /summary -- dashboard totals across all 3 request types. Visible to
 // hr/admin (leave & attendance) and accounting/admin (transport totals).
 // ============================================================
-router.get("/summary", authenticateToken, authorizeRoles("hr", "admin", "accounting"), async (req, res) => {
+router.get("/summary", authenticateToken, authorizeRoles("hr", "hr_manager", "admin", "accounting", "accounting_manager"), async (req, res) => {
     try {
         const now = new Date();
         const yearStart = `${now.getFullYear()}-01-01`;
@@ -120,7 +120,7 @@ router.get("/summary", authenticateToken, authorizeRoles("hr", "admin", "account
 // GET /leave-attendance -- combined history of leave/departure and
 // attendance-correction requests, for HR record-keeping.
 // ============================================================
-router.get("/leave-attendance", authenticateToken, authorizeRoles("hr", "admin"), async (req, res) => {
+router.get("/leave-attendance", authenticateToken, authorizeRoles("hr", "hr_manager", "admin"), async (req, res) => {
     try {
         const { page, pageSize } = parsePagination(req.query);
         const { status, type, dateFrom, dateTo, search } = req.query;
@@ -181,7 +181,7 @@ router.get("/leave-attendance", authenticateToken, authorizeRoles("hr", "admin")
 // reconciliation (also visible to hr/admin, who audit these before
 // Finance signs off).
 // ============================================================
-router.get("/transport", authenticateToken, authorizeRoles("hr", "accounting", "admin"), async (req, res) => {
+router.get("/transport", authenticateToken, authorizeRoles("hr", "hr_manager", "accounting", "accounting_manager", "admin"), async (req, res) => {
     try {
         const { page, pageSize } = parsePagination(req.query);
         const { status, dateFrom, dateTo, search, paidStatus } = req.query;
