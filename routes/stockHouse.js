@@ -1721,9 +1721,16 @@ router.get("/reservations/:recordNo/items", async (req, res) => {
 // One real difference from the legacy form: there, QtyAvl/QtyOut were
 // plain manually-typed fields the VBA never computed — most live rows just
 // have them at 0. Here QtyAvl is computed for real from current on-hand
-// stock (same received-shipped+returned calc as GET /stock-levels), so the
-// feasibility check actually means something instead of being whatever a
-// user happened to type.
+// stock (same received-shipped-sentToCoating+returned calc as
+// GET /stock-levels), so the feasibility check actually means something
+// instead of being whatever a user happened to type.
+//
+// CORRECTED: material sent to coating (guest.MIX) was missing from this
+// calculation — same gap as GET /stock-levels and GET /card/:computerNo
+// had, same fix (see those endpoints' CORRECTED notes). Without it, a
+// feasibility check could report material as available when part of it
+// was actually sitting at the coater, permanently gone from this
+// mill-finish code once sent.
 async function computeOnHand(pool, { profileNo, color, linthRe, storeNo, computerNo }) {
     const result = await pool.request()
         .input("profileNo", profileNo)
@@ -1746,6 +1753,11 @@ async function computeOnHand(pool, { profileNo, color, linthRe, storeNo, compute
                 UNION ALL
 
                 SELECT 0, 0, QtyOut FROM guest.StockBack
+                WHERE ProfileNO = @profileNo AND Color = @color AND LinthRe = @linthRe AND StoreNo = @storeNo AND ComputerNO = @computerNo
+
+                UNION ALL
+
+                SELECT 0, QtyAvl, 0 FROM guest.MIX
                 WHERE ProfileNO = @profileNo AND Color = @color AND LinthRe = @linthRe AND StoreNo = @storeNo AND ComputerNO = @computerNo
             ) combined
         `);
@@ -2047,27 +2059,32 @@ router.get("/card/:computerNo", async (req, res) => {
 
                     -- Mill-finish stock sent out to the external coating company
                     -- (guest.MIX/MIXO — see POST /mix/send), shown as its own
-                    -- 'MIX_OUT' row type (not plain 'OUT') so it's visible in the
-                    -- history and the frontend can label it distinctly from a real
-                    -- shipment, but deliberately excluded from the running balance
-                    -- (balanceQty = 0): confirmed against the legacy Access app's
-                    -- own M1.Card()/M1.RStock() — RStock's on-hand total is
-                    -- Sum(QtyIN)-Sum(QtyOut) only, with MIX's QtyAvl reported as a
-                    -- separate "currently at the coater" figure, never subtracted
-                    -- from on-hand. Netting MIX into this card's balance made it
-                    -- disagree with /stock-levels (Remaining Stock) for the same
-                    -- item — this keeps both reports consistent. Was originally
-                    -- typed plain 'OUT' like a real shipment, which is exactly why
-                    -- a flat balance next to a negative qty read as a bug rather
-                    -- than the intended behavior (see the project wiki's
-                    -- stock-house-ledger entry). Uses QtyAvl, not QtySend: checked
-                    -- live, 50,824 of 50,825 MIX rows have QtySend = 0 (the legacy
+                    -- 'MIX_OUT' row type (not plain 'OUT') so the frontend can
+                    -- label it distinctly from a real shipment.
+                    --
+                    -- CORRECTED: this used to exclude the quantity from the
+                    -- running balance (balanceQty = 0), reasoned as matching the
+                    -- legacy Access app's RStock report and staying consistent
+                    -- with /stock-levels. That was wrong — confirmed against the
+                    -- real physical process (not just one legacy report): mill-
+                    -- finish material sent to coating comes back as a genuinely
+                    -- different item under a new ComputerNO (POST /mix/receive
+                    -- creates a fresh EnterDou row keyed by the *target* color,
+                    -- never crediting the original mill code). The mill item's
+                    -- stock is gone the moment it's sent, permanently — it does
+                    -- not return to this code even after the coated material is
+                    -- received. balanceQty now actually subtracts, matching how
+                    -- StockOut already does; GET /stock-levels and computeOnHand()
+                    -- (used by feasibility checks) get the equivalent fix so all
+                    -- three item-level on-hand figures agree with each other and
+                    -- with reality. Uses QtyAvl, not QtySend: checked live,
+                    -- 50,824 of 50,825 MIX rows have QtySend = 0 (the legacy
                     -- Access app — still the primary writer of this table — has
                     -- only ever populated QtyAvl for the sent quantity; QtySend
                     -- appears vestigial). POST /mix/send (this app's own writer)
                     -- sets both columns to the same value, so QtyAvl is correct
                     -- for rows from either source.
-                    SELECT mx.SDate, 'MIX_OUT', -mx.QtyAvl, 0, mo.ProjectNO,
+                    SELECT mx.SDate, 'MIX_OUT', -mx.QtyAvl, -mx.QtyAvl, mo.ProjectNO,
                            mx.ProfileNO, mx.ProfileName, mx.Color, mx.LinthRe, mx.StoreNo, mx.SUser,
                            4, mx.RecordNO, mx.SerialNo
                     FROM guest.MIX mx
@@ -2093,10 +2110,13 @@ router.get("/card/:computerNo", async (req, res) => {
 });
 
 // GET /api/stock-house/stock-levels?storeNo=&profileNo= — current on-hand
-// quantity per item (received − shipped + returned), regardless of project
-// or reservation — mirrors the legacy "RStock"/"RStock2" reports, which
-// answered "how much of this do we actually have right now" as opposed to
-// /remaining's "how much of what's reserved for this project is left".
+// quantity per item (received − shipped − sent to coating + returned),
+// regardless of project or reservation — mirrors the legacy "RStock"/
+// "RStock2" reports, which answered "how much of this do we actually have
+// right now" as opposed to /remaining's "how much of what's reserved for
+// this project is left". Material sent to coating (guest.MIX) counts as an
+// outflow here, same as a real shipment — see the CORRECTED note on the
+// MIX branch of combinedCte below.
 router.get("/stock-levels", async (req, res) => {
     try {
         const { profileNo } = req.query;
@@ -2139,6 +2159,21 @@ router.get("/stock-levels", async (req, res) => {
                 SELECT sb.ProfileNO, NULL, sb.Color, sb.LinthRe, sb.StoreNo, sb.ComputerNO,
                        0, 0, sb.QtyOut
                 FROM guest.StockBack sb
+
+                UNION ALL
+
+                -- CORRECTED: material sent to coating (guest.MIX) was missing
+                -- from this on-hand calculation entirely. It's a real outflow
+                -- from the mill-finish item's stock, same as a StockOut
+                -- shipment — POST /mix/receive creates a brand-new item under
+                -- the coated color's own ComputerNO, it never credits this
+                -- (the mill) code back, even once the coated material is fully
+                -- received. Without this branch, sent-to-coating quantity
+                -- stayed counted as "on hand" here indefinitely — see
+                -- GET /card/:computerNo's matching correction.
+                SELECT mx.ProfileNO, NULL, mx.Color, mx.LinthRe, mx.StoreNo, mx.ComputerNO,
+                       0, mx.QtyAvl, 0
+                FROM guest.MIX mx
             ),
             keyed AS (
                 SELECT *,
