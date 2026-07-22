@@ -102,6 +102,47 @@ router.get("/orders", async (req, res) => {
     }
 });
 
+// GET /api/glass/orders/:orderNo — single order header, same shape as the
+// list rows above. Used by report pages to deep-link straight into an
+// order's detail view without re-implementing the search-by-orderNo the
+// list endpoint doesn't support (it only searches projName/projNo/JPO).
+router.get("/orders/:orderNo", async (req, res) => {
+    const orderNo = parseInt(req.params.orderNo);
+    if (!Number.isInteger(orderNo)) {
+        return res.status(400).json({ success: false, message: "Invalid orderNo" });
+    }
+    try {
+        const result = await withSqlRetry("glass", (pool) => pool.request()
+            .input("orderNo", orderNo)
+            .query(`
+                SELECT
+                    o.orderNo, o.projNo, o.projName, o.projMgr, o.oderDate, o.JPO, o.ProdctionNO,
+                    ISNULL(lines.totalQty, 0) AS totalQty,
+                    ISNULL(received.totalReceived, 0) AS totalReceived,
+                    ISNULL(lines.lineCount, 0) AS lineCount
+                FROM Sorders o
+                LEFT JOIN (
+                    SELECT orderNo, SUM(qty) AS totalQty, COUNT(*) AS lineCount
+                    FROM Sorderdetails
+                    GROUP BY orderNo
+                ) lines ON lines.orderNo = o.orderNo
+                LEFT JOIN (
+                    SELECT OrderNo, SUM(QTYIN) AS totalReceived
+                    FROM SSTOCK
+                    GROUP BY OrderNo
+                ) received ON received.OrderNo = o.orderNo
+                WHERE o.orderNo = @orderNo
+            `));
+        if (result.recordset.length === 0) {
+            return res.status(404).json({ success: false, message: "Order not found" });
+        }
+        res.json({ success: true, order: result.recordset[0] });
+    } catch (err) {
+        console.error("❌ GLASS GET ORDER ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to fetch glass order" });
+    }
+});
+
 // POST /api/glass/orders — create a new order header (Sorders). orderNo is
 // an identity column, same as MinStock's STOCKO.orderNo.
 router.post("/orders", async (req, res) => {
