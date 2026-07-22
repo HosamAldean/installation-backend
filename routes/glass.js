@@ -1095,12 +1095,26 @@ router.get("/reports/status", async (req, res) => {
 });
 
 // GET /api/glass/reports/billing?dateFrom=&dateTo=&projNo= — computed
-// (priced-but-maybe-not-yet-invoiced) totals vs. actually invoiced (SBill)
-// totals, grouped by project, so outstanding-to-invoice stands out.
+// (priced-but-maybe-not-yet-invoiced) totals vs. actually invoiced totals,
+// grouped by project, so outstanding-to-invoice stands out.
+//
+// CORRECTED: this used to read only Sorderdetails.price/SBill (the "current"
+// system this whole module manages) on the assumption that orders/
+// orderdetails/CheckBill/Bill were a dead pre-cutover archive. Verified live
+// against the database that assumption was wrong: orders had 773 new rows
+// and Bill had 212 new invoice entries in just the last 6-12 months —
+// that legacy pipeline is still how billing actually gets entered (in
+// occasional batches, per the person who confirmed this), while nobody has
+// ever billed through Sorderdetails.price. orderNo is a disjoint identity
+// sequence between the two systems (never overlaps), but projNo is shared
+// for the same real project across both (60+ confirmed), so that's the only
+// safe join key. Both sources are now included and kept visibly split
+// (current vs legacy) rather than silently blended, since they're two
+// independently-computed pricing systems.
 router.get("/reports/billing", async (req, res) => {
     try {
         const { dateFrom, dateTo, projNo } = req.query;
-        const { itemsResult, billsResult } = await withSqlRetry("glass", async (pool) => {
+        const { itemsResult, billsResult, legacyItemsResult, legacyBillsResult } = await withSqlRetry("glass", async (pool) => {
             const itemsRequest = pool.request();
             const itemConditions = ["d.price IS NOT NULL"];
             if (dateFrom) { itemsRequest.input("dateFrom", dateFrom); itemConditions.push("o.oderDate >= @dateFrom"); }
@@ -1129,27 +1143,80 @@ router.get("/reports/billing", async (req, res) => {
                 GROUP BY o.projNo, o.projName
             `);
 
-            return { itemsResult, billsResult };
+            const legacyItemsRequest = pool.request();
+            const legacyItemConditions = [];
+            if (dateFrom) { legacyItemsRequest.input("dateFrom", dateFrom); legacyItemConditions.push("o.oderDate >= @dateFrom"); }
+            if (dateTo) { legacyItemsRequest.input("dateTo", dateTo); legacyItemConditions.push("o.oderDate <= @dateTo"); }
+            if (projNo) { legacyItemsRequest.input("projNo", `%${projNo}%`); legacyItemConditions.push("o.projNo LIKE @projNo"); }
+            const legacyItemsWhereClause = legacyItemConditions.length ? `WHERE ${legacyItemConditions.join(" AND ")}` : "";
+            const legacyItemsResult = await legacyItemsRequest.query(`
+                SELECT o.projNo, o.projName, SUM(c.[total PU]) AS computedTotal
+                FROM CheckBill c
+                JOIN orders o ON o.orderNo = c.orderNo
+                ${legacyItemsWhereClause}
+                GROUP BY o.projNo, o.projName
+            `);
+
+            const legacyBillsRequest = pool.request();
+            const legacyBillConditions = [];
+            if (dateFrom) { legacyBillsRequest.input("dateFrom", dateFrom); legacyBillConditions.push("b.DateEnter >= @dateFrom"); }
+            if (dateTo) { legacyBillsRequest.input("dateTo", dateTo); legacyBillConditions.push("b.DateEnter <= @dateTo"); }
+            if (projNo) { legacyBillsRequest.input("projNo", `%${projNo}%`); legacyBillConditions.push("o.projNo LIKE @projNo"); }
+            const legacyBillsWhereClause = legacyBillConditions.length ? `WHERE ${legacyBillConditions.join(" AND ")}` : "";
+            const legacyBillsResult = await legacyBillsRequest.query(`
+                SELECT o.projNo, o.projName, SUM(b.Price) AS invoicedTotal, COUNT(*) AS billCount
+                FROM Bill b
+                JOIN orders o ON o.orderNo = b.orderNo
+                ${legacyBillsWhereClause}
+                GROUP BY o.projNo, o.projName
+            `);
+
+            return { itemsResult, billsResult, legacyItemsResult, legacyBillsResult };
+        });
+
+        const emptyEntry = (projNo, projName) => ({
+            projNo, projName,
+            currentComputedTotal: 0, legacyComputedTotal: 0,
+            currentInvoicedTotal: 0, legacyInvoicedTotal: 0,
+            currentBillCount: 0, legacyBillCount: 0,
         });
 
         const byProject = new Map();
         itemsResult.recordset.forEach(row => {
             const key = row.projNo;
             const { totalPU } = computeBilling(row);
-            const entry = byProject.get(key) || { projNo: row.projNo, projName: row.projName, computedTotal: 0, invoicedTotal: 0, billCount: 0 };
-            entry.computedTotal = round3(entry.computedTotal + totalPU);
+            const entry = byProject.get(key) || emptyEntry(row.projNo, row.projName);
+            entry.currentComputedTotal = round3(entry.currentComputedTotal + totalPU);
             byProject.set(key, entry);
         });
         billsResult.recordset.forEach(row => {
             const key = row.projNo;
-            const entry = byProject.get(key) || { projNo: row.projNo, projName: row.projName, computedTotal: 0, invoicedTotal: 0, billCount: 0 };
-            entry.invoicedTotal = round3(row.invoicedTotal || 0);
-            entry.billCount = row.billCount;
+            const entry = byProject.get(key) || emptyEntry(row.projNo, row.projName);
+            entry.currentInvoicedTotal = round3(row.invoicedTotal || 0);
+            entry.currentBillCount = row.billCount;
+            byProject.set(key, entry);
+        });
+        legacyItemsResult.recordset.forEach(row => {
+            const key = row.projNo;
+            const entry = byProject.get(key) || emptyEntry(row.projNo, row.projName);
+            entry.legacyComputedTotal = round3(row.computedTotal || 0);
+            byProject.set(key, entry);
+        });
+        legacyBillsResult.recordset.forEach(row => {
+            const key = row.projNo;
+            const entry = byProject.get(key) || emptyEntry(row.projNo, row.projName);
+            entry.legacyInvoicedTotal = round3(row.invoicedTotal || 0);
+            entry.legacyBillCount = row.billCount;
             byProject.set(key, entry);
         });
 
         const projects = Array.from(byProject.values())
-            .map(p => ({ ...p, outstanding: round3(p.computedTotal - p.invoicedTotal) }))
+            .map(p => {
+                const computedTotal = round3(p.currentComputedTotal + p.legacyComputedTotal);
+                const invoicedTotal = round3(p.currentInvoicedTotal + p.legacyInvoicedTotal);
+                const billCount = p.currentBillCount + p.legacyBillCount;
+                return { ...p, computedTotal, invoicedTotal, billCount, outstanding: round3(computedTotal - invoicedTotal) };
+            })
             .sort((a, b) => b.computedTotal - a.computedTotal);
 
         const totals = projects.reduce((acc, p) => ({
