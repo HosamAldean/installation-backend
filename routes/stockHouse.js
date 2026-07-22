@@ -2046,22 +2046,28 @@ router.get("/card/:computerNo", async (req, res) => {
                     UNION ALL
 
                     -- Mill-finish stock sent out to the external coating company
-                    -- (guest.MIX/MIXO — see POST /mix/send), shown as an 'OUT' row
-                    -- so it's visible in the history, but deliberately excluded from
-                    -- the running balance (balanceQty = 0): confirmed against the
-                    -- legacy Access app's own M1.Card()/M1.RStock() — RStock's
-                    -- on-hand total is Sum(QtyIN)-Sum(QtyOut) only, with MIX's
-                    -- QtyAvl reported as a separate "currently at the coater" figure,
-                    -- never subtracted from on-hand. Netting MIX into this card's
-                    -- balance made it disagree with /stock-levels (Remaining Stock)
-                    -- for the same item — this keeps both reports consistent. Uses
-                    -- QtyAvl, not QtySend: checked live, 50,824 of 50,825 MIX rows
-                    -- have QtySend = 0 (the legacy Access app — still the primary
-                    -- writer of this table — has only ever populated QtyAvl for the
-                    -- sent quantity; QtySend appears vestigial). POST /mix/send
-                    -- (this app's own writer) sets both columns to the same value,
-                    -- so QtyAvl is correct for rows from either source.
-                    SELECT mx.SDate, 'OUT', -mx.QtyAvl, 0, mo.ProjectNO,
+                    -- (guest.MIX/MIXO — see POST /mix/send), shown as its own
+                    -- 'MIX_OUT' row type (not plain 'OUT') so it's visible in the
+                    -- history and the frontend can label it distinctly from a real
+                    -- shipment, but deliberately excluded from the running balance
+                    -- (balanceQty = 0): confirmed against the legacy Access app's
+                    -- own M1.Card()/M1.RStock() — RStock's on-hand total is
+                    -- Sum(QtyIN)-Sum(QtyOut) only, with MIX's QtyAvl reported as a
+                    -- separate "currently at the coater" figure, never subtracted
+                    -- from on-hand. Netting MIX into this card's balance made it
+                    -- disagree with /stock-levels (Remaining Stock) for the same
+                    -- item — this keeps both reports consistent. Was originally
+                    -- typed plain 'OUT' like a real shipment, which is exactly why
+                    -- a flat balance next to a negative qty read as a bug rather
+                    -- than the intended behavior (see the project wiki's
+                    -- stock-house-ledger entry). Uses QtyAvl, not QtySend: checked
+                    -- live, 50,824 of 50,825 MIX rows have QtySend = 0 (the legacy
+                    -- Access app — still the primary writer of this table — has
+                    -- only ever populated QtyAvl for the sent quantity; QtySend
+                    -- appears vestigial). POST /mix/send (this app's own writer)
+                    -- sets both columns to the same value, so QtyAvl is correct
+                    -- for rows from either source.
+                    SELECT mx.SDate, 'MIX_OUT', -mx.QtyAvl, 0, mo.ProjectNO,
                            mx.ProfileNO, mx.ProfileName, mx.Color, mx.LinthRe, mx.StoreNo, mx.SUser,
                            4, mx.RecordNO, mx.SerialNo
                     FROM guest.MIX mx
