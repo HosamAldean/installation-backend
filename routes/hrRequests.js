@@ -53,16 +53,33 @@ function requireEmpNo(req, res) {
 }
 
 // ============================================================
-// GET /vacation-balance -- read-only PayEmp.Vac_Bal for the caller
-// ============================================================
+// GET /vacation-balance -- read-only current annual-leave balance.
+//
+// CORRECTED: this used to read PayEmp.Vac_Bal, which is dead -- verified
+// live that it's 0 for every one of the 527 active employees company-wide,
+// not just the test account. The company's ERP has a full HR/payroll
+// vacation module (Pay_Vac / Pay_VacBal / dozens of HRP_*/Pay_Vac* stored
+// procs) that PayEmp.Vac_Bal was never wired up to. Pay_VacBal is a
+// proper per-employee, per-year, per-leave-type ledger (YearBal/
+// OpeningBal/ConsBal/DueBal); Pay_Vac (the type lookup) confirms only
+// Vac_Code=1 ("سنوية" / annual) has Vac_Bal=true -- every other leave
+// type (sick, maternity, condolence, unpaid, ...) has no running balance
+// concept in this company's configuration, matching the paper form's own
+// emphasis on an annual-leave balance. DueBal for the current year is
+// the "balance as of today" figure, confirmed against a real employee
+// (200231): PayEmp.Vac_Bal read 0, Pay_VacBal's 2026 row read DueBal=34.
 router.get("/vacation-balance", authenticateToken, async (req, res) => {
     const empNo = requireEmpNo(req, res);
     if (empNo === null) return;
     try {
         const result = await withSqlRetry("erp", (pool) => pool.request()
             .input("empNo", empNo)
-            .query(`SELECT Vac_Bal FROM [DB].[dbo].[PayEmp] WHERE Emp_num = @empNo`));
-        res.json({ success: true, vacationBalance: result.recordset[0]?.Vac_Bal ?? null });
+            .input("balYear", new Date().getFullYear())
+            .query(`
+                SELECT DueBal FROM [DB].[dbo].[Pay_VacBal]
+                WHERE EmpNo = @empNo AND VacType = 1 AND BalYear = @balYear
+            `));
+        res.json({ success: true, vacationBalance: result.recordset[0]?.DueBal ?? null });
     } catch (err) {
         console.error("❌ HR VACATION BALANCE ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to fetch vacation balance" });
