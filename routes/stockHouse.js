@@ -1752,7 +1752,11 @@ async function computeOnHand(pool, { profileNo, color, linthRe, storeNo, compute
 
                 UNION ALL
 
-                SELECT 0, 0, QtyOut FROM guest.StockBack
+                -- CORRECTED: was QtyOut, confirmed live to be 0 in every
+                -- StockBack row — the real returned qty is QtyAvl, same fix
+                -- already applied in GET /remaining, GET /card/:computerNo,
+                -- and GET /stock-levels.
+                SELECT 0, 0, QtyAvl FROM guest.StockBack
                 WHERE ProfileNO = @profileNo AND Color = @color AND LinthRe = @linthRe AND StoreNo = @storeNo AND ComputerNO = @computerNo
 
                 UNION ALL
@@ -2046,7 +2050,12 @@ router.get("/card/:computerNo", async (req, res) => {
 
                     UNION ALL
 
-                    SELECT sb.SDate, 'RETURN', sb.QtyOut, sb.QtyOut, sbo.ProjectNO,
+                    -- CORRECTED: was sb.QtyOut, which is confirmed live to be
+                    -- 0 in literally every StockBack row (2,743 of 2,743) —
+                    -- the real returned quantity is QtyAvl, same fix already
+                    -- applied in GET /remaining. Using QtyOut meant every
+                    -- return in this item's history showed as a 0-qty event.
+                    SELECT sb.SDate, 'RETURN', sb.QtyAvl, sb.QtyAvl, sbo.ProjectNO,
                            sb.ProfileNO, NULL, sb.Color, sb.LinthRe, sb.StoreNo, sb.SUser,
                            3, sb.RecordNO, sb.SerialNo
                     FROM guest.StockBack sb
@@ -2156,8 +2165,13 @@ router.get("/stock-levels", async (req, res) => {
 
                 UNION ALL
 
+                -- CORRECTED: was sb.QtyOut, confirmed live to be 0 in every
+                -- StockBack row (2,743 of 2,743) — the real returned qty is
+                -- QtyAvl, same fix already applied in GET /remaining and
+                -- GET /card/:computerNo. QtyOut meant returns never actually
+                -- added back to on-hand here.
                 SELECT sb.ProfileNO, NULL, sb.Color, sb.LinthRe, sb.StoreNo, sb.ComputerNO,
-                       0, 0, sb.QtyOut
+                       0, 0, sb.QtyAvl
                 FROM guest.StockBack sb
 
                 UNION ALL
