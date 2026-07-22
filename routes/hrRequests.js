@@ -21,28 +21,9 @@ import {
     HrTransportRequest,
     HrTransportAccompanier,
 } from "../models/index.js";
+import { isSupervisorOf, getSupervisedEmpNos } from "../utils/supervisorLookup.js";
 
 const router = express.Router();
-
-async function isSupervisorOf(supervisorEmpNo, employeeEmpNo) {
-    if (!supervisorEmpNo || !employeeEmpNo) return false;
-    const result = await withSqlRetry("erp", (pool) => pool.request()
-        .input("employeeEmpNo", employeeEmpNo)
-        .input("supervisorEmpNo", supervisorEmpNo)
-        .query(`
-            SELECT 1 FROM [DB].[dbo].[PayEmp]
-            WHERE Emp_num = @employeeEmpNo AND Supervisor_No = @supervisorEmpNo
-        `));
-    return result.recordset.length > 0;
-}
-
-async function getSupervisedEmpNos(supervisorEmpNo) {
-    if (!supervisorEmpNo) return [];
-    const result = await withSqlRetry("erp", (pool) => pool.request()
-        .input("supervisorEmpNo", supervisorEmpNo)
-        .query(`SELECT Emp_num FROM [DB].[dbo].[PayEmp] WHERE Supervisor_No = @supervisorEmpNo`));
-    return result.recordset.map(r => r.Emp_num);
-}
 
 function requireEmpNo(req, res) {
     if (!req.user.assignedEmpNo) {
