@@ -709,6 +709,7 @@ router.put("/orders/:orderNo/appointments", async (req, res) => {
 router.get("/ready-to-ship", async (req, res) => {
     try {
         const orderNo = req.query.orderNo ? parseInt(req.query.orderNo) : null;
+        const { page, pageSize } = parsePagination(req.query);
 
         const result = await withSqlRetry("glass", (pool) => {
             const request = pool.request();
@@ -738,7 +739,9 @@ router.get("/ready-to-ship", async (req, res) => {
             `);
         });
 
-        res.json({ success: true, items: result.recordset });
+        const totalRemaining = result.recordset.reduce((sum, it) => sum + it.remainingToShip, 0);
+        const { pageItems, total } = paginate(result.recordset, page, pageSize);
+        res.json({ success: true, items: pageItems, total, page, pageSize, totalRemaining });
     } catch (err) {
         console.error("❌ GLASS READY-TO-SHIP ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to fetch ready-to-ship items" });
@@ -875,6 +878,25 @@ const SCHOCO_AREA_RATE = { "15": 9.45, "20": 12 };
 const SCHOCO_QTY_RATE = { "15": 9, "20": 9.6 };
 
 const round3 = (n) => Math.round(n * 1000) / 1000;
+
+// Report tables were rendering unbounded result sets as raw <table> rows on
+// the frontend (Billing hit 1,325 project rows, Ready to Ship 1,256 items)
+// and visibly lagging as a result. Every report endpoint below now slices
+// its result to a page after computing totals from the full set, so totals
+// stay accurate while only one page's worth of rows is ever sent down.
+const DEFAULT_REPORT_PAGE_SIZE = 30;
+const MAX_REPORT_PAGE_SIZE = 200;
+function parsePagination(query) {
+    const page = Math.max(1, parseInt(query.page) || 1);
+    const pageSize = Math.min(MAX_REPORT_PAGE_SIZE, Math.max(1, parseInt(query.pageSize) || DEFAULT_REPORT_PAGE_SIZE));
+    return { page, pageSize };
+}
+function paginate(fullArray, page, pageSize) {
+    return {
+        pageItems: fullArray.slice((page - 1) * pageSize, page * pageSize),
+        total: fullArray.length,
+    };
+}
 
 // Computes the same derived billing fields as Check1, given a Sorderdetails
 // row (height/width/qty/spacer/intype/outtype plus the billing input
@@ -1039,6 +1061,7 @@ router.post("/orders/:orderNo/bills", async (req, res) => {
 router.get("/reports/status", async (req, res) => {
     try {
         const { dateFrom, dateTo, projNo } = req.query;
+        const { page, pageSize } = parsePagination(req.query);
         const result = await withSqlRetry("glass", (pool) => {
             const request = pool.request();
             const conditions = [];
@@ -1087,7 +1110,8 @@ router.get("/reports/status", async (req, res) => {
             fullyReceivedOrders: acc.fullyReceivedOrders + (o.lineCount > 0 && o.fullyReceivedLines >= o.lineCount ? 1 : 0),
         }), { totalQty: 0, totalReceived: 0, orderCount: 0, fullyReceivedOrders: 0 });
 
-        res.json({ success: true, orders, totals });
+        const { pageItems, total } = paginate(orders, page, pageSize);
+        res.json({ success: true, orders: pageItems, totals, total, page, pageSize });
     } catch (err) {
         console.error("❌ GLASS STATUS REPORT ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to fetch status report" });
@@ -1114,6 +1138,7 @@ router.get("/reports/status", async (req, res) => {
 router.get("/reports/billing", async (req, res) => {
     try {
         const { dateFrom, dateTo, projNo } = req.query;
+        const { page, pageSize } = parsePagination(req.query);
         const { itemsResult, billsResult, legacyItemsResult, legacyBillsResult } = await withSqlRetry("glass", async (pool) => {
             const itemsRequest = pool.request();
             const itemConditions = ["d.price IS NOT NULL"];
@@ -1225,7 +1250,8 @@ router.get("/reports/billing", async (req, res) => {
             outstanding: round3(acc.outstanding + p.outstanding),
         }), { computedTotal: 0, invoicedTotal: 0, outstanding: 0 });
 
-        res.json({ success: true, projects, totals });
+        const { pageItems, total } = paginate(projects, page, pageSize);
+        res.json({ success: true, projects: pageItems, totals, total, page, pageSize });
     } catch (err) {
         console.error("❌ GLASS BILLING REPORT ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to fetch billing report" });
@@ -1236,6 +1262,7 @@ router.get("/reports/billing", async (req, res) => {
 // yet fully received.
 router.get("/reports/overdue", async (req, res) => {
     try {
+        const { page, pageSize } = parsePagination(req.query);
         const result = await withSqlRetry("glass", (pool) => pool.request().query(`
             SELECT
                 d.orderNo, d.serialNo, d.itemNo, d.qty, d.expectdate, d.barcode,
@@ -1250,7 +1277,8 @@ router.get("/reports/overdue", async (req, res) => {
               AND ISNULL(s.QTYIN, 0) < d.qty
             ORDER BY d.expectdate ASC
         `));
-        res.json({ success: true, items: result.recordset });
+        const { pageItems, total } = paginate(result.recordset, page, pageSize);
+        res.json({ success: true, items: pageItems, total, page, pageSize });
     } catch (err) {
         console.error("❌ GLASS OVERDUE REPORT ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to fetch overdue report" });
@@ -1282,6 +1310,7 @@ router.get("/reports/overdue", async (req, res) => {
 router.get("/reports/factory-status", async (req, res) => {
     try {
         const { dateFrom, dateTo, projNo } = req.query;
+        const { page, pageSize } = parsePagination(req.query);
         const result = await withSqlRetry("glass", (pool) => {
             const request = pool.request();
             const conditions = [];
@@ -1315,7 +1344,8 @@ router.get("/reports/factory-status", async (req, res) => {
             return acc;
         }, { noDate: 0, late: 0, underWork: 0, finished: 0, taken: 0, onTrack: 0 });
 
-        res.json({ success: true, orders, totals });
+        const { pageItems, total } = paginate(orders, page, pageSize);
+        res.json({ success: true, orders: pageItems, totals, total, page, pageSize });
     } catch (err) {
         console.error("❌ GLASS FACTORY STATUS REPORT ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to fetch factory status report" });
@@ -1361,6 +1391,7 @@ router.get("/reports/factory-status", async (req, res) => {
 router.get("/reports/store", async (req, res) => {
     try {
         const { projNo } = req.query;
+        const { page, pageSize } = parsePagination(req.query);
         const result = await withSqlRetry("minstock", (pool) => {
             const request = pool.request();
             let whereClause = "";
@@ -1392,7 +1423,8 @@ router.get("/reports/store", async (req, res) => {
             entry.lineCount += 1;
         }
 
-        res.json({ success: true, items, projectTotals: Array.from(projectMap.values()) });
+        const { pageItems, total } = paginate(items, page, pageSize);
+        res.json({ success: true, items: pageItems, total, page, pageSize, projectTotals: Array.from(projectMap.values()) });
     } catch (err) {
         console.error("❌ GLASS STORE REPORT ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to fetch glass store report" });
