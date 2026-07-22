@@ -43,6 +43,17 @@ export const HrTransportRequest = sequelizeUtf8.define('HrTransportRequest', {
     financeNote: { type: DataTypes.TEXT, allowNull: true },
     kmRate: { type: DataTypes.FLOAT, allowNull: true },
     totalAmount: { type: DataTypes.FLOAT, allowNull: true },
+    // Manual top-up Finance can add on top of the km/fare calculation
+    // (bonus, correction, extra allowance) -- folded into totalAmount at
+    // approval time, kept separately too so the breakdown stays visible.
+    additionalAmount: { type: DataTypes.FLOAT, allowNull: true },
+    additionalAmountNote: { type: DataTypes.TEXT, allowNull: true },
+    // Separate from financeDecision/status: "approved" means Finance signed
+    // off on the amount, "paid" means Accounting confirms it was actually
+    // disbursed -- two different real-world events, so they're two
+    // different fields rather than folding "paid" into the status enum.
+    paidAt: { type: DataTypes.DATE, allowNull: true },
+    paidByUserId: { type: DataTypes.INTEGER, allowNull: true },
 }, {
     tableName: 'HrTransportRequests',
     timestamps: true,

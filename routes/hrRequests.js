@@ -368,7 +368,7 @@ router.put("/transport-requests/:id/hr-decision", authenticateToken, authorizeRo
 });
 
 router.put("/transport-requests/:id/finance-decision", authenticateToken, authorizeRoles("accounting", "admin"), async (req, res) => {
-    const { decision, note, kmRate } = req.body;
+    const { decision, note, kmRate, additionalAmount, additionalAmountNote } = req.body;
     if (!["approved", "rejected"].includes(decision)) {
         return res.status(400).json({ success: false, message: "decision must be 'approved' or 'rejected'" });
     }
@@ -381,16 +381,22 @@ router.put("/transport-requests/:id/finance-decision", authenticateToken, author
 
         let totalAmount = null;
         let appliedKmRate = null;
+        // additionalAmount is a manual top-up Finance can add on top of the
+        // km/fare calculation (bonus, correction, extra allowance) --
+        // rounded to 3 decimals throughout to match JOD's fils (1/1000)
+        // subunit convention.
+        const appliedAdditionalAmount = additionalAmount != null ? parseFloat(additionalAmount) : null;
         if (decision === "approved") {
             if (request.transportMethod === "private_car") {
                 if (kmRate == null) {
                     return res.status(400).json({ success: false, message: "kmRate is required to approve a private-car request" });
                 }
                 appliedKmRate = parseFloat(kmRate);
-                totalAmount = Math.round((request.kmDriven || 0) * appliedKmRate * 1000) / 1000;
+                totalAmount = (request.kmDriven || 0) * appliedKmRate;
             } else {
                 totalAmount = request.farePaid || 0;
             }
+            totalAmount = Math.round((totalAmount + (appliedAdditionalAmount || 0)) * 1000) / 1000;
         }
 
         await request.update({
@@ -399,6 +405,8 @@ router.put("/transport-requests/:id/finance-decision", authenticateToken, author
             financeDecidedAt: new Date(),
             financeNote: note || null,
             kmRate: appliedKmRate,
+            additionalAmount: decision === "approved" ? appliedAdditionalAmount : null,
+            additionalAmountNote: decision === "approved" ? (additionalAmountNote || null) : null,
             totalAmount,
             status: decision,
         });
@@ -406,6 +414,31 @@ router.put("/transport-requests/:id/finance-decision", authenticateToken, author
     } catch (err) {
         console.error("❌ HR TRANSPORT FINANCE DECISION ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to record decision" });
+    }
+});
+
+// ============================================================
+// PUT /transport-requests/:id/mark-paid -- Accounting's separate
+// confirmation that an already-approved reimbursement was actually
+// disbursed. Distinct from financeDecision ("approved" = amount signed
+// off) since those are two different real-world events that can happen
+// at different times (approval today, bank transfer next week).
+// ============================================================
+router.put("/transport-requests/:id/mark-paid", authenticateToken, authorizeRoles("accounting", "admin"), async (req, res) => {
+    try {
+        const request = await HrTransportRequest.findByPk(req.params.id);
+        if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+        if (request.status !== "approved") {
+            return res.status(400).json({ success: false, message: "Only approved requests can be marked as paid" });
+        }
+        if (request.paidAt) {
+            return res.status(400).json({ success: false, message: "This request is already marked as paid" });
+        }
+        await request.update({ paidAt: new Date(), paidByUserId: req.user.userId });
+        res.json({ success: true });
+    } catch (err) {
+        console.error("❌ HR TRANSPORT MARK PAID ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to mark request as paid" });
     }
 });
 

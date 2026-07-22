@@ -184,11 +184,11 @@ router.get("/leave-attendance", authenticateToken, authorizeRoles("hr", "admin")
 router.get("/transport", authenticateToken, authorizeRoles("hr", "accounting", "admin"), async (req, res) => {
     try {
         const { page, pageSize } = parsePagination(req.query);
-        const { status, dateFrom, dateTo, search } = req.query;
+        const { status, dateFrom, dateTo, search, paidStatus } = req.query;
 
         const empNoFilter = await resolveSearchToEmpNos(search);
         if (empNoFilter && empNoFilter.length === 0) {
-            return res.json({ success: true, items: [], total: 0, page, pageSize, totals: { count: 0, totalKm: 0, totalAmount: 0 } });
+            return res.json({ success: true, items: [], total: 0, page, pageSize, totals: { count: 0, totalKm: 0, totalAmount: 0, totalPaid: 0, totalUnpaid: 0 } });
         }
 
         const where = {};
@@ -198,6 +198,15 @@ router.get("/transport", authenticateToken, authorizeRoles("hr", "accounting", "
             where.departureDate = {};
             if (dateFrom) where.departureDate[Op.gte] = dateFrom;
             if (dateTo) where.departureDate[Op.lte] = dateTo;
+        }
+        // Only meaningful for approved requests -- "paid" vs "unpaid" is
+        // Accounting's own follow-up confirmation (see mark-paid endpoint
+        // in hrRequests.js), not Finance's approval decision itself.
+        if (paidStatus === "paid") {
+            where.paidAt = { [Op.ne]: null };
+        } else if (paidStatus === "unpaid") {
+            where.status = "approved";
+            where.paidAt = null;
         }
 
         const transport = await HrTransportRequest.findAll({
@@ -215,6 +224,8 @@ router.get("/transport", authenticateToken, authorizeRoles("hr", "accounting", "
             count: total,
             totalKm: enriched.reduce((s, r) => s + (r.kmDriven || 0), 0),
             totalAmount: enriched.reduce((s, r) => s + (r.totalAmount || 0), 0),
+            totalPaid: enriched.filter((r) => r.paidAt).reduce((s, r) => s + (r.totalAmount || 0), 0),
+            totalUnpaid: enriched.filter((r) => r.status === "approved" && !r.paidAt).reduce((s, r) => s + (r.totalAmount || 0), 0),
         };
 
         res.json({ success: true, items, total, page, pageSize, totals });
