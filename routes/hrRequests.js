@@ -36,19 +36,35 @@ function requireEmpNo(req, res) {
 // ============================================================
 // GET /vacation-balance -- read-only current annual-leave balance.
 //
-// CORRECTED: this used to read PayEmp.Vac_Bal, which is dead -- verified
-// live that it's 0 for every one of the 527 active employees company-wide,
-// not just the test account. The company's ERP has a full HR/payroll
-// vacation module (Pay_Vac / Pay_VacBal / dozens of HRP_*/Pay_Vac* stored
-// procs) that PayEmp.Vac_Bal was never wired up to. Pay_VacBal is a
-// proper per-employee, per-year, per-leave-type ledger (YearBal/
-// OpeningBal/ConsBal/DueBal); Pay_Vac (the type lookup) confirms only
-// Vac_Code=1 ("سنوية" / annual) has Vac_Bal=true -- every other leave
-// type (sick, maternity, condolence, unpaid, ...) has no running balance
-// concept in this company's configuration, matching the paper form's own
-// emphasis on an annual-leave balance. DueBal for the current year is
-// the "balance as of today" figure, confirmed against a real employee
-// (200231): PayEmp.Vac_Bal read 0, Pay_VacBal's 2026 row read DueBal=34.
+// CORRECTED (1st pass): this used to read PayEmp.Vac_Bal, which is dead --
+// verified live that it's 0 for every one of the 527 active employees
+// company-wide, not just the test account. The company's ERP has a full
+// HR/payroll vacation module (Pay_Vac / Pay_VacBal / dozens of
+// HRP_*/Pay_Vac* stored procs) that PayEmp.Vac_Bal was never wired up to.
+//
+// CORRECTED (2nd pass): Pay_VacBal.DueBal is the full-year figure (as if
+// the whole year's entitlement had already accrued), not the balance as
+// of today -- confirmed this reads noticeably higher than what's actually
+// owed mid-year. The ERP's own HRP_GetVacBalance proc computes a proper
+// as-of-date figure (its @RemBal output param), prorating OpeningBal
+// across the elapsed portion of the year (from Jan 1, or hire date if
+// hired this year, through today) before adding adjustments and
+// RoundedBal and subtracting ConsBal (leave already taken/consumed). We
+// can't call that proc directly, though: it passes @EmpNo into a smallint
+// parameter slot of its own pay_GetAddSubVacs(@CompNo, @BalYear, @EmpNo,
+// @EmpNo) call (confirmed via that function's real signature --
+// (@CompNo, @pYear, @FVacType, @ToVac), i.e. a VacType *range*, not
+// EmpNo x2) -- a genuine bug in the vendor SP that overflows for any
+// EmpNo above 32767 (i.e. most active employees, verified live). So this
+// replicates the same formula directly against Pay_VacBal/PayEmp/Pay_Vac/
+// Pay_LevFreeHrsLog, using DATEDIFF in SQL (not JS Date math, to avoid
+// timezone/DST rounding).
+//
+// Per Jordanian labor practice, annual leave is accrued per completed
+// calendar month of service (not by exact day), so the elapsed/total
+// fraction uses DATEDIFF(month, ...) rather than DATEDIFF(day, ...) --
+// verified against real employees (200231: full-year DueBal=34, as-of
+// current-month balance≈27.75 at month 7 of 12).
 router.get("/vacation-balance", authenticateToken, async (req, res) => {
     const empNo = requireEmpNo(req, res);
     if (empNo === null) return;
@@ -57,10 +73,33 @@ router.get("/vacation-balance", authenticateToken, async (req, res) => {
             .input("empNo", empNo)
             .input("balYear", new Date().getFullYear())
             .query(`
-                SELECT DueBal FROM [DB].[dbo].[Pay_VacBal]
-                WHERE EmpNo = @empNo AND VacType = 1 AND BalYear = @balYear
+                DECLARE @ToDate smalldatetime = GETDATE();
+                SELECT
+                    CASE WHEN pv.Vac_Bal = 1 THEN
+                        (vb.OpeningBal *
+                            CAST(DATEDIFF(month,
+                                CASE WHEN pe.Apt_Date > CAST(@balYear AS varchar) + '-1-1' THEN pe.Apt_Date ELSE CAST(@balYear AS varchar) + '-1-1' END,
+                                CASE WHEN pe.Work_status = 0 THEN pe.Work_status_Date ELSE @ToDate END
+                            ) + 1 AS float)
+                            /
+                            CAST(DATEDIFF(month,
+                                CASE WHEN pe.Apt_Date > CAST(@balYear AS varchar) + '-1-1' THEN pe.Apt_Date ELSE CAST(@balYear AS varchar) + '-1-1' END,
+                                CAST(@balYear AS varchar) + '-12-31'
+                            ) + 1 AS float)
+                        )
+                        + ISNULL((
+                            SELECT SUM(Added_Hrs) FROM dbo.Pay_LevFreeHrsLog
+                            WHERE CompNo = vb.CompNo AND EmpNo = vb.EmpNo AND Vac_Type = vb.VacType AND Upd_Year = vb.BalYear AND Trans_Type = 2
+                        ), 0)
+                        + vb.RoundedBal - vb.ConsBal
+                    ELSE vb.DueBal END AS remainingBalance
+                FROM dbo.Pay_VacBal vb
+                INNER JOIN dbo.PayEmp pe ON vb.CompNo = pe.Comp_num AND vb.EmpNo = pe.Emp_num
+                INNER JOIN dbo.Pay_Vac pv ON vb.CompNo = pv.CompNo AND vb.VacType = pv.Vac_Code
+                WHERE vb.EmpNo = @empNo AND vb.VacType = 1 AND vb.BalYear = @balYear
             `));
-        res.json({ success: true, vacationBalance: result.recordset[0]?.DueBal ?? null });
+        const balance = result.recordset[0]?.remainingBalance;
+        res.json({ success: true, vacationBalance: balance != null ? Math.round(balance * 100) / 100 : null });
     } catch (err) {
         console.error("❌ HR VACATION BALANCE ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to fetch vacation balance" });
