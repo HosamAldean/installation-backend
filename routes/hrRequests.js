@@ -47,10 +47,11 @@ function requireEmpNo(req, res) {
 // of today -- confirmed this reads noticeably higher than what's actually
 // owed mid-year. The ERP's own HRP_GetVacBalance proc computes a proper
 // as-of-date figure (its @RemBal output param), prorating OpeningBal
-// across the elapsed portion of the year (from Jan 1, or hire date if
-// hired this year, through today) before adding adjustments and
-// RoundedBal and subtracting ConsBal (leave already taken/consumed). We
-// can't call that proc directly, though: it passes @EmpNo into a smallint
+// linearly across the elapsed days of the year (from Jan 1, or hire date
+// if hired this year, through today) before adding adjustments and
+// RoundedBal and subtracting ConsBal (leave already taken/consumed). This
+// is the ERP's own formula, reused as-is (per explicit direction) -- we
+// can't call the proc directly, though: it passes @EmpNo into a smallint
 // parameter slot of its own pay_GetAddSubVacs(@CompNo, @BalYear, @EmpNo,
 // @EmpNo) call (confirmed via that function's real signature --
 // (@CompNo, @pYear, @FVacType, @ToVac), i.e. a VacType *range*, not
@@ -58,13 +59,8 @@ function requireEmpNo(req, res) {
 // EmpNo above 32767 (i.e. most active employees, verified live). So this
 // replicates the same formula directly against Pay_VacBal/PayEmp/Pay_Vac/
 // Pay_LevFreeHrsLog, using DATEDIFF in SQL (not JS Date math, to avoid
-// timezone/DST rounding).
-//
-// Per Jordanian labor practice, annual leave is accrued per completed
-// calendar month of service (not by exact day), so the elapsed/total
-// fraction uses DATEDIFF(month, ...) rather than DATEDIFF(day, ...) --
-// verified against real employees (200231: full-year DueBal=34, as-of
-// current-month balance≈27.75 at month 7 of 12).
+// timezone/DST rounding) -- verified against real employees (200231:
+// full-year DueBal=34, as-of-today balance≈27.2).
 router.get("/vacation-balance", authenticateToken, async (req, res) => {
     const empNo = requireEmpNo(req, res);
     if (empNo === null) return;
@@ -77,12 +73,12 @@ router.get("/vacation-balance", authenticateToken, async (req, res) => {
                 SELECT
                     CASE WHEN pv.Vac_Bal = 1 THEN
                         (vb.OpeningBal *
-                            CAST(DATEDIFF(month,
+                            CAST(DATEDIFF(day,
                                 CASE WHEN pe.Apt_Date > CAST(@balYear AS varchar) + '-1-1' THEN pe.Apt_Date ELSE CAST(@balYear AS varchar) + '-1-1' END,
                                 CASE WHEN pe.Work_status = 0 THEN pe.Work_status_Date ELSE @ToDate END
                             ) + 1 AS float)
                             /
-                            CAST(DATEDIFF(month,
+                            CAST(DATEDIFF(day,
                                 CASE WHEN pe.Apt_Date > CAST(@balYear AS varchar) + '-1-1' THEN pe.Apt_Date ELSE CAST(@balYear AS varchar) + '-1-1' END,
                                 CAST(@balYear AS varchar) + '-12-31'
                             ) + 1 AS float)
