@@ -209,7 +209,7 @@ router.post("/orders/:orderNo/items", async (req, res) => {
         itemNo, height, width, qty,
         incolor, intype, inthickness, spacer,
         outcolor, outtype, outthickness,
-        section, shape, note, expectdate, status, person, dept,
+        section, shape, note, expectdate, status, person, dept, financialNotes,
     } = req.body;
     if (!height || !width || !qty || parseFloat(qty) <= 0) {
         return res.status(400).json({ success: false, message: "height, width, and a positive qty are required" });
@@ -256,13 +256,14 @@ router.post("/orders/:orderNo/items", async (req, res) => {
                     .input("person", person || null)
                     .input("dept", dept || null)
                     .input("barcode", barcode)
+                    .input("financialNotes", financialNotes || null)
                     .query(`
                         INSERT INTO Sorderdetails
                             (orderNo, serialNo, itemNo, height, width, qty, incolor, intype, inthickness, spacer,
-                             outcolor, outtype, outthickness, section, shape, note, expectdate, status, person, dept, barcode)
+                             outcolor, outtype, outthickness, section, shape, note, expectdate, status, person, dept, barcode, [financial notes])
                         VALUES
                             (@orderNo, @serialNo, @itemNo, @height, @width, @qty, @incolor, @intype, @inthickness, @spacer,
-                             @outcolor, @outtype, @outthickness, @section, @shape, @note, @expectdate, @status, @person, @dept, @barcode)
+                             @outcolor, @outtype, @outthickness, @section, @shape, @note, @expectdate, @status, @person, @dept, @barcode, @financialNotes)
                     `);
 
                 await transaction.commit();
@@ -292,6 +293,13 @@ router.post("/orders/:orderNo/items", async (req, res) => {
 // descriptive text. expectdate is excluded too: it gates /reports/overdue
 // and /not-received's bucketing, so editing it after the fact could hide
 // or manufacture an overdue item.
+//
+// financialNotes ([financial notes]) added: a plain descriptive note column
+// that was previously readable via GET /orders/:orderNo/items but had no
+// write path at all — not in this whitelist, not even in the POST create
+// INSERT — making it settable only by direct DB edit despite the API
+// returning it. Safe to whitelist: free text, not read by computeBilling()
+// or any report-bucketing logic.
 router.put("/orders/:orderNo/items/:serialNo", async (req, res) => {
     const orderNo = parseInt(req.params.orderNo);
     const serialNo = parseInt(req.params.serialNo);
@@ -300,7 +308,7 @@ router.put("/orders/:orderNo/items/:serialNo", async (req, res) => {
     }
     const {
         itemNo, incolor, inthickness, outcolor, outthickness,
-        section, shape, note, status, person, dept,
+        section, shape, note, status, person, dept, financialNotes,
     } = req.body;
 
     try {
@@ -318,11 +326,13 @@ router.put("/orders/:orderNo/items/:serialNo", async (req, res) => {
             .input("status", status || null)
             .input("person", person || null)
             .input("dept", dept || null)
+            .input("financialNotes", financialNotes || null)
             .query(`
                 UPDATE Sorderdetails
                 SET itemNo = @itemNo, incolor = @incolor, inthickness = @inthickness,
                     outcolor = @outcolor, outthickness = @outthickness, section = @section,
-                    shape = @shape, note = @note, status = @status, person = @person, dept = @dept
+                    shape = @shape, note = @note, status = @status, person = @person, dept = @dept,
+                    [financial notes] = @financialNotes
                 WHERE orderNo = @orderNo AND serialNo = @serialNo
             `));
         if (!result.rowsAffected[0]) {
@@ -745,6 +755,7 @@ router.get("/barcode/:barcode", async (req, res) => {
                     o.projNo, o.projName, o.orderNo, d.serialNo, d.section, d.shape, d.spacer,
                     d.height, d.width, d.itemNo, d.qty, d.barcode, d.incolor, d.intype, d.inthickness,
                     d.outcolor, d.outtype, d.outthickness, o.JPO, o.ProdctionNO,
+                    d.note, d.status, d.person, d.dept, d.expectdate,
                     ISNULL(s.QTYIN, 0) AS receivedQty,
                     ISNULL(g.shippedQty, 0) AS shippedQty,
                     ISNULL(s.QTYIN, 0) - ISNULL(g.shippedQty, 0) AS remainingToShip
