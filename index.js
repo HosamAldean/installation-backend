@@ -34,6 +34,10 @@ import glassRouter from "./routes/glass.js";
 import stockHouseRouter from "./routes/stockHouse.js";
 import projOrdersRouter from "./routes/projOrders.js";
 import ironRouter from "./routes/iron.js";
+import projectsRouter from "./routes/projects.js";
+import clientsRouter, { archOfficesRouter } from "./routes/clients.js";
+import lookupsRouter from "./routes/lookups.js";
+import hrRequestsRouter from "./routes/hrRequests.js";
  // follow-up module
 
 // Models (named imports)
@@ -140,6 +144,11 @@ app.use("/api/glass", glassRouter);
 app.use("/api/stock-house", stockHouseRouter);
 app.use("/api/proj-orders", projOrdersRouter);
 app.use("/api/iron", ironRouter);
+app.use("/api/projects", projectsRouter);
+app.use("/api/clients", clientsRouter);
+app.use("/api/arch-offices", archOfficesRouter);
+app.use("/api/lookups", lookupsRouter);
+app.use("/api/hr-requests", hrRequestsRouter);
 
 app.use("/api", apiRouter);
 app.use('/instOrders', instOrdersRouter);
