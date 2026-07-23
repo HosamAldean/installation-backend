@@ -16,6 +16,11 @@ import { InstOrderHolds } from "./instOrderHolds.js";
 import { InstTeamCheckpoints } from "./instTeamCheckpoints.js";
 import { InstTeams } from "./InstTeams.js";
 import { FollowUpNotes } from "./FollowUpNotes.js";
+import { HrLeaveRequest } from "./HrLeaveRequest.js";
+import { HrAttendanceCorrectionRequest } from "./HrAttendanceCorrectionRequest.js";
+import { HrAttendanceCorrectionRow } from "./HrAttendanceCorrectionRow.js";
+import { HrTransportRequest } from "./HrTransportRequest.js";
+import { HrTransportAccompanier } from "./HrTransportAccompanier.js";
 
 
 // --------------------------------------
@@ -32,7 +37,12 @@ export {
     InstOrderHolds,
     InstTeamCheckpoints,
     InstTeams,
-    FollowUpNotes
+    FollowUpNotes,
+    HrLeaveRequest,
+    HrAttendanceCorrectionRequest,
+    HrAttendanceCorrectionRow,
+    HrTransportRequest,
+    HrTransportAccompanier
 };
 
 
@@ -179,4 +189,30 @@ InstOrderHolds.belongsTo(InstOrders, {
 InstOrders.hasMany(InstOrderHolds, {
     foreignKey: "instOrderId",
     as: "holds"
+});
+
+
+// ----------------------------------------------------
+// 9) HR requests (both sides on the same sequelizeUtf8 connection --
+// unlike everything above, which is application-level joined against
+// PayEmp/Pay_Job on a separate SQL Server connection)
+// ----------------------------------------------------
+HrAttendanceCorrectionRequest.hasMany(HrAttendanceCorrectionRow, {
+    foreignKey: "requestId",
+    as: "rows"
+});
+
+HrAttendanceCorrectionRow.belongsTo(HrAttendanceCorrectionRequest, {
+    foreignKey: "requestId",
+    as: "request"
+});
+
+HrTransportRequest.hasMany(HrTransportAccompanier, {
+    foreignKey: "requestId",
+    as: "accompaniers"
+});
+
+HrTransportAccompanier.belongsTo(HrTransportRequest, {
+    foreignKey: "requestId",
+    as: "request"
 });

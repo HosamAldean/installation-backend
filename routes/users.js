@@ -5,6 +5,7 @@ import { Op } from 'sequelize'
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import { authenticateToken, authorizeRoles } from '../middleware/auth.js';
+import { isSupervisorOf, getSupervisedEmpNos } from '../utils/supervisorLookup.js';
 
 const router = express.Router();
 
@@ -17,6 +18,29 @@ const router = express.Router();
 ---------------------------------- */
 const requireAuth = authenticateToken;
 const requireAdmin = authorizeRoles('admin');
+
+// Privileged roles that only an actual admin account may grant, revoke, or
+// touch at all -- CORRECTED: this whole file used to gate every write
+// action to the 'admin' role or a hardcoded 'installation_manager' special
+// case. Per explicit direction, "manager" access is now data-driven (same
+// PayEmp.Supervisor_No relationship used for HR-request approval routing
+// in routes/hrRequests.js) rather than role-based: any employee who
+// supervises at least one other employee can create/manage accounts for
+// their own reports, but granting hr/admin, or touching an existing
+// hr/admin account at all, stays admin-only. hr_manager is treated
+// identically to hr throughout this file (same company-wide scope, same
+// privilege) -- it's a senior HR role, not a differently-scoped one.
+const PRIVILEGED_ROLES = ['admin', 'hr', 'hr_manager'];
+
+// admin and hr(_manager) get company-wide scope (any employee, not just
+// their own reports) for listing/creating/managing user accounts -- HR
+// realistically onboards people across the whole company, not just people
+// who report to HR itself. Granting the admin/hr role to someone else is
+// still admin-only (see PRIVILEGED_ROLES above) -- this is about *whose*
+// accounts you can touch, not *what* you can turn them into.
+function hasCompanyWideScope(role) {
+    return role === 'admin' || role === 'hr' || role === 'hr_manager';
+}
 
 /* ----------------------------------
    GET current user
@@ -48,28 +72,42 @@ router.get('/me', requireAuth, async (req, res) => {
 });
 
 /* ----------------------------------
-   LIST users (Admin / Manager)
+   LIST users (Admin sees everyone; any manager sees only the users
+   under them, per PayEmp.Supervisor_No)
 ---------------------------------- */
 router.get('/', requireAuth, async (req, res) => {
     try {
-        if (!['admin', 'installation_manager'].includes(req.user.role))
-            return res.status(403).json({ success: false, message: 'Forbidden' });
+        let supervisedUsernames = null; // null = no restriction (admin/hr)
+        if (!hasCompanyWideScope(req.user.role)) {
+            const supervisorEmpNo = req.user.assignedEmpNo ? parseInt(req.user.assignedEmpNo) : null;
+            const supervisedEmpNos = await getSupervisedEmpNos(supervisorEmpNo);
+            if (supervisedEmpNos.length === 0) {
+                return res.json({ success: true, users: [], total: 0, page: 1, pageSize: 50 });
+            }
+            // username is the empNo as a string for employee-linked accounts
+            // (see POST '/' below) -- that's the only join key available
+            // between InsUser (MySQL) and PayEmp (ERP SQL Server).
+            supervisedUsernames = supervisedEmpNos.map(String);
+        }
 
         // Was silently ignored — a duplicate, dead GET '/' handler further
         // down this file supported ?search=, but Express only ever dispatches
         // to the first matching route, so admin/Users.tsx's search box never
         // actually filtered anything server-side.
         const search = String(req.query.search || '').trim();
-        const where = search
-            ? {
+        const conditions = [];
+        if (supervisedUsernames) conditions.push({ username: { [Op.in]: supervisedUsernames } });
+        if (search) {
+            conditions.push({
                 [Op.or]: [
                     { username: { [Op.like]: `%${search}%` } },
                     { firstName: { [Op.like]: `%${search}%` } },
                     { lastName: { [Op.like]: `%${search}%` } },
                     { email: { [Op.like]: `%${search}%` } },
                 ],
-            }
-            : undefined;
+            });
+        }
+        const where = conditions.length ? { [Op.and]: conditions } : undefined;
 
         const page = Math.max(1, parseInt(req.query.page) || 1);
         const pageSize = Math.min(200, Math.max(1, parseInt(req.query.pageSize) || 50));
@@ -102,12 +140,33 @@ router.get('/', requireAuth, async (req, res) => {
 });
 
 /* ----------------------------------
-   CREATE user (Admin)
+   CREATE user (Admin/HR: any employee company-wide; Manager: only their
+   own reports; only an actual admin may assign an hr/admin role --
+   see PRIVILEGED_ROLES/hasCompanyWideScope above)
 ---------------------------------- */
-// CREATE user (Admin)
-router.post('/', requireAuth, requireAdmin, async (req, res) => {
+router.post('/', requireAuth, async (req, res) => {
     try {
         const { empNo, role = 'user', teamId: bodyTeamId, password: bodyPassword, assignedStore } = req.body;
+        const isAdmin = req.user.role === 'admin';
+
+        if (!isAdmin && PRIVILEGED_ROLES.includes(role)) {
+            return res.status(403).json({ success: false, message: 'Only an admin can assign this role' });
+        }
+
+        if (!hasCompanyWideScope(req.user.role)) {
+            // Managers can only create accounts linked to a real employee
+            // they supervise -- the free-form username/password path below
+            // has no employee link to scope against, so it stays
+            // admin/hr-only.
+            if (!empNo) {
+                return res.status(403).json({ success: false, message: 'Forbidden' });
+            }
+            const supervisorEmpNo = req.user.assignedEmpNo ? parseInt(req.user.assignedEmpNo) : null;
+            const allowed = await isSupervisorOf(supervisorEmpNo, parseInt(empNo));
+            if (!allowed) {
+                return res.status(403).json({ success: false, message: 'You can only create accounts for employees who report to you' });
+            }
+        }
 
         let username, firstName, lastName, email, password, teamId;
 
@@ -186,18 +245,43 @@ router.post('/', requireAuth, requireAdmin, async (req, res) => {
 
 
 /* ----------------------------------
-   UPDATE user (Admin / Self)
+   UPDATE user (Admin/HR: anyone company-wide; Self: own profile fields;
+   Manager: users under them, minus hr/admin fields and accounts --
+   see PRIVILEGED_ROLES). Only an actual admin may touch an existing
+   hr/admin account or grant those roles -- HR's company-wide scope
+   covers onboarding, not managing other HR/admin accounts.
 ---------------------------------- */
 router.patch('/:id', requireAuth, async (req, res) => {
     try {
         const { id } = req.params;
-
-        if (req.user.userId !== Number(id) && req.user.role !== 'admin')
-            return res.status(403).json({ success: false, message: 'Forbidden' });
+        const isAdmin = req.user.role === 'admin';
+        const isSelf = req.user.userId === Number(id);
+        const hasScope = hasCompanyWideScope(req.user.role);
 
         const user = await User.findByPk(id);
         if (!user)
             return res.status(404).json({ success: false, message: 'User not found' });
+
+        let isManagerOfTarget = false;
+        if (!hasScope && !isSelf) {
+            // A manager may never touch an existing hr/admin account, even
+            // if PayEmp.Supervisor_No happens to say they supervise that
+            // person -- only an actual admin can manage privileged accounts.
+            if (PRIVILEGED_ROLES.includes(user.role)) {
+                return res.status(403).json({ success: false, message: 'Forbidden' });
+            }
+            const supervisorEmpNo = req.user.assignedEmpNo ? parseInt(req.user.assignedEmpNo) : null;
+            const targetEmpNo = Number(user.username);
+            isManagerOfTarget = !isNaN(targetEmpNo) && await isSupervisorOf(supervisorEmpNo, targetEmpNo);
+            if (!isManagerOfTarget) {
+                return res.status(403).json({ success: false, message: 'Forbidden' });
+            }
+        }
+        // hr touching an existing admin/hr account is still blocked, even
+        // though hr has company-wide scope for ordinary employees.
+        if (hasScope && !isAdmin && !isSelf && PRIVILEGED_ROLES.includes(user.role)) {
+            return res.status(403).json({ success: false, message: 'Forbidden' });
+        }
 
         const {
             firstName,
@@ -215,9 +299,15 @@ router.patch('/:id', requireAuth, async (req, res) => {
         if (email !== undefined) user.email = email;
         if (avatarUrl !== undefined) user.avatarUrl = avatarUrl;
 
-        // admin-only fields
-        if (req.user.role === 'admin') {
-            if (role !== undefined) user.role = role;
+        // Fields a manager/hr can also set for reports they're allowed to
+        // touch, not just admin
+        if (hasScope || isManagerOfTarget) {
+            if (role !== undefined) {
+                if (!isAdmin && PRIVILEGED_ROLES.includes(role)) {
+                    return res.status(403).json({ success: false, message: 'Only an admin can assign this role' });
+                }
+                user.role = role;
+            }
             if (teamId !== undefined) user.teamId = teamId;
             if (assignedStore !== undefined) user.assignedStore = assignedStore === null ? null : Number(assignedStore);
             if (active !== undefined) user.active = active;
@@ -273,9 +363,22 @@ router.delete('/:id', requireAuth, requireAdmin, async (req, res) => {
 });
 
 
-router.get('/employees', requireAuth, requireAdmin, async (req, res) => {
+// Admin: every unassigned employee company-wide (unchanged). Manager
+// (non-admin): only their own reports who don't have an account yet --
+// otherwise a manager could enroll anyone, defeating the whole point of
+// scoping create-user access to "employees under them."
+router.get('/employees', requireAuth, async (req, res) => {
     try {
         const { search = '' } = req.query;
+
+        let supervisedEmpNos = null;
+        if (!hasCompanyWideScope(req.user.role)) {
+            const supervisorEmpNo = req.user.assignedEmpNo ? parseInt(req.user.assignedEmpNo) : null;
+            supervisedEmpNos = await getSupervisedEmpNos(supervisorEmpNo);
+            if (supervisedEmpNos.length === 0) {
+                return res.json({ success: true, employees: [] });
+            }
+        }
 
         // 1️⃣ get existing usernames (empNo)
         const existingUsers = await User.findAll({
@@ -289,8 +392,14 @@ router.get('/employees', requireAuth, requireAdmin, async (req, res) => {
         const pool = await getSqlPool('erp');
         const sqlDB = process.env.MSSQL1_DB;
 
+        // CORRECTED: this used to also filter to Work_place='7200'
+        // (Installation Department only) and exclude job_code 191 --
+        // both removed per explicit direction, since any manager company-
+        // wide (not just Installation) needs to see their own reports here,
+        // and there was no clear reason left to exclude a specific job code
+        // once the department restriction itself was wrong.
         let query = `
-            SELECT 
+            SELECT
                 e.Emp_num AS empNo,
                 e.EmpEngName AS name_en,
                 e.EmpName AS name_ar,
@@ -299,12 +408,14 @@ router.get('/employees', requireAuth, requireAdmin, async (req, res) => {
             LEFT JOIN ${sqlDB}.dbo.Pay_Job j
                 ON e.Job_code = j.job_code AND j.Comp_num = '1'
             WHERE e.Work_status = '1'
-              AND e.Work_place = '7200'
-              AND e.job_code NOT IN ('191')
         `;
 
         if (usedEmpNos.length) {
             query += ` AND e.Emp_num NOT IN (${usedEmpNos.join(',')})`;
+        }
+
+        if (supervisedEmpNos) {
+            query += ` AND e.Emp_num IN (${supervisedEmpNos.length ? supervisedEmpNos.join(',') : 'NULL'})`;
         }
 
         if (search) {

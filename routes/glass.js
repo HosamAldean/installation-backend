@@ -102,6 +102,47 @@ router.get("/orders", async (req, res) => {
     }
 });
 
+// GET /api/glass/orders/:orderNo — single order header, same shape as the
+// list rows above. Used by report pages to deep-link straight into an
+// order's detail view without re-implementing the search-by-orderNo the
+// list endpoint doesn't support (it only searches projName/projNo/JPO).
+router.get("/orders/:orderNo", async (req, res) => {
+    const orderNo = parseInt(req.params.orderNo);
+    if (!Number.isInteger(orderNo)) {
+        return res.status(400).json({ success: false, message: "Invalid orderNo" });
+    }
+    try {
+        const result = await withSqlRetry("glass", (pool) => pool.request()
+            .input("orderNo", orderNo)
+            .query(`
+                SELECT
+                    o.orderNo, o.projNo, o.projName, o.projMgr, o.oderDate, o.JPO, o.ProdctionNO,
+                    ISNULL(lines.totalQty, 0) AS totalQty,
+                    ISNULL(received.totalReceived, 0) AS totalReceived,
+                    ISNULL(lines.lineCount, 0) AS lineCount
+                FROM Sorders o
+                LEFT JOIN (
+                    SELECT orderNo, SUM(qty) AS totalQty, COUNT(*) AS lineCount
+                    FROM Sorderdetails
+                    GROUP BY orderNo
+                ) lines ON lines.orderNo = o.orderNo
+                LEFT JOIN (
+                    SELECT OrderNo, SUM(QTYIN) AS totalReceived
+                    FROM SSTOCK
+                    GROUP BY OrderNo
+                ) received ON received.OrderNo = o.orderNo
+                WHERE o.orderNo = @orderNo
+            `));
+        if (result.recordset.length === 0) {
+            return res.status(404).json({ success: false, message: "Order not found" });
+        }
+        res.json({ success: true, order: result.recordset[0] });
+    } catch (err) {
+        console.error("❌ GLASS GET ORDER ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to fetch glass order" });
+    }
+});
+
 // POST /api/glass/orders — create a new order header (Sorders). orderNo is
 // an identity column, same as MinStock's STOCKO.orderNo.
 router.post("/orders", async (req, res) => {
@@ -209,7 +250,7 @@ router.post("/orders/:orderNo/items", async (req, res) => {
         itemNo, height, width, qty,
         incolor, intype, inthickness, spacer,
         outcolor, outtype, outthickness,
-        section, shape, note, expectdate, status, person, dept,
+        section, shape, note, expectdate, status, person, dept, financialNotes,
     } = req.body;
     if (!height || !width || !qty || parseFloat(qty) <= 0) {
         return res.status(400).json({ success: false, message: "height, width, and a positive qty are required" });
@@ -256,13 +297,14 @@ router.post("/orders/:orderNo/items", async (req, res) => {
                     .input("person", person || null)
                     .input("dept", dept || null)
                     .input("barcode", barcode)
+                    .input("financialNotes", financialNotes || null)
                     .query(`
                         INSERT INTO Sorderdetails
                             (orderNo, serialNo, itemNo, height, width, qty, incolor, intype, inthickness, spacer,
-                             outcolor, outtype, outthickness, section, shape, note, expectdate, status, person, dept, barcode)
+                             outcolor, outtype, outthickness, section, shape, note, expectdate, status, person, dept, barcode, [financial notes])
                         VALUES
                             (@orderNo, @serialNo, @itemNo, @height, @width, @qty, @incolor, @intype, @inthickness, @spacer,
-                             @outcolor, @outtype, @outthickness, @section, @shape, @note, @expectdate, @status, @person, @dept, @barcode)
+                             @outcolor, @outtype, @outthickness, @section, @shape, @note, @expectdate, @status, @person, @dept, @barcode, @financialNotes)
                     `);
 
                 await transaction.commit();
@@ -292,6 +334,13 @@ router.post("/orders/:orderNo/items", async (req, res) => {
 // descriptive text. expectdate is excluded too: it gates /reports/overdue
 // and /not-received's bucketing, so editing it after the fact could hide
 // or manufacture an overdue item.
+//
+// financialNotes ([financial notes]) added: a plain descriptive note column
+// that was previously readable via GET /orders/:orderNo/items but had no
+// write path at all — not in this whitelist, not even in the POST create
+// INSERT — making it settable only by direct DB edit despite the API
+// returning it. Safe to whitelist: free text, not read by computeBilling()
+// or any report-bucketing logic.
 router.put("/orders/:orderNo/items/:serialNo", async (req, res) => {
     const orderNo = parseInt(req.params.orderNo);
     const serialNo = parseInt(req.params.serialNo);
@@ -300,7 +349,7 @@ router.put("/orders/:orderNo/items/:serialNo", async (req, res) => {
     }
     const {
         itemNo, incolor, inthickness, outcolor, outthickness,
-        section, shape, note, status, person, dept,
+        section, shape, note, status, person, dept, financialNotes,
     } = req.body;
 
     try {
@@ -318,11 +367,13 @@ router.put("/orders/:orderNo/items/:serialNo", async (req, res) => {
             .input("status", status || null)
             .input("person", person || null)
             .input("dept", dept || null)
+            .input("financialNotes", financialNotes || null)
             .query(`
                 UPDATE Sorderdetails
                 SET itemNo = @itemNo, incolor = @incolor, inthickness = @inthickness,
                     outcolor = @outcolor, outthickness = @outthickness, section = @section,
-                    shape = @shape, note = @note, status = @status, person = @person, dept = @dept
+                    shape = @shape, note = @note, status = @status, person = @person, dept = @dept,
+                    [financial notes] = @financialNotes
                 WHERE orderNo = @orderNo AND serialNo = @serialNo
             `));
         if (!result.rowsAffected[0]) {
@@ -658,6 +709,7 @@ router.put("/orders/:orderNo/appointments", async (req, res) => {
 router.get("/ready-to-ship", async (req, res) => {
     try {
         const orderNo = req.query.orderNo ? parseInt(req.query.orderNo) : null;
+        const { page, pageSize } = parsePagination(req.query);
 
         const result = await withSqlRetry("glass", (pool) => {
             const request = pool.request();
@@ -687,7 +739,9 @@ router.get("/ready-to-ship", async (req, res) => {
             `);
         });
 
-        res.json({ success: true, items: result.recordset });
+        const totalRemaining = result.recordset.reduce((sum, it) => sum + it.remainingToShip, 0);
+        const { pageItems, total } = paginate(result.recordset, page, pageSize);
+        res.json({ success: true, items: pageItems, total, page, pageSize, totalRemaining });
     } catch (err) {
         console.error("❌ GLASS READY-TO-SHIP ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to fetch ready-to-ship items" });
@@ -745,6 +799,7 @@ router.get("/barcode/:barcode", async (req, res) => {
                     o.projNo, o.projName, o.orderNo, d.serialNo, d.section, d.shape, d.spacer,
                     d.height, d.width, d.itemNo, d.qty, d.barcode, d.incolor, d.intype, d.inthickness,
                     d.outcolor, d.outtype, d.outthickness, o.JPO, o.ProdctionNO,
+                    d.note, d.status, d.person, d.dept, d.expectdate,
                     ISNULL(s.QTYIN, 0) AS receivedQty,
                     ISNULL(g.shippedQty, 0) AS shippedQty,
                     ISNULL(s.QTYIN, 0) - ISNULL(g.shippedQty, 0) AS remainingToShip
@@ -823,6 +878,25 @@ const SCHOCO_AREA_RATE = { "15": 9.45, "20": 12 };
 const SCHOCO_QTY_RATE = { "15": 9, "20": 9.6 };
 
 const round3 = (n) => Math.round(n * 1000) / 1000;
+
+// Report tables were rendering unbounded result sets as raw <table> rows on
+// the frontend (Billing hit 1,325 project rows, Ready to Ship 1,256 items)
+// and visibly lagging as a result. Every report endpoint below now slices
+// its result to a page after computing totals from the full set, so totals
+// stay accurate while only one page's worth of rows is ever sent down.
+const DEFAULT_REPORT_PAGE_SIZE = 30;
+const MAX_REPORT_PAGE_SIZE = 200;
+function parsePagination(query) {
+    const page = Math.max(1, parseInt(query.page) || 1);
+    const pageSize = Math.min(MAX_REPORT_PAGE_SIZE, Math.max(1, parseInt(query.pageSize) || DEFAULT_REPORT_PAGE_SIZE));
+    return { page, pageSize };
+}
+function paginate(fullArray, page, pageSize) {
+    return {
+        pageItems: fullArray.slice((page - 1) * pageSize, page * pageSize),
+        total: fullArray.length,
+    };
+}
 
 // Computes the same derived billing fields as Check1, given a Sorderdetails
 // row (height/width/qty/spacer/intype/outtype plus the billing input
@@ -987,6 +1061,7 @@ router.post("/orders/:orderNo/bills", async (req, res) => {
 router.get("/reports/status", async (req, res) => {
     try {
         const { dateFrom, dateTo, projNo } = req.query;
+        const { page, pageSize } = parsePagination(req.query);
         const result = await withSqlRetry("glass", (pool) => {
             const request = pool.request();
             const conditions = [];
@@ -1035,7 +1110,8 @@ router.get("/reports/status", async (req, res) => {
             fullyReceivedOrders: acc.fullyReceivedOrders + (o.lineCount > 0 && o.fullyReceivedLines >= o.lineCount ? 1 : 0),
         }), { totalQty: 0, totalReceived: 0, orderCount: 0, fullyReceivedOrders: 0 });
 
-        res.json({ success: true, orders, totals });
+        const { pageItems, total } = paginate(orders, page, pageSize);
+        res.json({ success: true, orders: pageItems, totals, total, page, pageSize });
     } catch (err) {
         console.error("❌ GLASS STATUS REPORT ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to fetch status report" });
@@ -1043,12 +1119,27 @@ router.get("/reports/status", async (req, res) => {
 });
 
 // GET /api/glass/reports/billing?dateFrom=&dateTo=&projNo= — computed
-// (priced-but-maybe-not-yet-invoiced) totals vs. actually invoiced (SBill)
-// totals, grouped by project, so outstanding-to-invoice stands out.
+// (priced-but-maybe-not-yet-invoiced) totals vs. actually invoiced totals,
+// grouped by project, so outstanding-to-invoice stands out.
+//
+// CORRECTED: this used to read only Sorderdetails.price/SBill (the "current"
+// system this whole module manages) on the assumption that orders/
+// orderdetails/CheckBill/Bill were a dead pre-cutover archive. Verified live
+// against the database that assumption was wrong: orders had 773 new rows
+// and Bill had 212 new invoice entries in just the last 6-12 months —
+// that legacy pipeline is still how billing actually gets entered (in
+// occasional batches, per the person who confirmed this), while nobody has
+// ever billed through Sorderdetails.price. orderNo is a disjoint identity
+// sequence between the two systems (never overlaps), but projNo is shared
+// for the same real project across both (60+ confirmed), so that's the only
+// safe join key. Both sources are now included and kept visibly split
+// (current vs legacy) rather than silently blended, since they're two
+// independently-computed pricing systems.
 router.get("/reports/billing", async (req, res) => {
     try {
         const { dateFrom, dateTo, projNo } = req.query;
-        const { itemsResult, billsResult } = await withSqlRetry("glass", async (pool) => {
+        const { page, pageSize } = parsePagination(req.query);
+        const { itemsResult, billsResult, legacyItemsResult, legacyBillsResult } = await withSqlRetry("glass", async (pool) => {
             const itemsRequest = pool.request();
             const itemConditions = ["d.price IS NOT NULL"];
             if (dateFrom) { itemsRequest.input("dateFrom", dateFrom); itemConditions.push("o.oderDate >= @dateFrom"); }
@@ -1077,27 +1168,80 @@ router.get("/reports/billing", async (req, res) => {
                 GROUP BY o.projNo, o.projName
             `);
 
-            return { itemsResult, billsResult };
+            const legacyItemsRequest = pool.request();
+            const legacyItemConditions = [];
+            if (dateFrom) { legacyItemsRequest.input("dateFrom", dateFrom); legacyItemConditions.push("o.oderDate >= @dateFrom"); }
+            if (dateTo) { legacyItemsRequest.input("dateTo", dateTo); legacyItemConditions.push("o.oderDate <= @dateTo"); }
+            if (projNo) { legacyItemsRequest.input("projNo", `%${projNo}%`); legacyItemConditions.push("o.projNo LIKE @projNo"); }
+            const legacyItemsWhereClause = legacyItemConditions.length ? `WHERE ${legacyItemConditions.join(" AND ")}` : "";
+            const legacyItemsResult = await legacyItemsRequest.query(`
+                SELECT o.projNo, o.projName, SUM(c.[total PU]) AS computedTotal
+                FROM CheckBill c
+                JOIN orders o ON o.orderNo = c.orderNo
+                ${legacyItemsWhereClause}
+                GROUP BY o.projNo, o.projName
+            `);
+
+            const legacyBillsRequest = pool.request();
+            const legacyBillConditions = [];
+            if (dateFrom) { legacyBillsRequest.input("dateFrom", dateFrom); legacyBillConditions.push("b.DateEnter >= @dateFrom"); }
+            if (dateTo) { legacyBillsRequest.input("dateTo", dateTo); legacyBillConditions.push("b.DateEnter <= @dateTo"); }
+            if (projNo) { legacyBillsRequest.input("projNo", `%${projNo}%`); legacyBillConditions.push("o.projNo LIKE @projNo"); }
+            const legacyBillsWhereClause = legacyBillConditions.length ? `WHERE ${legacyBillConditions.join(" AND ")}` : "";
+            const legacyBillsResult = await legacyBillsRequest.query(`
+                SELECT o.projNo, o.projName, SUM(b.Price) AS invoicedTotal, COUNT(*) AS billCount
+                FROM Bill b
+                JOIN orders o ON o.orderNo = b.orderNo
+                ${legacyBillsWhereClause}
+                GROUP BY o.projNo, o.projName
+            `);
+
+            return { itemsResult, billsResult, legacyItemsResult, legacyBillsResult };
+        });
+
+        const emptyEntry = (projNo, projName) => ({
+            projNo, projName,
+            currentComputedTotal: 0, legacyComputedTotal: 0,
+            currentInvoicedTotal: 0, legacyInvoicedTotal: 0,
+            currentBillCount: 0, legacyBillCount: 0,
         });
 
         const byProject = new Map();
         itemsResult.recordset.forEach(row => {
             const key = row.projNo;
             const { totalPU } = computeBilling(row);
-            const entry = byProject.get(key) || { projNo: row.projNo, projName: row.projName, computedTotal: 0, invoicedTotal: 0, billCount: 0 };
-            entry.computedTotal = round3(entry.computedTotal + totalPU);
+            const entry = byProject.get(key) || emptyEntry(row.projNo, row.projName);
+            entry.currentComputedTotal = round3(entry.currentComputedTotal + totalPU);
             byProject.set(key, entry);
         });
         billsResult.recordset.forEach(row => {
             const key = row.projNo;
-            const entry = byProject.get(key) || { projNo: row.projNo, projName: row.projName, computedTotal: 0, invoicedTotal: 0, billCount: 0 };
-            entry.invoicedTotal = round3(row.invoicedTotal || 0);
-            entry.billCount = row.billCount;
+            const entry = byProject.get(key) || emptyEntry(row.projNo, row.projName);
+            entry.currentInvoicedTotal = round3(row.invoicedTotal || 0);
+            entry.currentBillCount = row.billCount;
+            byProject.set(key, entry);
+        });
+        legacyItemsResult.recordset.forEach(row => {
+            const key = row.projNo;
+            const entry = byProject.get(key) || emptyEntry(row.projNo, row.projName);
+            entry.legacyComputedTotal = round3(row.computedTotal || 0);
+            byProject.set(key, entry);
+        });
+        legacyBillsResult.recordset.forEach(row => {
+            const key = row.projNo;
+            const entry = byProject.get(key) || emptyEntry(row.projNo, row.projName);
+            entry.legacyInvoicedTotal = round3(row.invoicedTotal || 0);
+            entry.legacyBillCount = row.billCount;
             byProject.set(key, entry);
         });
 
         const projects = Array.from(byProject.values())
-            .map(p => ({ ...p, outstanding: round3(p.computedTotal - p.invoicedTotal) }))
+            .map(p => {
+                const computedTotal = round3(p.currentComputedTotal + p.legacyComputedTotal);
+                const invoicedTotal = round3(p.currentInvoicedTotal + p.legacyInvoicedTotal);
+                const billCount = p.currentBillCount + p.legacyBillCount;
+                return { ...p, computedTotal, invoicedTotal, billCount, outstanding: round3(computedTotal - invoicedTotal) };
+            })
             .sort((a, b) => b.computedTotal - a.computedTotal);
 
         const totals = projects.reduce((acc, p) => ({
@@ -1106,7 +1250,8 @@ router.get("/reports/billing", async (req, res) => {
             outstanding: round3(acc.outstanding + p.outstanding),
         }), { computedTotal: 0, invoicedTotal: 0, outstanding: 0 });
 
-        res.json({ success: true, projects, totals });
+        const { pageItems, total } = paginate(projects, page, pageSize);
+        res.json({ success: true, projects: pageItems, totals, total, page, pageSize });
     } catch (err) {
         console.error("❌ GLASS BILLING REPORT ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to fetch billing report" });
@@ -1117,6 +1262,7 @@ router.get("/reports/billing", async (req, res) => {
 // yet fully received.
 router.get("/reports/overdue", async (req, res) => {
     try {
+        const { page, pageSize } = parsePagination(req.query);
         const result = await withSqlRetry("glass", (pool) => pool.request().query(`
             SELECT
                 d.orderNo, d.serialNo, d.itemNo, d.qty, d.expectdate, d.barcode,
@@ -1131,7 +1277,8 @@ router.get("/reports/overdue", async (req, res) => {
               AND ISNULL(s.QTYIN, 0) < d.qty
             ORDER BY d.expectdate ASC
         `));
-        res.json({ success: true, items: result.recordset });
+        const { pageItems, total } = paginate(result.recordset, page, pageSize);
+        res.json({ success: true, items: pageItems, total, page, pageSize });
     } catch (err) {
         console.error("❌ GLASS OVERDUE REPORT ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to fetch overdue report" });
@@ -1163,6 +1310,7 @@ router.get("/reports/overdue", async (req, res) => {
 router.get("/reports/factory-status", async (req, res) => {
     try {
         const { dateFrom, dateTo, projNo } = req.query;
+        const { page, pageSize } = parsePagination(req.query);
         const result = await withSqlRetry("glass", (pool) => {
             const request = pool.request();
             const conditions = [];
@@ -1196,7 +1344,8 @@ router.get("/reports/factory-status", async (req, res) => {
             return acc;
         }, { noDate: 0, late: 0, underWork: 0, finished: 0, taken: 0, onTrack: 0 });
 
-        res.json({ success: true, orders, totals });
+        const { pageItems, total } = paginate(orders, page, pageSize);
+        res.json({ success: true, orders: pageItems, totals, total, page, pageSize });
     } catch (err) {
         console.error("❌ GLASS FACTORY STATUS REPORT ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to fetch factory status report" });
@@ -1242,6 +1391,7 @@ router.get("/reports/factory-status", async (req, res) => {
 router.get("/reports/store", async (req, res) => {
     try {
         const { projNo } = req.query;
+        const { page, pageSize } = parsePagination(req.query);
         const result = await withSqlRetry("minstock", (pool) => {
             const request = pool.request();
             let whereClause = "";
@@ -1273,7 +1423,8 @@ router.get("/reports/store", async (req, res) => {
             entry.lineCount += 1;
         }
 
-        res.json({ success: true, items, projectTotals: Array.from(projectMap.values()) });
+        const { pageItems, total } = paginate(items, page, pageSize);
+        res.json({ success: true, items: pageItems, total, page, pageSize, projectTotals: Array.from(projectMap.values()) });
     } catch (err) {
         console.error("❌ GLASS STORE REPORT ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to fetch glass store report" });
