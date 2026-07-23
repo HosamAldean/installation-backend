@@ -24,16 +24,20 @@
 // orderNo 322633 serialNo 33 -> barcode 26263333.
 import express from "express";
 import { getSqlPool, withSqlRetry } from "../config/db.js";
-import { authenticateToken, authorizeRoles } from "../middleware/auth.js";
+import { authenticateToken, authorizeReadWrite } from "../middleware/auth.js";
 import { User } from "../models/User.js";
 
 const router = express.Router();
 
-// Production order intake sits upstream of installation tracking, which is
-// already gated to installation_manager/admin (see installationRequests.js,
-// instOrders.js) — mirrored here since there's no more specific "production
-// intake" role in the current taxonomy. Revisit if that turns out wrong.
-router.use(authenticateToken, authorizeRoles("installation_manager", "admin"));
+// Production order intake sits upstream of installation tracking. Now
+// owned by the dedicated "production" role (added once the taxonomy gap
+// noted below was actually revisited) -- installation_manager keeps
+// view-only access since they still need visibility into it, but edit
+// actions (POST/PUT) are production/admin only.
+router.use(authenticateToken, authorizeReadWrite(
+    ["installation_manager", "production", "admin"],
+    ["production", "admin"],
+));
 
 function buildBarcode(orderNo, serialNo) {
     const yy = String(new Date().getFullYear()).slice(-2);

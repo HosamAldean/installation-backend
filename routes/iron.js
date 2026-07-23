@@ -59,16 +59,20 @@
 //     respectively, confirmed live), not free text.
 import express from "express";
 import { withSqlRetry } from "../config/db.js";
-import { authenticateToken, authorizeRoles } from "../middleware/auth.js";
+import { authenticateToken, authorizeReadWrite } from "../middleware/auth.js";
 import { User } from "../models/User.js";
 import { pushFinishedUnitToMinStock } from "../utils/minStockSync.js";
 
 const router = express.Router();
 
-// No dedicated "Iron/steel department" role exists in the current taxonomy
-// (same situation Proj's order-intake routes were in) — gated to
-// installation_manager/admin for now; revisit if that turns out wrong.
-router.use(authenticateToken, authorizeRoles("installation_manager", "admin"));
+// Now owned by the dedicated "production" role (same taxonomy gap
+// projOrders.js was in, now revisited for both together).
+// installation_manager keeps view-only access; edit actions (POST/PUT/
+// DELETE) are production/admin only.
+router.use(authenticateToken, authorizeReadWrite(
+    ["installation_manager", "production", "admin"],
+    ["production", "admin"],
+));
 
 async function resolveUsername(req) {
     const user = await User.findByPk(req.user.userId, { attributes: ["username"] });
