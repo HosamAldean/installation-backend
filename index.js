@@ -221,9 +221,22 @@ import http from "http";
         };
 
         // HTTPS Server
-        https.createServer(sslOptions, app).listen(PORT, "0.0.0.0", () => {
-            console.log(`🔥 HTTPS Backend running on https://192.168.20.77:${PORT}`);
-        });
+        // .listen() binds asynchronously -- a failure (EADDRINUSE from the
+        // previous nodemon-restarted process not having released the port
+        // yet, EACCES, etc.) surfaces as an 'error' event on the server
+        // object, not a thrown exception the surrounding try/catch would
+        // ever see. Unhandled, Node's default EventEmitter behavior is to
+        // throw and crash the whole process with no logged cause -- which
+        // is exactly what nodemon's silent "app crashed" reports when this
+        // isn't listened for. Logging it here at least makes the failure
+        // diagnosable instead of an invisible crash.
+        https.createServer(sslOptions, app)
+            .on("error", (err) => {
+                console.error(`❌ HTTPS server failed to start on port ${PORT}:`, err.message);
+            })
+            .listen(PORT, "0.0.0.0", () => {
+                console.log(`🔥 HTTPS Backend running on https://192.168.20.77:${PORT}`);
+            });
 
         // Optional: HTTP redirect → HTTPS
         http.createServer((req, res) => {
@@ -231,9 +244,13 @@ import http from "http";
                 Location: `https://${req.headers.host.replace(/:\d+/, ":" + PORT)}${req.url}`
             });
             res.end();
-        }).listen(4001, "0.0.0.0", () => {
-            console.log("➡ HTTP redirect server on :4001 → HTTPS");
-        });
+        })
+            .on("error", (err) => {
+                console.error("❌ HTTP redirect server failed to start on port 4001:", err.message);
+            })
+            .listen(4001, "0.0.0.0", () => {
+                console.log("➡ HTTP redirect server on :4001 → HTTPS");
+            });
 
         // Start DB watcher to emit SSE when relevant tables change
         try {
