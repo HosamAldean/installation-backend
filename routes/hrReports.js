@@ -22,6 +22,7 @@ import {
     HrTransportAccompanier,
 } from "../models/index.js";
 import { resolveEmployeeNames } from "../utils/employeeLookup.js";
+import { resolveUserNames } from "../utils/userLookup.js";
 
 const router = express.Router();
 
@@ -164,8 +165,22 @@ router.get("/leave-attendance", authenticateToken, authorizeRoles("hr", "hr_mana
         if (dateTo) combined = combined.filter((r) => r.effectiveDate <= dateTo);
         combined.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 
-        const names = await resolveEmployeeNames(combined.map((r) => r.requesterEmpNo));
-        combined = combined.map((r) => ({ ...r, employee: names[r.requesterEmpNo] || null }));
+        // Manager approver is an ERP empNo (like the requester); HR reviewer
+        // is an InsUser.userId (HR staff are login accounts, not
+        // necessarily linked to a payroll record) -- two different lookups.
+        const [empNames, userNames] = await Promise.all([
+            resolveEmployeeNames([
+                ...combined.map((r) => r.requesterEmpNo),
+                ...combined.map((r) => r.managerApproverEmpNo),
+            ]),
+            resolveUserNames(combined.map((r) => r.hrReviewerUserId)),
+        ]);
+        combined = combined.map((r) => ({
+            ...r,
+            employee: empNames[r.requesterEmpNo] || null,
+            managerApprover: r.managerApproverEmpNo ? (empNames[r.managerApproverEmpNo] || null) : null,
+            hrApprover: r.hrReviewerUserId ? (userNames[r.hrReviewerUserId] || null) : null,
+        }));
 
         const total = combined.length;
         const items = combined.slice((page - 1) * pageSize, page * pageSize);
@@ -215,8 +230,25 @@ router.get("/transport", authenticateToken, authorizeRoles("hr", "hr_manager", "
             include: [{ model: HrTransportAccompanier, as: "accompaniers" }],
         });
 
-        const names = await resolveEmployeeNames(transport.map((r) => r.requesterEmpNo));
-        const enriched = transport.map((r) => ({ ...r.toJSON(), employee: names[r.requesterEmpNo] || null }));
+        const [empNames, userNames] = await Promise.all([
+            resolveEmployeeNames([
+                ...transport.map((r) => r.requesterEmpNo),
+                ...transport.map((r) => r.managerApproverEmpNo),
+            ]),
+            resolveUserNames([
+                ...transport.map((r) => r.hrAuditorUserId),
+                ...transport.map((r) => r.financeApproverUserId),
+                ...transport.map((r) => r.paidByUserId),
+            ]),
+        ]);
+        const enriched = transport.map((r) => ({
+            ...r.toJSON(),
+            employee: empNames[r.requesterEmpNo] || null,
+            managerApprover: r.managerApproverEmpNo ? (empNames[r.managerApproverEmpNo] || null) : null,
+            hrApprover: r.hrAuditorUserId ? (userNames[r.hrAuditorUserId] || null) : null,
+            financeApprover: r.financeApproverUserId ? (userNames[r.financeApproverUserId] || null) : null,
+            paidBy: r.paidByUserId ? (userNames[r.paidByUserId] || null) : null,
+        }));
 
         const total = enriched.length;
         const items = enriched.slice((page - 1) * pageSize, page * pageSize);
