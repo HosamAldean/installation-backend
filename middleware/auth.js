@@ -43,3 +43,23 @@ export const authorizeRoles = (...roles) => (req, res, next) => {
     }
     next();
 };
+
+// Read/write split authorization -- some pages need a role that can view
+// but not edit (e.g. installation_manager on Production Orders/Iron,
+// which moved to production-role ownership but installation_manager still
+// needs visibility). viewRoles must be the superset (anyone who can edit
+// can also view); GET/HEAD requests only need viewRoles, every other
+// method additionally requires editRoles.
+export const authorizeReadWrite = (viewRoles, editRoles) => (req, res, next) => {
+    if (!req.user) {
+        return res.status(401).json({ success: false, message: 'Not authenticated' });
+    }
+    if (!viewRoles.includes(req.user.role)) {
+        return res.status(403).json({ success: false, message: 'Forbidden' });
+    }
+    const isReadOnlyMethod = req.method === 'GET' || req.method === 'HEAD';
+    if (!isReadOnlyMethod && !editRoles.includes(req.user.role)) {
+        return res.status(403).json({ success: false, message: 'You have view-only access to this page' });
+    }
+    next();
+};
