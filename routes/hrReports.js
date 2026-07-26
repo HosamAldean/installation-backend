@@ -214,13 +214,15 @@ router.get("/transport", authenticateToken, authorizeRoles("hr", "hr_manager", "
             if (dateFrom) where.departureDate[Op.gte] = dateFrom;
             if (dateTo) where.departureDate[Op.lte] = dateTo;
         }
-        // Only meaningful for approved requests -- "paid" vs "unpaid" is
-        // Accounting's own follow-up confirmation (see mark-paid endpoint
-        // in hrRequests.js), not Finance's approval decision itself.
+        // "Paid" vs "not paid" is a simple paidAt split, not restricted to
+        // approved requests -- "not paid" covers everything still owed or
+        // pending (approved-but-unpaid, plus anything still in review),
+        // so the two buckets are exhaustive and never lose a row between
+        // them. Only approved requests can ever actually have paidAt set
+        // (see the mark-paid endpoint in hrRequests.js).
         if (paidStatus === "paid") {
             where.paidAt = { [Op.ne]: null };
         } else if (paidStatus === "unpaid") {
-            where.status = "approved";
             where.paidAt = null;
         }
 
@@ -257,7 +259,7 @@ router.get("/transport", authenticateToken, authorizeRoles("hr", "hr_manager", "
             totalKm: enriched.reduce((s, r) => s + (r.kmDriven || 0), 0),
             totalAmount: enriched.reduce((s, r) => s + (r.totalAmount || 0), 0),
             totalPaid: enriched.filter((r) => r.paidAt).reduce((s, r) => s + (r.totalAmount || 0), 0),
-            totalUnpaid: enriched.filter((r) => r.status === "approved" && !r.paidAt).reduce((s, r) => s + (r.totalAmount || 0), 0),
+            totalUnpaid: enriched.filter((r) => !r.paidAt).reduce((s, r) => s + (r.totalAmount || 0), 0),
         };
 
         res.json({ success: true, items, total, page, pageSize, totals });
