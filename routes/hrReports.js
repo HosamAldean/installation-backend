@@ -124,7 +124,7 @@ router.get("/summary", authenticateToken, authorizeRoles("hr", "hr_manager", "ad
 router.get("/leave-attendance", authenticateToken, authorizeRoles("hr", "hr_manager", "admin"), async (req, res) => {
     try {
         const { page, pageSize } = parsePagination(req.query);
-        const { status, type, dateFrom, dateTo, search } = req.query;
+        const { status, type, dateFrom, dateTo, search, exported } = req.query;
 
         const empNoFilter = await resolveSearchToEmpNos(search);
         if (empNoFilter && empNoFilter.length === 0) {
@@ -134,6 +134,11 @@ router.get("/leave-attendance", authenticateToken, authorizeRoles("hr", "hr_mana
         const where = {};
         if (status) where.status = status;
         if (empNoFilter) where.requesterEmpNo = { [Op.in]: empNoFilter };
+        // Defaults to unset (no filter) unless the caller explicitly asks --
+        // the report page itself defaults its own UI to "no" so a fresh
+        // export naturally only grabs new records, see mark-exported below.
+        if (exported === "no") where.exportedAt = null;
+        else if (exported === "yes") where.exportedAt = { [Op.ne]: null };
 
         const [leave, attendance] = await Promise.all([
             (!type || type === "leave")
@@ -199,7 +204,7 @@ router.get("/leave-attendance", authenticateToken, authorizeRoles("hr", "hr_mana
 router.get("/transport", authenticateToken, authorizeRoles("hr", "hr_manager", "accounting", "accounting_manager", "admin"), async (req, res) => {
     try {
         const { page, pageSize } = parsePagination(req.query);
-        const { status, dateFrom, dateTo, search, paidStatus } = req.query;
+        const { status, dateFrom, dateTo, search, paidStatus, exported } = req.query;
 
         const empNoFilter = await resolveSearchToEmpNos(search);
         if (empNoFilter && empNoFilter.length === 0) {
@@ -225,6 +230,8 @@ router.get("/transport", authenticateToken, authorizeRoles("hr", "hr_manager", "
         } else if (paidStatus === "unpaid") {
             where.paidAt = null;
         }
+        if (exported === "no") where.exportedAt = null;
+        else if (exported === "yes") where.exportedAt = { [Op.ne]: null };
 
         const transport = await HrTransportRequest.findAll({
             where,
@@ -266,6 +273,97 @@ router.get("/transport", authenticateToken, authorizeRoles("hr", "hr_manager", "
     } catch (err) {
         console.error("❌ HR TRANSPORT REPORT ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to fetch transport report" });
+    }
+});
+
+// ============================================================
+// PUT /leave-attendance/mark-exported -- marks all currently-unexported
+// leave/attendance rows matching the given filters as exported (sets
+// exportedAt = NOW()). Same filter semantics as the GET endpoint above
+// (minus `exported` itself, since this only ever targets unexported
+// rows) -- called after a CSV/PDF export completes so a fresh export
+// naturally only grabs new records next time.
+// ============================================================
+router.put("/leave-attendance/mark-exported", authenticateToken, authorizeRoles("hr", "hr_manager", "admin"), async (req, res) => {
+    try {
+        const { status, type, dateFrom, dateTo, search } = req.body;
+
+        const empNoFilter = await resolveSearchToEmpNos(search);
+        if (empNoFilter && empNoFilter.length === 0) {
+            return res.json({ success: true, count: 0 });
+        }
+
+        const where = { exportedAt: null };
+        if (status) where.status = status;
+        if (empNoFilter) where.requesterEmpNo = { [Op.in]: empNoFilter };
+
+        // dateFrom/dateTo filter on effectiveDate (fromDate for a leave
+        // request, createdAt for a departure or attendance correction --
+        // same computed field the GET endpoint uses), not a plain column,
+        // so it can't fold into the SQL where above -- fetch ids first,
+        // filter in JS, then bulk-update by id.
+        const [leave, attendance] = await Promise.all([
+            (!type || type === "leave")
+                ? HrLeaveRequest.findAll({ where, attributes: ["id", "kind", "fromDate", "createdAt"] })
+                : [],
+            (!type || type === "attendance")
+                ? HrAttendanceCorrectionRequest.findAll({ where, attributes: ["id", "createdAt"] })
+                : [],
+        ]);
+
+        const inRange = (d) => (!dateFrom || d >= dateFrom) && (!dateTo || d <= dateTo);
+        const leaveIds = leave
+            .filter((r) => inRange(r.kind === "leave" ? r.fromDate : r.createdAt.toISOString().slice(0, 10)))
+            .map((r) => r.id);
+        const attendanceIds = attendance
+            .filter((r) => inRange(r.createdAt.toISOString().slice(0, 10)))
+            .map((r) => r.id);
+
+        await Promise.all([
+            leaveIds.length
+                ? HrLeaveRequest.update({ exportedAt: new Date() }, { where: { id: { [Op.in]: leaveIds } } })
+                : null,
+            attendanceIds.length
+                ? HrAttendanceCorrectionRequest.update({ exportedAt: new Date() }, { where: { id: { [Op.in]: attendanceIds } } })
+                : null,
+        ]);
+
+        res.json({ success: true, count: leaveIds.length + attendanceIds.length });
+    } catch (err) {
+        console.error("❌ HR LEAVE/ATTENDANCE MARK-EXPORTED ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to mark records as exported" });
+    }
+});
+
+// ============================================================
+// PUT /transport/mark-exported -- marks all currently-unexported
+// transport rows matching the given filters as exported.
+// ============================================================
+router.put("/transport/mark-exported", authenticateToken, authorizeRoles("hr", "hr_manager", "accounting", "accounting_manager", "admin"), async (req, res) => {
+    try {
+        const { status, dateFrom, dateTo, search, paidStatus } = req.body;
+
+        const empNoFilter = await resolveSearchToEmpNos(search);
+        if (empNoFilter && empNoFilter.length === 0) {
+            return res.json({ success: true, count: 0 });
+        }
+
+        const where = { exportedAt: null };
+        if (status) where.status = status;
+        if (empNoFilter) where.requesterEmpNo = { [Op.in]: empNoFilter };
+        if (dateFrom || dateTo) {
+            where.departureDate = {};
+            if (dateFrom) where.departureDate[Op.gte] = dateFrom;
+            if (dateTo) where.departureDate[Op.lte] = dateTo;
+        }
+        if (paidStatus === "paid") where.paidAt = { [Op.ne]: null };
+        else if (paidStatus === "unpaid") where.paidAt = null;
+
+        const [count] = await HrTransportRequest.update({ exportedAt: new Date() }, { where });
+        res.json({ success: true, count });
+    } catch (err) {
+        console.error("❌ HR TRANSPORT MARK-EXPORTED ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to mark records as exported" });
     }
 });
 
