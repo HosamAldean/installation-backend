@@ -54,6 +54,8 @@ export const HrTransportRequest = sequelizeUtf8.define('HrTransportRequest', {
     // different fields rather than folding "paid" into the status enum.
     paidAt: { type: DataTypes.DATE, allowNull: true },
     paidByUserId: { type: DataTypes.INTEGER, allowNull: true },
+    // See HrLeaveRequest.js's exportedAt for the rationale.
+    exportedAt: { type: DataTypes.DATE, allowNull: true },
 }, {
     tableName: 'HrTransportRequests',
     timestamps: true,

@@ -23,6 +23,8 @@ export const HrAttendanceCorrectionRequest = sequelizeUtf8.define('HrAttendanceC
     hrDecision: { type: DataTypes.ENUM('approved', 'rejected'), allowNull: true },
     hrDecidedAt: { type: DataTypes.DATE, allowNull: true },
     hrNote: { type: DataTypes.TEXT, allowNull: true },
+    // See HrLeaveRequest.js's exportedAt for the rationale.
+    exportedAt: { type: DataTypes.DATE, allowNull: true },
 }, {
     tableName: 'HrAttendanceCorrectionRequests',
     timestamps: true,

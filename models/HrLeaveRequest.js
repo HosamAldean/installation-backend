@@ -42,6 +42,11 @@ export const HrLeaveRequest = sequelizeUtf8.define('HrLeaveRequest', {
     hrDecision: { type: DataTypes.ENUM('approved', 'rejected'), allowNull: true },
     hrDecidedAt: { type: DataTypes.DATE, allowNull: true },
     hrNote: { type: DataTypes.TEXT, allowNull: true },
+    // Set when this row was last included in a report export (CSV or
+    // PDF) -- lets the report default to "not yet exported" so a fresh
+    // export naturally only grabs new records instead of re-exporting
+    // everything every time. See scripts/add-hr-export-tracking.js.
+    exportedAt: { type: DataTypes.DATE, allowNull: true },
 }, {
     tableName: 'HrLeaveRequests',
     timestamps: true,
