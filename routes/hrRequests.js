@@ -23,6 +23,7 @@ import {
 } from "../models/index.js";
 import { isSupervisorOf, getSupervisedEmpNos } from "../utils/supervisorLookup.js";
 import { resolveEmployeeNames } from "../utils/employeeLookup.js";
+import { resolveUserNames } from "../utils/userLookup.js";
 
 const router = express.Router();
 
@@ -461,11 +462,41 @@ router.get("/my-requests", authenticateToken, async (req, res) => {
                 include: [{ model: HrTransportAccompanier, as: "accompaniers" }],
             }),
         ]);
+
+        // Manager approver is an ERP empNo (like the requester); HR/Finance
+        // reviewers and the payment confirmer are InsUser.userId (login
+        // accounts, not necessarily linked to a payroll record) -- two
+        // different lookups, same pattern as routes/hrReports.js.
+        const [empNames, userNames] = await Promise.all([
+            resolveEmployeeNames([
+                ...leave.map(r => r.managerApproverEmpNo),
+                ...attendance.map(r => r.managerApproverEmpNo),
+                ...transport.map(r => r.managerApproverEmpNo),
+            ]),
+            resolveUserNames([
+                ...leave.map(r => r.hrReviewerUserId),
+                ...attendance.map(r => r.hrReviewerUserId),
+                ...transport.map(r => r.hrAuditorUserId),
+                ...transport.map(r => r.financeApproverUserId),
+                ...transport.map(r => r.paidByUserId),
+            ]),
+        ]);
+        const approvers = (r, hrField) => ({
+            managerApprover: r.managerApproverEmpNo ? (empNames[r.managerApproverEmpNo] || null) : null,
+            hrApprover: r[hrField] ? (userNames[r[hrField]] || null) : null,
+        });
+
         res.json({
             success: true,
-            leave: leave.map(r => ({ ...r.toJSON(), type: "leave" })),
-            attendance: attendance.map(r => ({ ...r.toJSON(), type: "attendance" })),
-            transport: transport.map(r => ({ ...r.toJSON(), type: "transport" })),
+            leave: leave.map(r => ({ ...r.toJSON(), type: "leave", ...approvers(r, "hrReviewerUserId") })),
+            attendance: attendance.map(r => ({ ...r.toJSON(), type: "attendance", ...approvers(r, "hrReviewerUserId") })),
+            transport: transport.map(r => ({
+                ...r.toJSON(),
+                type: "transport",
+                ...approvers(r, "hrAuditorUserId"),
+                financeApprover: r.financeApproverUserId ? (userNames[r.financeApproverUserId] || null) : null,
+                paidBy: r.paidByUserId ? (userNames[r.paidByUserId] || null) : null,
+            })),
         });
     } catch (err) {
         console.error("❌ HR MY REQUESTS ERROR:", err);
