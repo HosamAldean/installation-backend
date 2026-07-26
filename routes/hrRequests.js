@@ -22,6 +22,7 @@ import {
     HrTransportAccompanier,
 } from "../models/index.js";
 import { isSupervisorOf, getSupervisedEmpNos } from "../utils/supervisorLookup.js";
+import { resolveEmployeeNames } from "../utils/employeeLookup.js";
 
 const router = express.Router();
 
@@ -493,11 +494,12 @@ router.get("/manager-approvals", authenticateToken, async (req, res) => {
             HrAttendanceCorrectionRequest.findAll({ where, order: [["createdAt", "ASC"]], include: [{ model: HrAttendanceCorrectionRow, as: "rows" }] }),
             HrTransportRequest.findAll({ where, order: [["createdAt", "ASC"]], include: [{ model: HrTransportAccompanier, as: "accompaniers" }] }),
         ]);
+        const names = await resolveEmployeeNames([...leave, ...attendance, ...transport].map(r => r.requesterEmpNo));
         res.json({
             success: true,
-            leave: leave.map(r => ({ ...r.toJSON(), type: "leave" })),
-            attendance: attendance.map(r => ({ ...r.toJSON(), type: "attendance" })),
-            transport: transport.map(r => ({ ...r.toJSON(), type: "transport" })),
+            leave: leave.map(r => ({ ...r.toJSON(), type: "leave", employee: names[r.requesterEmpNo] || null })),
+            attendance: attendance.map(r => ({ ...r.toJSON(), type: "attendance", employee: names[r.requesterEmpNo] || null })),
+            transport: transport.map(r => ({ ...r.toJSON(), type: "transport", employee: names[r.requesterEmpNo] || null })),
         });
     } catch (err) {
         console.error("❌ HR MANAGER APPROVALS ERROR:", err);
@@ -515,11 +517,12 @@ router.get("/hr-queue", authenticateToken, authorizeRoles("hr", "hr_manager", "a
             HrAttendanceCorrectionRequest.findAll({ where: { status: "pending_hr" }, order: [["createdAt", "ASC"]], include: [{ model: HrAttendanceCorrectionRow, as: "rows" }] }),
             HrTransportRequest.findAll({ where: { status: "pending_hr_audit" }, order: [["createdAt", "ASC"]], include: [{ model: HrTransportAccompanier, as: "accompaniers" }] }),
         ]);
+        const names = await resolveEmployeeNames([...leave, ...attendance, ...transport].map(r => r.requesterEmpNo));
         res.json({
             success: true,
-            leave: leave.map(r => ({ ...r.toJSON(), type: "leave" })),
-            attendance: attendance.map(r => ({ ...r.toJSON(), type: "attendance" })),
-            transport: transport.map(r => ({ ...r.toJSON(), type: "transport" })),
+            leave: leave.map(r => ({ ...r.toJSON(), type: "leave", employee: names[r.requesterEmpNo] || null })),
+            attendance: attendance.map(r => ({ ...r.toJSON(), type: "attendance", employee: names[r.requesterEmpNo] || null })),
+            transport: transport.map(r => ({ ...r.toJSON(), type: "transport", employee: names[r.requesterEmpNo] || null })),
         });
     } catch (err) {
         console.error("❌ HR QUEUE ERROR:", err);
@@ -537,7 +540,8 @@ router.get("/finance-queue", authenticateToken, authorizeRoles("accounting", "ac
             order: [["createdAt", "ASC"]],
             include: [{ model: HrTransportAccompanier, as: "accompaniers" }],
         });
-        res.json({ success: true, transport: transport.map(r => r.toJSON()) });
+        const names = await resolveEmployeeNames(transport.map(r => r.requesterEmpNo));
+        res.json({ success: true, transport: transport.map(r => ({ ...r.toJSON(), employee: names[r.requesterEmpNo] || null })) });
     } catch (err) {
         console.error("❌ HR FINANCE QUEUE ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to fetch finance queue" });
