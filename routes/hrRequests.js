@@ -24,6 +24,7 @@ import {
 import { isSupervisorOf, getSupervisedEmpNos } from "../utils/supervisorLookup.js";
 import { resolveEmployeeNames } from "../utils/employeeLookup.js";
 import { resolveUserNames } from "../utils/userLookup.js";
+import { sendPushToUser } from "../services/pushNotifications.js";
 
 const router = express.Router();
 
@@ -155,6 +156,10 @@ router.put("/leave-requests/:id/manager-decision", authenticateToken, async (req
             managerNote: note || null,
             status: decision === "approved" ? "pending_hr" : "rejected",
         });
+        sendPushToUser(request.requesterUserId, {
+            title: "Leave request update",
+            body: decision === "approved" ? "Your manager approved your leave request — now awaiting HR." : "Your manager rejected your leave request.",
+        });
         res.json({ success: true });
     } catch (err) {
         console.error("❌ HR LEAVE MANAGER DECISION ERROR:", err);
@@ -179,6 +184,10 @@ router.put("/leave-requests/:id/hr-decision", authenticateToken, authorizeRoles(
             hrDecidedAt: new Date(),
             hrNote: note || null,
             status: decision,
+        });
+        sendPushToUser(request.requesterUserId, {
+            title: "Leave request update",
+            body: decision === "approved" ? "HR approved your leave request." : "HR rejected your leave request.",
         });
         res.json({ success: true });
     } catch (err) {
@@ -238,6 +247,10 @@ router.put("/attendance-corrections/:id/manager-decision", authenticateToken, as
             managerNote: note || null,
             status: decision === "approved" ? "pending_hr" : "rejected",
         });
+        sendPushToUser(request.requesterUserId, {
+            title: "Attendance correction update",
+            body: decision === "approved" ? "Your manager approved your attendance correction — now awaiting HR." : "Your manager rejected your attendance correction.",
+        });
         res.json({ success: true });
     } catch (err) {
         console.error("❌ HR ATTENDANCE MANAGER DECISION ERROR:", err);
@@ -262,6 +275,10 @@ router.put("/attendance-corrections/:id/hr-decision", authenticateToken, authori
             hrDecidedAt: new Date(),
             hrNote: note || null,
             status: decision,
+        });
+        sendPushToUser(request.requesterUserId, {
+            title: "Attendance correction update",
+            body: decision === "approved" ? "HR approved your attendance correction." : "HR rejected your attendance correction.",
         });
         res.json({ success: true });
     } catch (err) {
@@ -337,6 +354,10 @@ router.put("/transport-requests/:id/manager-decision", authenticateToken, async 
             managerNote: note || null,
             status: decision === "approved" ? "pending_hr_audit" : "rejected",
         });
+        sendPushToUser(request.requesterUserId, {
+            title: "Transportation request update",
+            body: decision === "approved" ? "Your manager approved your transportation request — now awaiting HR audit." : "Your manager rejected your transportation request.",
+        });
         res.json({ success: true });
     } catch (err) {
         console.error("❌ HR TRANSPORT MANAGER DECISION ERROR:", err);
@@ -361,6 +382,10 @@ router.put("/transport-requests/:id/hr-decision", authenticateToken, authorizeRo
             hrDecidedAt: new Date(),
             hrNote: note || null,
             status: decision === "approved" ? "pending_finance" : "rejected",
+        });
+        sendPushToUser(request.requesterUserId, {
+            title: "Transportation request update",
+            body: decision === "approved" ? "HR audited and approved your transportation request — now awaiting finance." : "HR rejected your transportation request.",
         });
         res.json({ success: true });
     } catch (err) {
@@ -412,6 +437,10 @@ router.put("/transport-requests/:id/finance-decision", authenticateToken, author
             totalAmount,
             status: decision,
         });
+        sendPushToUser(request.requesterUserId, {
+            title: "Transportation request update",
+            body: decision === "approved" ? "Finance approved your transportation request." : "Finance rejected your transportation request.",
+        });
         res.json({ success: true, totalAmount });
     } catch (err) {
         console.error("❌ HR TRANSPORT FINANCE DECISION ERROR:", err);
@@ -437,6 +466,10 @@ router.put("/transport-requests/:id/mark-paid", authenticateToken, authorizeRole
             return res.status(400).json({ success: false, message: "This request is already marked as paid" });
         }
         await request.update({ paidAt: new Date(), paidByUserId: req.user.userId });
+        sendPushToUser(request.requesterUserId, {
+            title: "Transportation request update",
+            body: "Your transportation reimbursement has been paid.",
+        });
         res.json({ success: true });
     } catch (err) {
         console.error("❌ HR TRANSPORT MARK PAID ERROR:", err);

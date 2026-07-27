@@ -226,6 +226,27 @@ router.post('/change-password', checkRateLimit, authenticateToken, async (req, r
 });
 
 // ======================
+// Register a device's Expo push token (mobile app, on login)
+// ======================
+router.post('/push-token', authenticateToken, async (req, res) => {
+    try {
+        const { pushToken } = req.body;
+        if (!pushToken || typeof pushToken !== 'string') {
+            return res.status(400).json({ success: false, message: 'pushToken is required' });
+        }
+
+        const user = await User.findByPk(req.user.userId);
+        if (!user) return res.status(404).json({ message: 'User not found' });
+
+        await user.update({ pushToken });
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Save push token error:', err);
+        res.status(500).json({ success: false, message: 'Failed to save push token' });
+    }
+});
+
+// ======================
 // Get logged-in user
 // ======================
 router.get('/me', authenticateToken, async (req, res) => {

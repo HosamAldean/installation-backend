@@ -91,6 +91,17 @@ export const User = sequelize2.define(
             allowNull: true,
             field: 'lastSeenAt',
         },
+
+        // Raw FCM device token for mobile notifications (not routed through
+        // Expo's push service — see mobile/tasks/pushNotificationTask.ts),
+        // re-registered on every mobile login (tokens can rotate) — null
+        // means no mobile device has registered, or the user has never
+        // logged in on mobile.
+        pushToken: {
+            type: DataTypes.STRING,
+            allowNull: true,
+            field: 'pushToken',
+        },
     },
     {
         tableName: 'InsUser',

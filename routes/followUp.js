@@ -89,7 +89,7 @@ const safeArabic = (text) => {
 ================================================================ */
 // GET /api/follow-up/my-orders
 // GET /api/follow-up/my-orders
-router.get('/my-orders', authenticateToken, async (req, res) => {
+router.get('/my-orders', authenticateToken, authorizeRoles('user', 'admin'), async (req, res) => {
     try {
         const assignedEmpNo = req.user.assignedEmpNo; // make sure this exists on req.user
 
@@ -343,7 +343,7 @@ async function upsertTeamLocation(teamId, lat, lng) {
 // ("media") is generic on purpose, since it may be either an image or a
 // video; multer/storage don't care about content type, and image_after is
 // just a URL string column regardless of what kind of file it points to.
-router.post("/order-step/update", authenticateToken, upload.single("media"), async (req, res) => {
+router.post("/order-step/update", authenticateToken, authorizeRoles('user', 'admin'), upload.single("media"), async (req, res) => {
     try {
         const { stepId, status, lat, lng } = req.body;
         const userId = req.user.userId;
@@ -504,7 +504,7 @@ router.post("/order-step/photo", authenticateToken, upload.single("photo"), asyn
 });
 
 // ------------------------ POST Step Issue ------------------------
-router.post("/order-step/issue", authenticateToken, upload.single("photo"), async (req, res) => {
+router.post("/order-step/issue", authenticateToken, authorizeRoles('user', 'admin'), upload.single("photo"), async (req, res) => {
     try {
         const { stepId, note, lat, lng } = req.body;
         const userId = req.user.userId;
@@ -556,7 +556,7 @@ router.post("/order-step/issue", authenticateToken, upload.single("photo"), asyn
 /** ------------------------
  * POST Team Checkpoint
  * ------------------------ */
-router.post("/team/checkpoint", authenticateToken, async (req, res) => {
+router.post("/team/checkpoint", authenticateToken, authorizeRoles('user', 'admin'), async (req, res) => {
     try {
         const { lat, lng, checkpointType, orderId, notes } = req.body;
         if (typeof lat !== 'number' || typeof lng !== 'number') {
@@ -752,7 +752,7 @@ router.get("/my-orders/:orderId/last-checkpoint", authenticateToken, async (req,
 // ===============================
 // STEP 1: GET STOCK + STOCKO
 // ===============================
-router.get("/scan-basic/:barcode", authenticateToken, async (req, res) => {
+router.get("/scan-basic/:barcode", authenticateToken, authorizeRoles('user', 'admin'), async (req, res) => {
     try {
         const { barcode } = req.params;
 
@@ -880,7 +880,7 @@ router.get("/scan-basic/:barcode", authenticateToken, async (req, res) => {
 });
 
 // GET /api/follow-up/delivered-items
-router.get('/delivered-items', authenticateToken, async (req, res) => {
+router.get('/delivered-items', authenticateToken, authorizeRoles('user', 'admin'), async (req, res) => {
     try {
         const assignedEmpNo = req.user.assignedEmpNo;
 
@@ -1146,7 +1146,7 @@ router.post("/confirm-delivery-batch", authenticateToken, async (req, res) => {
 
 // POST /api/follow-up/delivery-status
 // Confirms a delivery as DELIVERED or MISSING, with an optional photo (mobile).
-router.post("/delivery-status", authenticateToken, uploadDeliveryPhoto.single("photo"), async (req, res) => {
+router.post("/delivery-status", authenticateToken, authorizeRoles('user', 'admin'), uploadDeliveryPhoto.single("photo"), async (req, res) => {
     try {
         const { barcode, note } = req.body;
         const status = (req.body.status || "DELIVERED").toUpperCase();
