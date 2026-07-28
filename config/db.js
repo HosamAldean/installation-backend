@@ -46,21 +46,38 @@ export const sequelize2 = new Sequelize(
         dialect: 'mysql',
         port: Number(process.env.DB_PORT || 3306),
         logging: false,
-        // Same raw-byte-passthrough fix as `sequelize`/`sequelize3` below --
-        // without it, legacy IIT_Petra text (e.g. Arabic client/project
-        // names) comes back mojibake'd, since this connection was
-        // negotiating latin1 against columns that actually hold UTF-8
-        // bytes. Confirmed live: Client.js-read Arabic names ("ابراهيم
-        // يونس") rendered as "Ø§Ø¨Ø±Ø§Ù‡ÙŠÙ…..." before this fix.
-        //
-        // field.type is mysql2's wire-protocol type name, not the SQL
-        // column type -- a VARCHAR column (what every Sequelize STRING
-        // field maps to) reports as "VAR_STRING", not "STRING" (confirmed
-        // via a raw typeCast probe against `client.clientName`). The
-        // original condition here only ever matched CHAR/ENUM/SET columns,
-        // so it was a silent no-op for ordinary VARCHAR text -- almost
-        // certainly true of the same condition on `sequelize`/`sequelize3`
-        // below too, not verified here since nothing reported broken there.
+        define: {
+            timestamps: false // we'll set timestamps per model where needed
+        }
+    }
+);
+
+// Same connection as sequelize2, scoped only to the models behind the
+// Clients/Projects pages (Client, ClientReference, ArchOffice, Project,
+// ProjectTeam) -- everything else stays on plain sequelize2 above rather
+// than getting this fix applied blanket-wide. Without it, legacy
+// IIT_Petra text (e.g. Arabic client/project names) comes back
+// mojibake'd, since a connection with no explicit charset negotiates
+// latin1 against columns that actually hold UTF-8 bytes. Confirmed live:
+// Client.js-read Arabic names ("ابراهيم يونس") rendered as
+// "Ø§Ø¨Ø±Ø§Ù‡ÙŠÙ…..." before this fix.
+//
+// field.type is mysql2's wire-protocol type name, not the SQL column
+// type -- a VARCHAR column (what every Sequelize STRING field maps to)
+// reports as "VAR_STRING", not "STRING" (confirmed via a raw typeCast
+// probe against `client.clientName`). `sequelize`/`sequelize3` below have
+// the same STRING-only condition and are almost certainly missing this
+// same fix for their own VARCHAR columns -- not touched here since
+// nothing reported broken there.
+export const sequelize2ClientsProjects = new Sequelize(
+    process.env.DB_NAME || 'IIT_Petra',
+    process.env.DB_USER || 'root',
+    process.env.DB_PASS || '',
+    {
+        host: process.env.DB_HOST || '127.0.0.1',
+        dialect: 'mysql',
+        port: Number(process.env.DB_PORT || 3306),
+        logging: false,
         dialectOptions: {
             charset: 'latin1',
             collate: 'latin1_swedish_ci',
@@ -74,7 +91,7 @@ export const sequelize2 = new Sequelize(
             },
         },
         define: {
-            timestamps: false, // we'll set timestamps per model where needed
+            timestamps: false,
             charset: 'latin1',
             collate: 'latin1_swedish_ci',
         }

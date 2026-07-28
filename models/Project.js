@@ -4,9 +4,9 @@
 // display context; this is the first real CRUD model for it, per the
 // Petra Migration Blueprint §07 "Projects" module (PH.1).
 import { DataTypes } from 'sequelize';
-import { sequelize2 } from '../config/db.js';
+import { sequelize2ClientsProjects } from '../config/db.js';
 
-export const Project = sequelize2.define('Project', {
+export const Project = sequelize2ClientsProjects.define('Project', {
     projectId: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
     projectNo: { type: DataTypes.STRING, allowNull: true, unique: true },
     projectName: { type: DataTypes.STRING, allowNull: true },
