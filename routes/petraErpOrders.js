@@ -17,7 +17,7 @@
 import express from 'express';
 import { QueryTypes } from 'sequelize';
 import { authenticateToken, authorizeRoles } from '../middleware/auth.js';
-import { sequelize2 } from '../config/db.js';
+import { sequelize2PetraErp as sequelize2 } from '../config/db.js';
 import { Order } from '../models/Order.js';
 
 const router = express.Router();

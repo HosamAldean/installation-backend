@@ -2,9 +2,9 @@
 // IIT_Petra.archOffice — architect offices, grouped under the Clients
 // module per Migration Blueprint §07 rather than given its own module.
 import { DataTypes } from 'sequelize';
-import { sequelize2ClientsProjects } from '../config/db.js';
+import { sequelize2PetraErp } from '../config/db.js';
 
-export const ArchOffice = sequelize2ClientsProjects.define('ArchOffice', {
+export const ArchOffice = sequelize2PetraErp.define('ArchOffice', {
     archOfficeId: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
     archOfficeName: { type: DataTypes.STRING, allowNull: false },
     archOfficeNameAr: { type: DataTypes.STRING, allowNull: false, defaultValue: '' },

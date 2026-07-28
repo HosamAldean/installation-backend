@@ -52,15 +52,15 @@ export const sequelize2 = new Sequelize(
     }
 );
 
-// Same connection as sequelize2, scoped only to the models behind the
-// Clients/Projects pages (Client, ClientReference, ArchOffice, Project,
-// ProjectTeam) -- everything else stays on plain sequelize2 above rather
-// than getting this fix applied blanket-wide. Without it, legacy
-// IIT_Petra text (e.g. Arabic client/project names) comes back
-// mojibake'd, since a connection with no explicit charset negotiates
-// latin1 against columns that actually hold UTF-8 bytes. Confirmed live:
-// Client.js-read Arabic names ("ابراهيم يونس") rendered as
-// "Ø§Ø¨Ø±Ø§Ù‡ÙŠÙ…..." before this fix.
+// Same connection as sequelize2, scoped to the models/raw queries behind
+// the Petra ERP pages (Clients, Projects, Orders, Lookups) -- InstOrders,
+// InsUser, and everything else stay on plain sequelize2 above rather than
+// getting this fix applied blanket-wide across the whole app. Without it,
+// legacy IIT_Petra text (e.g. Arabic client/project names, order
+// descriptions, lookup labels) comes back mojibake'd, since a connection
+// with no explicit charset negotiates latin1 against columns that
+// actually hold UTF-8 bytes. Confirmed live: Client.js-read Arabic names
+// ("ابراهيم يونس") rendered as "Ø§Ø¨Ø±Ø§Ù‡ÙŠÙ…..." before this fix.
 //
 // field.type is mysql2's wire-protocol type name, not the SQL column
 // type -- a VARCHAR column (what every Sequelize STRING field maps to)
@@ -69,7 +69,7 @@ export const sequelize2 = new Sequelize(
 // the same STRING-only condition and are almost certainly missing this
 // same fix for their own VARCHAR columns -- not touched here since
 // nothing reported broken there.
-export const sequelize2ClientsProjects = new Sequelize(
+export const sequelize2PetraErp = new Sequelize(
     process.env.DB_NAME || 'IIT_Petra',
     process.env.DB_USER || 'root',
     process.env.DB_PASS || '',

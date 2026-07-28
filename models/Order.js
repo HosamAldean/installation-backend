@@ -8,9 +8,9 @@
 // (gmNote/gmDate). `deleted` is a soft-delete flag already used by the
 // live data — never hard-delete a row, only set deleted=1.
 import { DataTypes } from 'sequelize';
-import { sequelize2 } from '../config/db.js';
+import { sequelize2PetraErp } from '../config/db.js';
 
-export const Order = sequelize2.define('Order', {
+export const Order = sequelize2PetraErp.define('Order', {
     orderId: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
     orderNumber: { type: DataTypes.FLOAT, allowNull: false },
     projectId: { type: DataTypes.INTEGER, allowNull: false },

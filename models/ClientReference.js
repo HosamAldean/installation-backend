@@ -2,9 +2,9 @@
 // IIT_Petra.clientReference — a named contact person tied to a client,
 // optionally scoped to a project/offer. See Migration Blueprint §07.
 import { DataTypes } from 'sequelize';
-import { sequelize2ClientsProjects } from '../config/db.js';
+import { sequelize2PetraErp } from '../config/db.js';
 
-export const ClientReference = sequelize2ClientsProjects.define('ClientReference', {
+export const ClientReference = sequelize2PetraErp.define('ClientReference', {
     clientReferenceId: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
     clientId: { type: DataTypes.INTEGER, allowNull: false },
     projectId: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },

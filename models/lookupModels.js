@@ -13,7 +13,7 @@
 // (models/unitShapes.js, added 2026-07-09) with different column names
 // (descEn/descAr, not Name) — reused here, not redefined.
 import { DataTypes } from 'sequelize';
-import { sequelize2 } from '../config/db.js';
+import { sequelize2PetraErp } from '../config/db.js';
 import { UnitShape } from './unitShapes.js';
 
 // Plain `<table>Id` / `<table>Name` tables — the factory computes both
@@ -46,7 +46,7 @@ const SIMPLE_LOOKUP_TABLES = [
 function defineSimpleLookup(tableName) {
     const pkField = `${tableName}Id`;
     const nameField = `${tableName}Name`;
-    const model = sequelize2.define(
+    const model = sequelize2PetraErp.define(
         tableName[0].toUpperCase() + tableName.slice(1),
         {
             [pkField]: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
@@ -57,7 +57,7 @@ function defineSimpleLookup(tableName) {
     return { model, pkField, nameField };
 }
 
-const ColorInfo = sequelize2.define('ColorInfo', {
+const ColorInfo = sequelize2PetraErp.define('ColorInfo', {
     colorInfoId: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
     mixCode: { type: DataTypes.STRING, allowNull: true },
     code: { type: DataTypes.STRING, allowNull: true },
@@ -66,7 +66,7 @@ const ColorInfo = sequelize2.define('ColorInfo', {
     colorImage: { type: DataTypes.STRING, allowNull: true },
 }, { tableName: 'colorInfo', timestamps: false });
 
-const ProfileSection = sequelize2.define('ProfileSection', {
+const ProfileSection = sequelize2PetraErp.define('ProfileSection', {
     profileSectionId: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
     profileSectionName: { type: DataTypes.STRING, allowNull: true },
     profileSectionDept: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
@@ -77,7 +77,7 @@ const ProfileSection = sequelize2.define('ProfileSection', {
 // orderTypeName/orderTypeDesc are Arabic/English labels for the same
 // production department (e.g. "انتاج المنيوم" / "Aluminum") — see
 // Order.js and routes/petraErpOrders.js.
-const OrderType = sequelize2.define('OrderType', {
+const OrderType = sequelize2PetraErp.define('OrderType', {
     orderTypeId: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
     orderTypeName: { type: DataTypes.STRING, allowNull: false },
     orderTypeDesc: { type: DataTypes.STRING, allowNull: false, defaultValue: '' },
