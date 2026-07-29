@@ -1,12 +1,9 @@
 // backend/routes/offers.js
 // Petra ERP — Offers module (PH.5). See Migration Blueprint §07 "Offers".
 // offers.php in the legacy app is ~140 methods across 6+ sub-domains; this
-// covers the core offer entity, its notes/client links, and quotations
-// (pricing line items, nested here since they're always offer-scoped).
-// Deliberately NOT built here (too much scope for one pass, needs its own
-// follow-up):
-//   - offerChanges -- glass/coating change-request + approval workflow.
-//   - offerContractNotes -- only 1 live row, negligible usage.
+// covers the core offer entity, notes/client links, quotations (pricing
+// line items), the change-request workflow (offerChanges), and contract
+// notes -- all nested here since they're always offer-scoped.
 // Roles narrower than Projects/Clients, matching the blueprint's "Roles:
 // sales, sales_manager, admin" for this module.
 import express from 'express';
@@ -17,6 +14,8 @@ import { Offer } from '../models/Offer.js';
 import { OfferNotes } from '../models/OfferNotes.js';
 import { OfferClients } from '../models/OfferClients.js';
 import { Quotation } from '../models/Quotation.js';
+import { OfferChanges } from '../models/OfferChanges.js';
+import { OfferContractNotes } from '../models/OfferContractNotes.js';
 
 const router = express.Router();
 router.use(authenticateToken, authorizeRoles('sales', 'sales_manager', 'admin'));
@@ -205,6 +204,113 @@ router.patch('/:id/quotations/:quotationId', async (req, res) => {
 router.delete('/:id/quotations/:quotationId', async (req, res) => {
     const deleted = await Quotation.destroy({
         where: { quotationId: req.params.quotationId, offerId: req.params.id },
+    });
+    if (!deleted) return res.status(404).json({ message: 'Not found' });
+    res.json({ message: 'deleted' });
+});
+
+/* ---------------- Changes (glass/coating change-request workflow) ---------------- */
+
+// coatingTypeId is a fixed 4-value enum in the legacy app (Powder Coated,
+// PVDF, Anodized, Wooden) -- there is no coatingType lookup table in the
+// live schema (verified via SHOW TABLES). glassTypeId, despite its name,
+// is a foreign key into glassSpecification (verified in
+// templates/Admin/quotation.tpl), not a "glassType" table.
+const COATING_TYPES = { 1: 'Powder Coated', 2: 'PVDF', 3: 'Anodized', 4: 'Wooden' };
+
+// GET /api/offers/:id/changes
+router.get('/:id/changes', async (req, res) => {
+    const changes = await sequelize2PetraErp.query(
+        `SELECT oc.*, g.glassSpecificationName
+           FROM offerChanges oc
+           LEFT JOIN glassSpecification g ON oc.glassTypeId = g.glassSpecificationId
+          WHERE oc.offerId = :offerId
+          ORDER BY oc.changeNo DESC, oc.offerChangesId DESC`,
+        { replacements: { offerId: req.params.id }, type: QueryTypes.SELECT },
+    );
+    res.json({ changes: changes.map((c) => ({ ...c, coatingTypeName: COATING_TYPES[c.coatingTypeId] || null })) });
+});
+
+// POST /api/offers/:id/changes  { glassTypeId, coatingTypeId, offerChangesNote?, changeNo? }
+router.post('/:id/changes', async (req, res) => {
+    const required = ['glassTypeId', 'coatingTypeId'];
+    for (const f of required) {
+        if (req.body[f] === undefined) return res.status(400).json({ message: `${f} is required` });
+    }
+    const [{ maxChangeNo }] = await sequelize2PetraErp.query(
+        'SELECT COALESCE(MAX(changeNo), 0) AS maxChangeNo FROM offerChanges WHERE offerId = :offerId',
+        { replacements: { offerId: req.params.id }, type: QueryTypes.SELECT },
+    );
+    const values = whitelist(OfferChanges, req.body, ['offerChangesId', 'offerId', 'changeNo']);
+    const change = await OfferChanges.create({
+        ...values,
+        offerId: req.params.id,
+        changeNo: req.body.changeNo ?? (maxChangeNo || 0) + 1,
+    });
+    res.status(201).json(change);
+});
+
+// PATCH /api/offers/:id/changes/:changeId  -- also used to toggle offerApproved
+router.patch('/:id/changes/:changeId', async (req, res) => {
+    const change = await OfferChanges.findOne({
+        where: { offerChangesId: req.params.changeId, offerId: req.params.id },
+    });
+    if (!change) return res.status(404).json({ message: 'Not found' });
+    await change.update(whitelist(OfferChanges, req.body, ['offerChangesId', 'offerId']));
+    res.json(change);
+});
+
+// DELETE /api/offers/:id/changes/:changeId
+router.delete('/:id/changes/:changeId', async (req, res) => {
+    const deleted = await OfferChanges.destroy({
+        where: { offerChangesId: req.params.changeId, offerId: req.params.id },
+    });
+    if (!deleted) return res.status(404).json({ message: 'Not found' });
+    res.json({ message: 'deleted' });
+});
+
+/* ---------------- Contract notes ---------------- */
+
+// GET /api/offers/:id/contract-notes
+router.get('/:id/contract-notes', async (req, res) => {
+    const notes = await OfferContractNotes.findAll({
+        where: { offerId: req.params.id },
+        order: [['offerContractNotesDate', 'DESC']],
+    });
+    res.json({ notes });
+});
+
+// POST /api/offers/:id/contract-notes  { offerContractNotesType, offerContractNotesDesc }
+router.post('/:id/contract-notes', async (req, res) => {
+    const required = ['offerContractNotesType', 'offerContractNotesDesc'];
+    for (const f of required) {
+        if (!req.body[f]?.trim?.() && req.body[f] === undefined) {
+            return res.status(400).json({ message: `${f} is required` });
+        }
+    }
+    const note = await OfferContractNotes.create({
+        offerId: req.params.id,
+        offerContractNotesType: req.body.offerContractNotesType,
+        offerContractNotesDesc: req.body.offerContractNotesDesc,
+        offerContractNotesDate: new Date(),
+    });
+    res.status(201).json(note);
+});
+
+// PATCH /api/offers/:id/contract-notes/:noteId
+router.patch('/:id/contract-notes/:noteId', async (req, res) => {
+    const note = await OfferContractNotes.findOne({
+        where: { offerContractNotesId: req.params.noteId, offerId: req.params.id },
+    });
+    if (!note) return res.status(404).json({ message: 'Not found' });
+    await note.update(whitelist(OfferContractNotes, req.body, ['offerContractNotesId', 'offerId']));
+    res.json(note);
+});
+
+// DELETE /api/offers/:id/contract-notes/:noteId
+router.delete('/:id/contract-notes/:noteId', async (req, res) => {
+    const deleted = await OfferContractNotes.destroy({
+        where: { offerContractNotesId: req.params.noteId, offerId: req.params.id },
     });
     if (!deleted) return res.status(404).json({ message: 'Not found' });
     res.json({ message: 'deleted' });

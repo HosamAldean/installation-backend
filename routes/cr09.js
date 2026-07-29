@@ -6,12 +6,11 @@
 // guessed from the legacy PHP class names, verified via SHOW TABLES/
 // COLUMNS before writing this.
 //
-// Deliberately NOT built here (further deferral, on top of what
-// routes/controlSheet.js and routes/offers.js already deferred): the
-// unit-tagging tables motorUnitCR09/shutterBoxUnitCR09/
-// shutterCoverUnitCR09/shutterUnitCR09 (which contract-unit IDs have a
-// motor/shutter-box/shutter-cover/shutter feature) -- four more near-
-// identical simple tables, secondary to the two core CR09 tables.
+// The motor/shutter-box/shutter-cover/shutter feature views
+// (motorUnitCR09 etc.) are handled separately in routes/cr09Tags.js,
+// mounted at /api/cr09/tags -- they turned out to be read-only SQL VIEWS
+// over masterControl, not tables, so they don't fit this file's
+// Sequelize-model CRUD pattern.
 //
 // Same roles as Control Sheet: project_manager/admin write,
 // +installation_manager read.

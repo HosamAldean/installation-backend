@@ -45,6 +45,7 @@ import salesAnalyticsRouter from "./routes/salesAnalytics.js";
 import leadsRouter from "./routes/leads.js";
 import timesheetsRouter from "./routes/timesheets.js";
 import cr09Router from "./routes/cr09.js";
+import cr09TagsRouter from "./routes/cr09Tags.js";
 import hrRequestsRouter from "./routes/hrRequests.js";
 import hrReportsRouter from "./routes/hrReports.js";
  // follow-up module
@@ -165,6 +166,7 @@ app.use("/api/sales-analytics", salesAnalyticsRouter);
 app.use("/api/leads", leadsRouter);
 app.use("/api/timesheets", timesheetsRouter);
 app.use("/api/cr09", cr09Router);
+app.use("/api/cr09/tags", cr09TagsRouter);
 app.use("/api/hr-requests", hrRequestsRouter);
 app.use("/api/hr-reports", hrReportsRouter);
 
