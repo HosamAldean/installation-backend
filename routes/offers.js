@@ -1,17 +1,12 @@
 // backend/routes/offers.js
 // Petra ERP — Offers module (PH.5). See Migration Blueprint §07 "Offers".
 // offers.php in the legacy app is ~140 methods across 6+ sub-domains; this
-// covers the core offer entity plus its notes and client links only.
+// covers the core offer entity, its notes/client links, and quotations
+// (pricing line items, nested here since they're always offer-scoped).
 // Deliberately NOT built here (too much scope for one pass, needs its own
 // follow-up):
-//   - quotations (68k+ rows) -- the actual pricing line items per offer,
-//     tied to profileSection/measurement and a real pricing calculation
-//     this session didn't verify against the legacy app's business logic.
 //   - offerChanges -- glass/coating change-request + approval workflow.
 //   - offerContractNotes -- only 1 live row, negligible usage.
-//   - leads, timeSheet -- separate small tables (25 and 919 rows) the
-//     blueprint lists as their own pages (Leads.tsx, timesheets); not
-//     touched this pass.
 // Roles narrower than Projects/Clients, matching the blueprint's "Roles:
 // sales, sales_manager, admin" for this module.
 import express from 'express';
@@ -21,6 +16,7 @@ import { sequelize2PetraErp } from '../config/db.js';
 import { Offer } from '../models/Offer.js';
 import { OfferNotes } from '../models/OfferNotes.js';
 import { OfferClients } from '../models/OfferClients.js';
+import { Quotation } from '../models/Quotation.js';
 
 const router = express.Router();
 router.use(authenticateToken, authorizeRoles('sales', 'sales_manager', 'admin'));
@@ -156,6 +152,59 @@ router.post('/:id/clients', async (req, res) => {
 router.delete('/:id/clients/:linkId', async (req, res) => {
     const deleted = await OfferClients.destroy({
         where: { offerClientsId: req.params.linkId, offerId: req.params.id },
+    });
+    if (!deleted) return res.status(404).json({ message: 'Not found' });
+    res.json({ message: 'deleted' });
+});
+
+/* ---------------- Quotations (pricing line items) ---------------- */
+
+// GET /api/offers/:id/quotations?qChoiceNo= -- omit qChoiceNo to see all
+// choices/revisions for the offer, grouped implicitly by the qChoiceNo
+// column in the response.
+router.get('/:id/quotations', async (req, res) => {
+    const conditions = ['q.offerId = :offerId'];
+    const replacements = { offerId: req.params.id };
+    if (req.query.qChoiceNo !== undefined) {
+        conditions.push('q.qChoiceNo = :qChoiceNo');
+        replacements.qChoiceNo = req.query.qChoiceNo;
+    }
+    const quotations = await sequelize2PetraErp.query(
+        `SELECT q.*, p.profileSectionName
+           FROM quotations q
+           LEFT JOIN profileSection p ON q.profileSectionId = p.profileSectionId
+          WHERE ${conditions.join(' AND ')}
+          ORDER BY q.qChoiceNo DESC, q.quotationId ASC`,
+        { replacements, type: QueryTypes.SELECT },
+    );
+    res.json({ quotations });
+});
+
+// POST /api/offers/:id/quotations  { profileSectionId, value, price, measurmentId, qChoiceNo?, qDiscountPerc? }
+router.post('/:id/quotations', async (req, res) => {
+    const required = ['profileSectionId', 'value', 'price', 'measurmentId'];
+    for (const f of required) {
+        if (req.body[f] === undefined) return res.status(400).json({ message: `${f} is required` });
+    }
+    const values = whitelist(Quotation, req.body, ['quotationId', 'offerId']);
+    const quotation = await Quotation.create({ ...values, offerId: req.params.id });
+    res.status(201).json(quotation);
+});
+
+// PATCH /api/offers/:id/quotations/:quotationId
+router.patch('/:id/quotations/:quotationId', async (req, res) => {
+    const quotation = await Quotation.findOne({
+        where: { quotationId: req.params.quotationId, offerId: req.params.id },
+    });
+    if (!quotation) return res.status(404).json({ message: 'Not found' });
+    await quotation.update(whitelist(Quotation, req.body, ['quotationId', 'offerId']));
+    res.json(quotation);
+});
+
+// DELETE /api/offers/:id/quotations/:quotationId
+router.delete('/:id/quotations/:quotationId', async (req, res) => {
+    const deleted = await Quotation.destroy({
+        where: { quotationId: req.params.quotationId, offerId: req.params.id },
     });
     if (!deleted) return res.status(404).json({ message: 'Not found' });
     res.json({ message: 'deleted' });
