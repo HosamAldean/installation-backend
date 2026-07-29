@@ -86,6 +86,14 @@ const OrderType = sequelize2PetraErp.define('OrderType', {
     orderTypeDept: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
 }, { tableName: 'orderType', timestamps: false });
 
+// glassId/glassName don't fit the `<table>Id`/`<table>Name` factory
+// pattern (table is CR09dGlass, PK is glassId) -- 0 live rows at time of
+// writing, feeds CR09Details' glassId dropdown.
+const CR09dGlass = sequelize2PetraErp.define('CR09dGlass', {
+    glassId: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+    glassName: { type: DataTypes.STRING, allowNull: true },
+}, { tableName: 'CR09dGlass', timestamps: false });
+
 // type -> { model, pkField, nameField }. `nameField` is what the generic
 // list route sorts/searches by default; routes/lookups.js never needs to
 // know per-table specifics beyond this registry.
@@ -97,6 +105,7 @@ export const LOOKUP_REGISTRY = {
     profileSection: { model: ProfileSection, pkField: 'profileSectionId', nameField: 'profileSectionName' },
     unitShapes: { model: UnitShape, pkField: 'unitShapeId', nameField: 'descEn' },
     orderType: { model: OrderType, pkField: 'orderTypeId', nameField: 'orderTypeDesc' },
+    cr09dGlass: { model: CR09dGlass, pkField: 'glassId', nameField: 'glassName' },
 };
 
 export const LOOKUP_TYPES = Object.keys(LOOKUP_REGISTRY);

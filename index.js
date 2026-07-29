@@ -42,6 +42,9 @@ import cashFlowRouter from "./routes/cashFlow.js";
 import offersRouter from "./routes/offers.js";
 import controlSheetRouter from "./routes/controlSheet.js";
 import salesAnalyticsRouter from "./routes/salesAnalytics.js";
+import leadsRouter from "./routes/leads.js";
+import timesheetsRouter from "./routes/timesheets.js";
+import cr09Router from "./routes/cr09.js";
 import hrRequestsRouter from "./routes/hrRequests.js";
 import hrReportsRouter from "./routes/hrReports.js";
  // follow-up module
@@ -159,6 +162,9 @@ app.use("/api/cash-flow", cashFlowRouter);
 app.use("/api/offers", offersRouter);
 app.use("/api/control-sheets", controlSheetRouter);
 app.use("/api/sales-analytics", salesAnalyticsRouter);
+app.use("/api/leads", leadsRouter);
+app.use("/api/timesheets", timesheetsRouter);
+app.use("/api/cr09", cr09Router);
 app.use("/api/hr-requests", hrRequestsRouter);
 app.use("/api/hr-reports", hrReportsRouter);
 
