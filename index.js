@@ -40,6 +40,7 @@ import lookupsRouter from "./routes/lookups.js";
 import petraErpOrdersRouter from "./routes/petraErpOrders.js";
 import cashFlowRouter from "./routes/cashFlow.js";
 import offersRouter from "./routes/offers.js";
+import controlSheetRouter from "./routes/controlSheet.js";
 import hrRequestsRouter from "./routes/hrRequests.js";
 import hrReportsRouter from "./routes/hrReports.js";
  // follow-up module
@@ -155,6 +156,7 @@ app.use("/api/lookups", lookupsRouter);
 app.use("/api/petra-erp/orders", petraErpOrdersRouter);
 app.use("/api/cash-flow", cashFlowRouter);
 app.use("/api/offers", offersRouter);
+app.use("/api/control-sheets", controlSheetRouter);
 app.use("/api/hr-requests", hrRequestsRouter);
 app.use("/api/hr-reports", hrReportsRouter);
 
