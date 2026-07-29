@@ -41,6 +41,7 @@ const SIMPLE_LOOKUP_TABLES = [
     'projectType',
     'orderStatus',
     'orderStage',
+    'cashFlowStage',
 ];
 
 function defineSimpleLookup(tableName) {

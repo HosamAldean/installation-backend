@@ -38,6 +38,7 @@ import projectsRouter from "./routes/projects.js";
 import clientsRouter, { archOfficesRouter } from "./routes/clients.js";
 import lookupsRouter from "./routes/lookups.js";
 import petraErpOrdersRouter from "./routes/petraErpOrders.js";
+import cashFlowRouter from "./routes/cashFlow.js";
 import hrRequestsRouter from "./routes/hrRequests.js";
 import hrReportsRouter from "./routes/hrReports.js";
  // follow-up module
@@ -151,6 +152,7 @@ app.use("/api/clients", clientsRouter);
 app.use("/api/arch-offices", archOfficesRouter);
 app.use("/api/lookups", lookupsRouter);
 app.use("/api/petra-erp/orders", petraErpOrdersRouter);
+app.use("/api/cash-flow", cashFlowRouter);
 app.use("/api/hr-requests", hrRequestsRouter);
 app.use("/api/hr-reports", hrReportsRouter);
 
