@@ -1568,7 +1568,7 @@ router.get("/remaining", async (req, res) => {
         const items = await itemsListRequest.query(`
             ${itemsCte}
             SELECT * FROM itemsBase
-            ORDER BY ProjectNO, ProfileNO
+            ORDER BY ProjectNO, ProfileNO, Color, LinthRe
             OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY
         `);
 
@@ -2219,7 +2219,7 @@ router.get("/stock-levels", async (req, res) => {
         const listResult = await listRequest.query(`
             ${combinedCte}
             SELECT * FROM combined
-            ORDER BY ProfileNO, Color, LinthRe
+            ORDER BY ProfileNO, Color, LinthRe, StoreNo, ComputerNO
             OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY
         `);
 
