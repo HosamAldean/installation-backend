@@ -3,14 +3,30 @@
 // in models/lookupModels.js. See Migration Blueprint §07 "Lookups".
 import express from 'express';
 import { Op } from 'sequelize';
-import { authenticateToken, authorizeRoles } from '../middleware/auth.js';
+import { authenticateToken, authorizeReadWrite } from '../middleware/auth.js';
 import { LOOKUP_REGISTRY, LOOKUP_TYPES } from '../models/lookupModels.js';
 
 const router = express.Router();
 
-// Reference-data management is admin-only, matching Migration Blueprint
-// §07's "Roles: admin" for this module.
-router.use(authenticateToken, authorizeRoles('admin'));
+// Editing reference data is admin-only, matching Migration Blueprint §07's
+// "Roles: admin" -- but *reading* it can't be, since Orders/Cash Flow (and
+// any future Petra ERP form) need these for their own dropdowns (order
+// type/status, payment type, bank, ...). Originally admin-only for both;
+// found broken when Cash Flow's payment-type/bank dropdowns needed this
+// and every other Petra ERP role would have 403'd reading it. 'user' is
+// also included here (unlike other Petra ERP routes) specifically so the
+// admin+testuser soft launch (Migration Blueprint Rev F) can exercise
+// these dropdowns -- testuser's actual role is the generic 'user', not
+// one of the Petra ERP roles. Reference data is read-only and has no PII,
+// so this is a low-risk broadening; worth revisiting once the soft launch
+// ends and access opens to the real Petra ERP roles.
+router.use(
+    authenticateToken,
+    authorizeReadWrite(
+        ['sales', 'sales_manager', 'accounting', 'project_manager', 'user', 'admin'],
+        ['admin'],
+    ),
+);
 
 // `:type` is validated against the fixed registry below on every route —
 // this is a generic table proxy, so that allow-list is what stands in for
