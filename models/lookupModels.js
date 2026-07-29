@@ -42,6 +42,7 @@ const SIMPLE_LOOKUP_TABLES = [
     'orderStatus',
     'orderStage',
     'cashFlowStage',
+    'offerStatus',
 ];
 
 function defineSimpleLookup(tableName) {
