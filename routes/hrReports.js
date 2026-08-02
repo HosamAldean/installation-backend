@@ -13,7 +13,9 @@
 import express from "express";
 import { Op } from "sequelize";
 import { withSqlRetry } from "../config/db.js";
-import { authenticateToken, authorizeRoles } from "../middleware/auth.js";
+import { authenticateToken } from "../middleware/auth.js";
+import { requirePermission } from "../middleware/permissions.js";
+import { PERMISSIONS } from "../constants/permissions.js";
 import {
     HrLeaveRequest,
     HrAttendanceCorrectionRequest,
@@ -68,7 +70,7 @@ function countByStatus(rows) {
 // GET /summary -- dashboard totals across all 3 request types. Visible to
 // hr/admin (leave & attendance) and accounting/admin (transport totals).
 // ============================================================
-router.get("/summary", authenticateToken, authorizeRoles("hr", "hr_manager", "admin", "accounting", "accounting_manager"), async (req, res) => {
+router.get("/summary", authenticateToken, requirePermission(PERMISSIONS.HR_REPORTS), async (req, res) => {
     try {
         const now = new Date();
         const yearStart = `${now.getFullYear()}-01-01`;
@@ -121,7 +123,7 @@ router.get("/summary", authenticateToken, authorizeRoles("hr", "hr_manager", "ad
 // GET /leave-attendance -- combined history of leave/departure and
 // attendance-correction requests, for HR record-keeping.
 // ============================================================
-router.get("/leave-attendance", authenticateToken, authorizeRoles("hr", "hr_manager", "admin"), async (req, res) => {
+router.get("/leave-attendance", authenticateToken, requirePermission(PERMISSIONS.HR_REPORTS_LEAVE_ATTENDANCE), async (req, res) => {
     try {
         const { page, pageSize } = parsePagination(req.query);
         const { status, type, dateFrom, dateTo, search, exported } = req.query;
@@ -201,7 +203,7 @@ router.get("/leave-attendance", authenticateToken, authorizeRoles("hr", "hr_mana
 // reconciliation (also visible to hr/admin, who audit these before
 // Finance signs off).
 // ============================================================
-router.get("/transport", authenticateToken, authorizeRoles("hr", "hr_manager", "accounting", "accounting_manager", "admin"), async (req, res) => {
+router.get("/transport", authenticateToken, requirePermission(PERMISSIONS.HR_REPORTS), async (req, res) => {
     try {
         const { page, pageSize } = parsePagination(req.query);
         const { status, dateFrom, dateTo, search, paidStatus, exported } = req.query;
@@ -284,7 +286,7 @@ router.get("/transport", authenticateToken, authorizeRoles("hr", "hr_manager", "
 // rows) -- called after a CSV/PDF export completes so a fresh export
 // naturally only grabs new records next time.
 // ============================================================
-router.put("/leave-attendance/mark-exported", authenticateToken, authorizeRoles("hr", "hr_manager", "admin"), async (req, res) => {
+router.put("/leave-attendance/mark-exported", authenticateToken, requirePermission(PERMISSIONS.HR_REPORTS_LEAVE_ATTENDANCE), async (req, res) => {
     try {
         const { status, type, dateFrom, dateTo, search } = req.body;
 
@@ -339,7 +341,7 @@ router.put("/leave-attendance/mark-exported", authenticateToken, authorizeRoles(
 // PUT /transport/mark-exported -- marks all currently-unexported
 // transport rows matching the given filters as exported.
 // ============================================================
-router.put("/transport/mark-exported", authenticateToken, authorizeRoles("hr", "hr_manager", "accounting", "accounting_manager", "admin"), async (req, res) => {
+router.put("/transport/mark-exported", authenticateToken, requirePermission(PERMISSIONS.HR_REPORTS), async (req, res) => {
     try {
         const { status, dateFrom, dateTo, search, paidStatus } = req.body;
 

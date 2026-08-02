@@ -8,7 +8,9 @@
 // sales, sales_manager, admin" for this module.
 import express from 'express';
 import { QueryTypes } from 'sequelize';
-import { authenticateToken, authorizeRoles } from '../middleware/auth.js';
+import { authenticateToken } from '../middleware/auth.js';
+import { requirePermission } from '../middleware/permissions.js';
+import { PERMISSIONS } from '../constants/permissions.js';
 import { sequelize2PetraErp } from '../config/db.js';
 import { Offer } from '../models/Offer.js';
 import { OfferNotes } from '../models/OfferNotes.js';
@@ -18,7 +20,7 @@ import { OfferChanges } from '../models/OfferChanges.js';
 import { OfferContractNotes } from '../models/OfferContractNotes.js';
 
 const router = express.Router();
-router.use(authenticateToken, authorizeRoles('sales', 'sales_manager', 'admin'));
+router.use(authenticateToken, requirePermission(PERMISSIONS.PETRA_ERP_OFFERS));
 
 function whitelist(model, body, excluding = []) {
     const attrs = Object.keys(model.getAttributes()).filter((a) => !excluding.includes(a));

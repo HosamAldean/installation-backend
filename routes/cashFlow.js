@@ -9,7 +9,9 @@
 // the generic /:id so Express doesn't swallow them as an :id param.
 import express from 'express';
 import { QueryTypes } from 'sequelize';
-import { authenticateToken, authorizeRoles } from '../middleware/auth.js';
+import { authenticateToken } from '../middleware/auth.js';
+import { requirePermission } from '../middleware/permissions.js';
+import { PERMISSIONS } from '../constants/permissions.js';
 import { sequelize2PetraErp } from '../config/db.js';
 import { CashFlow } from '../models/CashFlow.js';
 import { CashFlowDetails } from '../models/CashFlowDetails.js';
@@ -17,7 +19,7 @@ import { CashFlowNotes } from '../models/CashFlowNotes.js';
 import { CashFlowExpected } from '../models/CashFlowExpected.js';
 
 const router = express.Router();
-router.use(authenticateToken, authorizeRoles('accounting', 'admin'));
+router.use(authenticateToken, requirePermission(PERMISSIONS.PETRA_ERP_CASH_FLOW));
 
 function whitelist(model, body, excluding = []) {
     const attrs = Object.keys(model.getAttributes()).filter((a) => !excluding.includes(a));

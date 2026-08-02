@@ -1,7 +1,9 @@
 ﻿import express from 'express';
 import { sequelize2, withSqlRetry } from '../config/db.js';
 import { QueryTypes } from 'sequelize';
-import { authenticateToken, authorizeRoles } from '../middleware/auth.js';
+import { authenticateToken } from '../middleware/auth.js';
+import { requirePermission } from '../middleware/permissions.js';
+import { PERMISSIONS } from '../constants/permissions.js';
 
 const router = express.Router();
 // This entire router previously had no authentication at all — team
@@ -9,7 +11,7 @@ const router = express.Router();
 // anyone with network access. The frontend (EmployeeCardPage.tsx) is already
 // gated to manager/admin via RoleProtectedRoute — mirror that here.
 router.use(authenticateToken);
-router.use(authorizeRoles('installation_manager', 'admin'));
+router.use(requirePermission(PERMISSIONS.INSTALLATION_TEAMS));
 
 /** -------------------------------------------------------
  *  🔧 Arabic Auto-Recovery (Fix double-encoded UTF-8 text)

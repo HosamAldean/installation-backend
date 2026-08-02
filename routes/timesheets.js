@@ -3,12 +3,14 @@
 // §07 "Offers" (timesheets listed as its own page). Same roles as Offers.
 import express from 'express';
 import { QueryTypes } from 'sequelize';
-import { authenticateToken, authorizeRoles } from '../middleware/auth.js';
+import { authenticateToken } from '../middleware/auth.js';
+import { requirePermission } from '../middleware/permissions.js';
+import { PERMISSIONS } from '../constants/permissions.js';
 import { sequelize2PetraErp } from '../config/db.js';
 import { TimeSheet } from '../models/TimeSheet.js';
 
 const router = express.Router();
-router.use(authenticateToken, authorizeRoles('sales', 'sales_manager', 'admin'));
+router.use(authenticateToken, requirePermission(PERMISSIONS.PETRA_ERP_TIMESHEETS));
 
 function whitelist(model, body, excluding = []) {
     const attrs = Object.keys(model.getAttributes()).filter((a) => !excluding.includes(a));

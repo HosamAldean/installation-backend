@@ -13,7 +13,9 @@
 // even if someone's supervisor changes between submission and review.
 import express from "express";
 import { withSqlRetry } from "../config/db.js";
-import { authenticateToken, authorizeRoles } from "../middleware/auth.js";
+import { authenticateToken } from "../middleware/auth.js";
+import { requirePermission } from "../middleware/permissions.js";
+import { PERMISSIONS } from "../constants/permissions.js";
 import {
     HrLeaveRequest,
     HrAttendanceCorrectionRequest,
@@ -167,7 +169,7 @@ router.put("/leave-requests/:id/manager-decision", authenticateToken, async (req
     }
 });
 
-router.put("/leave-requests/:id/hr-decision", authenticateToken, authorizeRoles("hr", "hr_manager", "admin"), async (req, res) => {
+router.put("/leave-requests/:id/hr-decision", authenticateToken, requirePermission(PERMISSIONS.HR_REQUESTS_QUEUE), async (req, res) => {
     const { decision, note } = req.body;
     if (!["approved", "rejected"].includes(decision)) {
         return res.status(400).json({ success: false, message: "decision must be 'approved' or 'rejected'" });
@@ -258,7 +260,7 @@ router.put("/attendance-corrections/:id/manager-decision", authenticateToken, as
     }
 });
 
-router.put("/attendance-corrections/:id/hr-decision", authenticateToken, authorizeRoles("hr", "hr_manager", "admin"), async (req, res) => {
+router.put("/attendance-corrections/:id/hr-decision", authenticateToken, requirePermission(PERMISSIONS.HR_REQUESTS_QUEUE), async (req, res) => {
     const { decision, note } = req.body;
     if (!["approved", "rejected"].includes(decision)) {
         return res.status(400).json({ success: false, message: "decision must be 'approved' or 'rejected'" });
@@ -365,7 +367,7 @@ router.put("/transport-requests/:id/manager-decision", authenticateToken, async 
     }
 });
 
-router.put("/transport-requests/:id/hr-decision", authenticateToken, authorizeRoles("hr", "hr_manager", "admin"), async (req, res) => {
+router.put("/transport-requests/:id/hr-decision", authenticateToken, requirePermission(PERMISSIONS.HR_REQUESTS_QUEUE), async (req, res) => {
     const { decision, note } = req.body;
     if (!["approved", "rejected"].includes(decision)) {
         return res.status(400).json({ success: false, message: "decision must be 'approved' or 'rejected'" });
@@ -394,7 +396,7 @@ router.put("/transport-requests/:id/hr-decision", authenticateToken, authorizeRo
     }
 });
 
-router.put("/transport-requests/:id/finance-decision", authenticateToken, authorizeRoles("accounting", "accounting_manager", "admin"), async (req, res) => {
+router.put("/transport-requests/:id/finance-decision", authenticateToken, requirePermission(PERMISSIONS.ACCOUNTING_REQUESTS_QUEUE), async (req, res) => {
     const { decision, note, kmRate, additionalAmount, additionalAmountNote } = req.body;
     if (!["approved", "rejected"].includes(decision)) {
         return res.status(400).json({ success: false, message: "decision must be 'approved' or 'rejected'" });
@@ -455,7 +457,7 @@ router.put("/transport-requests/:id/finance-decision", authenticateToken, author
 // off) since those are two different real-world events that can happen
 // at different times (approval today, bank transfer next week).
 // ============================================================
-router.put("/transport-requests/:id/mark-paid", authenticateToken, authorizeRoles("accounting", "accounting_manager", "admin"), async (req, res) => {
+router.put("/transport-requests/:id/mark-paid", authenticateToken, requirePermission(PERMISSIONS.ACCOUNTING_REQUESTS_QUEUE), async (req, res) => {
     try {
         const request = await HrTransportRequest.findByPk(req.params.id);
         if (!request) return res.status(404).json({ success: false, message: "Request not found" });
@@ -474,6 +476,86 @@ router.put("/transport-requests/:id/mark-paid", authenticateToken, authorizeRole
     } catch (err) {
         console.error("❌ HR TRANSPORT MARK PAID ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to mark request as paid" });
+    }
+});
+
+// ============================================================
+// DELETE /leave-requests/:id, /attendance-corrections/:id,
+// /transport-requests/:id -- self-service cancel. Requester-only, and only
+// while the request is still awaiting a decision (a typo/change-of-mind
+// fix); once any approve/reject decision has landed, canceling would erase
+// a record someone already acted on, so it's blocked past that point --
+// same reasoning as the mix/:recordNo cancel guard in stockHouse.js
+// blocking a cancel once real material has already moved. No route to
+// un-cancel: withdrawing just means re-submitting a fresh request.
+// ============================================================
+router.delete("/leave-requests/:id", authenticateToken, async (req, res) => {
+    try {
+        const request = await HrLeaveRequest.findByPk(req.params.id);
+        if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+        if (request.requesterUserId !== req.user.userId) {
+            return res.status(403).json({ success: false, message: "You can only cancel your own requests" });
+        }
+        if (["approved", "rejected"].includes(request.status)) {
+            return res.status(400).json({ success: false, message: "This request has already been decided and can no longer be canceled" });
+        }
+        await request.destroy();
+        res.json({ success: true });
+    } catch (err) {
+        console.error("❌ HR LEAVE CANCEL ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to cancel request" });
+    }
+});
+
+router.delete("/attendance-corrections/:id", authenticateToken, async (req, res) => {
+    try {
+        const request = await HrAttendanceCorrectionRequest.findByPk(req.params.id);
+        if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+        if (request.requesterUserId !== req.user.userId) {
+            return res.status(403).json({ success: false, message: "You can only cancel your own requests" });
+        }
+        if (["approved", "rejected"].includes(request.status)) {
+            return res.status(400).json({ success: false, message: "This request has already been decided and can no longer be canceled" });
+        }
+        const t = await HrAttendanceCorrectionRequest.sequelize.transaction();
+        try {
+            await HrAttendanceCorrectionRow.destroy({ where: { requestId: request.id }, transaction: t });
+            await request.destroy({ transaction: t });
+            await t.commit();
+        } catch (txErr) {
+            await t.rollback();
+            throw txErr;
+        }
+        res.json({ success: true });
+    } catch (err) {
+        console.error("❌ HR ATTENDANCE CANCEL ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to cancel request" });
+    }
+});
+
+router.delete("/transport-requests/:id", authenticateToken, async (req, res) => {
+    try {
+        const request = await HrTransportRequest.findByPk(req.params.id);
+        if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+        if (request.requesterUserId !== req.user.userId) {
+            return res.status(403).json({ success: false, message: "You can only cancel your own requests" });
+        }
+        if (["approved", "rejected"].includes(request.status)) {
+            return res.status(400).json({ success: false, message: "This request has already been decided and can no longer be canceled" });
+        }
+        const t = await HrTransportRequest.sequelize.transaction();
+        try {
+            await HrTransportAccompanier.destroy({ where: { requestId: request.id }, transaction: t });
+            await request.destroy({ transaction: t });
+            await t.commit();
+        } catch (txErr) {
+            await t.rollback();
+            throw txErr;
+        }
+        res.json({ success: true });
+    } catch (err) {
+        console.error("❌ HR TRANSPORT CANCEL ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to cancel request" });
     }
 });
 
@@ -574,7 +656,7 @@ router.get("/manager-approvals", authenticateToken, async (req, res) => {
 // ============================================================
 // GET /hr-queue -- everything awaiting HR review, all 3 types
 // ============================================================
-router.get("/hr-queue", authenticateToken, authorizeRoles("hr", "hr_manager", "admin"), async (req, res) => {
+router.get("/hr-queue", authenticateToken, requirePermission(PERMISSIONS.HR_REQUESTS_QUEUE), async (req, res) => {
     try {
         const [leave, attendance, transport] = await Promise.all([
             HrLeaveRequest.findAll({ where: { status: "pending_hr" }, order: [["createdAt", "ASC"]] }),
@@ -597,7 +679,7 @@ router.get("/hr-queue", authenticateToken, authorizeRoles("hr", "hr_manager", "a
 // ============================================================
 // GET /finance-queue -- transport requests awaiting finance approval
 // ============================================================
-router.get("/finance-queue", authenticateToken, authorizeRoles("accounting", "accounting_manager", "admin"), async (req, res) => {
+router.get("/finance-queue", authenticateToken, requirePermission(PERMISSIONS.ACCOUNTING_REQUESTS_QUEUE), async (req, res) => {
     try {
         const transport = await HrTransportRequest.findAll({
             where: { status: "pending_finance" },

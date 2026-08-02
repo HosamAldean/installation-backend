@@ -23,12 +23,14 @@ import multer from "multer";
 import path from "path";
 import fs from "fs";
 import { withSqlRetry } from "../config/db.js";
-import { authenticateToken, authorizeRoles } from "../middleware/auth.js";
+import { authenticateToken } from "../middleware/auth.js";
+import { requirePermission } from "../middleware/permissions.js";
+import { PERMISSIONS } from "../constants/permissions.js";
 import { User } from "../models/User.js";
 
 const router = express.Router();
 
-router.use(authenticateToken, authorizeRoles("material_user", "admin"));
+router.use(authenticateToken, requirePermission(PERMISSIONS.MATERIAL_STOCK_HOUSE));
 
 // Resolves which store a request should act on: a material_user's own
 // assignedStore always wins (can't be overridden by the request body); an
@@ -981,18 +983,262 @@ router.post("/mix/send", async (req, res) => {
     }
 });
 
-// PUT /api/stock-house/mix/:recordNo — edit the coating-company name and
-// sign-off officers only. fullColor is excluded even though it looks
-// descriptive: /mix/receive's resolveComputerNo call uses it as the target
-// color to identify the coated stock coming back, so it functions as a
-// ledger key for this entity, not a free-text attribute.
+// --- Material transfers (guest.MIXO/MIX with NameRequst='IN'/'OUT') ------
+// A genuinely separate feature from the coating send-out above, despite
+// sharing the same two tables. Confirmed live via the legacy Access app's
+// RequstRO/RequstR forms (COM/VBA-inspected directly): "add" on RequstRO
+// creates a MIXO header with NameRequst hardcoded to 'IN'; a user can also
+// set it to 'OUT' via the same field (a combo box, not locked). This is an
+// internal stock movement in/out of a store — unrelated to sending material
+// to an external coating company — and until now nothing in this app ever
+// wrote a MIXO row with either value: the frontend's "In / Out" report tab
+// was showing the (correct, but conceptually unrelated) reservation-balance
+// report from GET /remaining under a misleading label, because this half of
+// the feature — creating and listing these records — was never built. The
+// legacy app's own summary screen for this (ReportInOut) is confirmed
+// broken in the current file — its RecordSource references two objects,
+// QueryMIXA and EnterDouG1, that don't exist anywhere in this database
+// (checked directly: 0 hits in AllQueries, AllTables, or live SQL Server
+// INFORMATION_SCHEMA) — so it isn't ported here; GET /transfer below is a
+// list of these records against this app's own already-correct on-hand
+// computation instead of resurrecting an unrunnable formula.
+router.post("/transfer", async (req, res) => {
+    try {
+        const {
+            direction, profileNo, color, linthRe, computerNo, qty,
+            projectNo, stoukOfficer, stouckManger, storeNo: bodyStoreNo,
+        } = req.body;
+
+        const dir = String(direction || "").toUpperCase();
+        if (dir !== "IN" && dir !== "OUT") {
+            return res.status(400).json({ success: false, message: "direction must be 'IN' or 'OUT'" });
+        }
+        if (!profileNo || !color || linthRe === undefined || linthRe === null) {
+            return res.status(400).json({ success: false, message: "profileNo, color and linthRe are required" });
+        }
+        if (!projectNo) {
+            return res.status(400).json({ success: false, message: "projectNo is required" });
+        }
+        const qtyTransfer = parseInt(qty, 10);
+        if (!Number.isInteger(qtyTransfer) || qtyTransfer <= 0) {
+            return res.status(400).json({ success: false, message: "A positive qty is required" });
+        }
+        const storeNo = resolveStoreNo(req, bodyStoreNo);
+        if (!storeNo) {
+            return res.status(400).json({ success: false, message: "storeNo is required" });
+        }
+
+        const sUser = await resolveUsername(req);
+
+        const result = await withSqlRetry("stockhouse", async (pool) => {
+            const project = await resolveProject(pool, projectNo);
+            if (!project) return { error: "noProject" };
+
+            // Unlike a coating send, a transfer isn't required to match
+            // existing on-hand stock at creation time -- an 'IN' transfer is
+            // often the first record of that combination arriving in this
+            // store. Resolve an existing code if there is one; otherwise
+            // fall back to the same barcode-style generation /enter uses.
+            const resolved = await resolveComputerNo(pool, { profileNo, color, linthRe, storeNo, computerNo });
+
+            const transaction = pool.transaction();
+            await transaction.begin();
+            let recordNo;
+            try {
+                const headerResult = await transaction.request()
+                    .input("projectNo", projectNo)
+                    .input("projectName", project.ProjectName)
+                    .input("projectManger", project.ProjectManger)
+                    .input("stoukOfficer", stoukOfficer || null)
+                    .input("stouckManger", stouckManger || null)
+                    .input("nameRequst", dir)
+                    .input("storeNo", storeNo)
+                    .input("sUser", sUser)
+                    .query(`
+                        INSERT INTO guest.MIXO
+                            (RequstNo, DateRequst, NameRequst, ProjectNO, ProjectName, ProjectManger,
+                             StoukOfficer, StouckManger, DateSend, C, StoreNO, SUser, SDate)
+                        OUTPUT INSERTED.RecordNO
+                        VALUES
+                            (NULL, GETDATE(), @nameRequst, @projectNo, @projectName, @projectManger,
+                             @stoukOfficer, @stouckManger, GETDATE(), 1, @storeNo, @sUser, GETDATE())
+                    `);
+                recordNo = headerResult.recordset[0].RecordNO;
+
+                // Confirmed live (COM-inspected: the legacy RequstR report's
+                // qty control is bound to QtyAvl, not QtySend) and against
+                // 1,240 real historical IN/OUT rows already in this table --
+                // every one has QtySend=0 and the real transferred qty in
+                // QtyAvl. QtySend is the coating-send feature's field
+                // (see POST /mix/send above); this feature uses QtyAvl, so
+                // it's written here to match, with QtySend left at its
+                // legacy-consistent 0.
+                await transaction.request()
+                    .input("recordNo", recordNo)
+                    .input("profileNo", profileNo)
+                    .input("profileName", resolved.profileName || null)
+                    .input("color", color)
+                    .input("linthRe", linthRe)
+                    .input("qty", qtyTransfer)
+                    .input("computerNo", resolved.computerNo || null)
+                    .input("storeNo", storeNo)
+                    .input("sUser", sUser)
+                    .query(`
+                        INSERT INTO guest.MIX
+                            (RecordNO, SerialNo, ProfileNO, ProfileName, QtySend, Color, LinthRe, QtyAvl, QtyOut, ComputerNO, StoreNo, SUser, SDate)
+                        VALUES
+                            (@recordNo, 1, @profileNo, @profileName, 0, @color, @linthRe, @qty, 0, @computerNo, @storeNo, @sUser, GETDATE())
+                    `);
+
+                await transaction.commit();
+            } catch (txErr) {
+                await transaction.rollback();
+                throw txErr;
+            }
+
+            return { recordNo };
+        });
+
+        if (result.error === "noProject") {
+            return res.status(404).json({ success: false, message: "Project not found" });
+        }
+
+        res.status(201).json({ success: true, recordNo: result.recordNo });
+    } catch (err) {
+        console.error("❌ STOCK HOUSE TRANSFER CREATE ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to create transfer" });
+    }
+});
+
+// GET /api/stock-house/transfer — list IN/OUT transfer records, store-scoped
+// like every other list endpoint here (access via HAVING/WHERE on the
+// caller's assignedStore, not a pre-filter).
+router.get("/transfer", async (req, res) => {
+    try {
+        const { projectNo } = req.query;
+        const storeNo = req.user.assignedStore || (req.query.storeNo ? parseInt(req.query.storeNo, 10) : null);
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 25));
+        const offset = (page - 1) * pageSize;
+
+        const whereParts = ["mo.NameRequst IN ('IN', 'OUT')"];
+        if (projectNo) whereParts.push("mo.ProjectNO = @projectNo");
+        if (storeNo) whereParts.push("mo.StoreNO = @storeNo");
+        const whereClause = `WHERE ${whereParts.join(" AND ")}`;
+
+        const { total, rows } = await withSqlRetry("stockhouse", async (pool) => {
+            const buildRequest = () => {
+                const r = pool.request();
+                if (projectNo) r.input("projectNo", projectNo);
+                if (storeNo) r.input("storeNo", storeNo);
+                return r;
+            };
+
+            const countResult = await buildRequest().query(`
+                SELECT COUNT(*) AS total FROM guest.MIXO mo ${whereClause}
+            `);
+
+            const rowsResult = await buildRequest()
+                .input("offset", offset)
+                .input("pageSize", pageSize)
+                .query(`
+                    SELECT
+                        mo.RecordNO, mo.RequstNo, mo.DateRequst, mo.NameRequst AS direction,
+                        mo.ProjectNO, mo.ProjectName, mo.StoreNO,
+                        ISNULL(lines.qty, 0) AS qty, ISNULL(lines.lineCount, 0) AS lineCount
+                    FROM guest.MIXO mo
+                    LEFT JOIN (
+                        SELECT RecordNO, SUM(QtyAvl) AS qty, COUNT(*) AS lineCount
+                        FROM guest.MIX
+                        GROUP BY RecordNO
+                    ) lines ON lines.RecordNO = mo.RecordNO
+                    ${whereClause}
+                    ORDER BY mo.RecordNO DESC
+                    OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY
+                `);
+
+            return { total: countResult.recordset[0].total, rows: rowsResult.recordset };
+        });
+
+        res.json({ success: true, items: rows, total, page, pageSize });
+    } catch (err) {
+        console.error("❌ STOCK HOUSE TRANSFER LIST ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to fetch transfers" });
+    }
+});
+
+// GET /api/stock-house/transfer/:recordNo — header+items print/detail view,
+// same shape as GET /mix/:recordNo.
+router.get("/transfer/:recordNo", async (req, res) => {
+    try {
+        const recordNo = parseInt(req.params.recordNo, 10);
+        if (!Number.isInteger(recordNo)) {
+            return res.status(400).json({ success: false, message: "Invalid record number" });
+        }
+
+        const result = await withSqlRetry("stockhouse", async (pool) => {
+            const headerResult = await pool.request()
+                .input("recordNo", recordNo)
+                .query(`
+                    SELECT RecordNO, RequstNo, DateRequst, NameRequst AS direction, ProjectNO, ProjectName, ProjectManger,
+                           StoukOfficer, StouckManger, DateSend, StoreNO
+                    FROM guest.MIXO
+                    WHERE RecordNO = @recordNo AND NameRequst IN ('IN', 'OUT')
+                `);
+            const header = headerResult.recordset[0];
+            if (!header) return null;
+
+            const itemsResult = await pool.request()
+                .input("recordNo", recordNo)
+                .query(`
+                    SELECT SerialNo, ProfileNO, ProfileName, Color, LinthRe, QtyAvl AS qty, ComputerNO
+                    FROM guest.MIX
+                    WHERE RecordNO = @recordNo
+                    ORDER BY SerialNo
+                `);
+
+            return { header, items: itemsResult.recordset };
+        });
+
+        if (!result) {
+            return res.status(404).json({ success: false, message: "Transfer record not found" });
+        }
+        res.json({ success: true, header: result.header, items: result.items });
+    } catch (err) {
+        console.error("❌ STOCK HOUSE TRANSFER RECORD ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to fetch transfer record" });
+    }
+});
+
+// PUT /api/stock-house/mix/:recordNo — edit the coating-company name,
+// sign-off officers, and (optionally) the fields that complete the second
+// phase of the request's real lifecycle: RequstNo (formal request #) and
+// DateSend (actual dispatch date), plus MIX.Color1 (the coating company's
+// matched/actual color) on one line item. Confirmed via COM/VBA + live data
+// (same-day production rows) that legacy leaves all three blank at creation
+// and fills them in later, by hand, once the batch is actually logged/sent
+// to the coating company — there's no button that does this automatically,
+// just plain bound fields on the MIXO/MIX forms. This app's own POST
+// /mix/send writes RequstNo=NULL permanently and stamps DateSend at create
+// time, with previously no way to ever revisit either. requstNo/dateSend/
+// color1 are applied only when present in the body (unlike coatingCompany/
+// stoukOfficer/stouckManger below, which always overwrite) so that editing
+// one doesn't accidentally clear one of the others set in a separate call.
+// fullColor is excluded even though it looks descriptive: /mix/receive's
+// resolveComputerNo call uses it as the target color to identify the coated
+// stock coming back, so it functions as a ledger key for this entity, not a
+// free-text attribute.
 router.put("/mix/:recordNo", async (req, res) => {
     try {
         const recordNo = parseInt(req.params.recordNo, 10);
         if (!Number.isInteger(recordNo)) {
             return res.status(400).json({ success: false, message: "Invalid recordNo" });
         }
-        const { coatingCompany, stoukOfficer, stouckManger } = req.body;
+        const { coatingCompany, stoukOfficer, stouckManger, requstNo, dateSend, color1, serialNo } = req.body;
+        const lineSerialNo = serialNo ? parseInt(serialNo, 10) : 1;
+        if (!Number.isInteger(lineSerialNo)) {
+            return res.status(400).json({ success: false, message: "Invalid serialNo" });
+        }
 
         const result = await withSqlRetry("stockhouse", async (pool) => {
             const existing = await pool.request()
@@ -1002,16 +1248,32 @@ router.put("/mix/:recordNo", async (req, res) => {
             if (!row) return { error: "notFound" };
             if (req.user.assignedStore && row.StoreNO !== req.user.assignedStore) return { error: "forbidden" };
 
-            await pool.request()
+            const headerSets = ["NameRequst = @nameRequst", "StoukOfficer = @stoukOfficer", "StouckManger = @stouckManger"];
+            const headerRequest = pool.request()
                 .input("recordNo", recordNo)
                 .input("nameRequst", coatingCompany?.trim() || "MIX")
                 .input("stoukOfficer", stoukOfficer || null)
-                .input("stouckManger", stouckManger || null)
-                .query(`
-                    UPDATE guest.MIXO
-                    SET NameRequst = @nameRequst, StoukOfficer = @stoukOfficer, StouckManger = @stouckManger
-                    WHERE RecordNO = @recordNo
-                `);
+                .input("stouckManger", stouckManger || null);
+            if (requstNo !== undefined) {
+                headerSets.push("RequstNo = @requstNo");
+                headerRequest.input("requstNo", requstNo ? String(requstNo).trim() : null);
+            }
+            if (dateSend !== undefined) {
+                headerSets.push("DateSend = @dateSend");
+                headerRequest.input("dateSend", dateSend || null);
+            }
+            await headerRequest.query(`UPDATE guest.MIXO SET ${headerSets.join(", ")} WHERE RecordNO = @recordNo`);
+
+            if (color1 !== undefined) {
+                await pool.request()
+                    .input("recordNo", recordNo)
+                    .input("serialNo", lineSerialNo)
+                    .input("color1", color1 ? String(color1).trim() : null)
+                    .query(`
+                        UPDATE guest.MIX SET Color1 = @color1
+                        WHERE RecordNO = @recordNo AND SerialNo = @serialNo
+                    `);
+            }
             return { ok: true };
         });
 
@@ -1025,6 +1287,78 @@ router.put("/mix/:recordNo", async (req, res) => {
     } catch (err) {
         console.error("❌ STOCK HOUSE MIX UPDATE ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to update coating send-out record" });
+    }
+});
+
+// DELETE /api/stock-house/mix/:recordNo — cancel a coating-send/transfer
+// request (the legacy Access "Cancel Request" button, present on MIXO/
+// RequstO/RequstRO — confirmed via COM/VBA that all three just call the
+// same shared M1.Cancel() sub against whichever form is currently open,
+// which runs DoCmd.DoMenuItem acEditMenu Select-Record then Delete on the
+// bound MIXO row after a Yes/No confirm; RequstO/RequstRO are themselves
+// just a printable-document layer over MIXO/MIX, per this file's own
+// earlier findings, so canceling the MIXO record is the one real action
+// under all three legacy "Cancel Request" buttons).
+//
+// Deliberately NOT a byte-for-byte port: the legacy delete only removes the
+// current record on the bound *main* form — MIXO's own MIX subform items
+// are never cascade-deleted (confirmed: MIXO/MIX have no FK, no VBA delete
+// of the subform), so the real legacy button silently orphans MIX line
+// items on every use. Cascade-deletes MIX rows for this RecordNO in the
+// same transaction instead — same category of deliberate improvement as
+// Min Stock's order/item delete guards (see routes/mainStock.js). Also
+// blocked (409) if any line item already has QtyOut > 0 (material already
+// received back from coating) — canceling then would silently lose the
+// record of material that's real, physical, and already back in stock.
+router.delete("/mix/:recordNo", async (req, res) => {
+    try {
+        const recordNo = parseInt(req.params.recordNo, 10);
+        if (!Number.isInteger(recordNo)) {
+            return res.status(400).json({ success: false, message: "Invalid recordNo" });
+        }
+
+        const result = await withSqlRetry("stockhouse", async (pool) => {
+            const existing = await pool.request()
+                .input("recordNo", recordNo)
+                .query("SELECT StoreNO FROM guest.MIXO WHERE RecordNO = @recordNo");
+            const row = existing.recordset[0];
+            if (!row) return { error: "notFound" };
+            if (req.user.assignedStore && row.StoreNO !== req.user.assignedStore) return { error: "forbidden" };
+
+            const receivedResult = await pool.request()
+                .input("recordNo", recordNo)
+                .query("SELECT ISNULL(SUM(QtyOut), 0) AS received FROM guest.MIX WHERE RecordNO = @recordNo");
+            if (receivedResult.recordset[0].received > 0) return { error: "alreadyReceived" };
+
+            const transaction = pool.transaction();
+            await transaction.begin();
+            try {
+                await transaction.request().input("recordNo", recordNo).query("DELETE FROM guest.MIX WHERE RecordNO = @recordNo");
+                await transaction.request().input("recordNo", recordNo).query("DELETE FROM guest.MIXO WHERE RecordNO = @recordNo");
+                await transaction.commit();
+            } catch (txErr) {
+                await transaction.rollback();
+                throw txErr;
+            }
+            return { ok: true };
+        });
+
+        if (result.error === "notFound") {
+            return res.status(404).json({ success: false, message: "Coating send-out record not found" });
+        }
+        if (result.error === "forbidden") {
+            return res.status(403).json({ success: false, message: "Not accessible from your store" });
+        }
+        if (result.error === "alreadyReceived") {
+            return res.status(409).json({
+                success: false,
+                message: "Cannot cancel — material has already been received back from coating for this request",
+            });
+        }
+        res.json({ success: true });
+    } catch (err) {
+        console.error("❌ STOCK HOUSE MIX CANCEL ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to cancel coating send-out record" });
     }
 });
 
@@ -1079,10 +1413,14 @@ router.post("/mix/receive", async (req, res) => {
 
             // A coating batch can come back in more than one partial delivery —
             // accumulate QtyOut across receive calls rather than overwriting it,
-            // and don't let the total exceed what was actually sent.
+            // and don't let the total exceed what was actually sent. QtyAvl,
+            // not QtySend, is the real "sent" column here (see GET
+            // /mix/outstanding above for the full finding) -- using QtySend
+            // made this cap check reject virtually every receive attempt
+            // against a legacy-created request (0 already > mix.QtySend of 0).
             const alreadyReceived = mix.QtyOut || 0;
-            if (alreadyReceived + qtyReceived > mix.QtySend) {
-                return { error: "exceedsRemaining", remaining: mix.QtySend - alreadyReceived, sent: mix.QtySend, received: alreadyReceived };
+            if (alreadyReceived + qtyReceived > mix.QtyAvl) {
+                return { error: "exceedsRemaining", remaining: mix.QtyAvl - alreadyReceived, sent: mix.QtyAvl, received: alreadyReceived };
             }
 
             // The coated combination (profile + target color + same length) is
@@ -1173,7 +1511,7 @@ router.post("/mix/receive", async (req, res) => {
 });
 
 // GET /api/stock-house/mix/outstanding?storeNo=&page=&pageSize= — individual
-// MIX send records not yet fully received back from coating (QtySend >
+// MIX send records not yet fully received back from coating (QtyAvl >
 // QtyOut), each with its own RecordNO/SerialNo — the pick list for
 // POST /mix/receive's mixRecordNo/mixSerialNo. GET /remaining's inCoating
 // section only returns project+profile+color+length aggregates (grouped,
@@ -1189,11 +1527,21 @@ router.get("/mix/outstanding", async (req, res) => {
         const { total, rows } = await withSqlRetry("stockhouse", async (pool) => {
             const buildRequest = () => pool.request().input("storeNo", storeNo);
 
-            // Same > 0 filter (not <> 0) as /remaining's inCoating section, and
-            // for the same reason: some historical MIX rows from the old Access
-            // app never had QtySend populated consistently, which would
-            // otherwise show up here as nonsense negative-outstanding rows.
-            const whereClause = "WHERE (mx.QtySend - mx.QtyOut) > 0 AND (@storeNo IS NULL OR mx.StoreNo = @storeNo)";
+            // QtyAvl, not QtySend, is the real "quantity sent to coating"
+            // column -- confirmed via COM inspection of the legacy MIX
+            // subform, where the control literally named "QtyRe" is bound to
+            // ControlSource QtyAvl and the control named "QtySend" is bound
+            // to ControlSource QtyOut (a legacy label/column mismatch, same
+            // class of bug as StockBack.QtyOut/QtyAvl above). Live data
+            // confirms it: across all 51k MIX rows, the real QtySend column
+            // is nonzero on exactly 1 row, while QtyAvl is populated on 96%
+            // of them -- so filtering/comparing on QtySend (as this endpoint
+            // used to) silently excluded virtually every coating request
+            // that originated in the still-actively-used legacy Access app,
+            // making "Receive from Coating" non-functional for almost all
+            // real data. QtyOut's meaning is correct as-is (confirmed: rows
+            // fully received back have QtyAvl === QtyOut).
+            const whereClause = "WHERE (mx.QtyAvl - mx.QtyOut) > 0 AND (@storeNo IS NULL OR mx.StoreNo = @storeNo)";
 
             const countResult = await buildRequest().query(`
                 SELECT COUNT(*) AS total
@@ -1207,7 +1555,8 @@ router.get("/mix/outstanding", async (req, res) => {
                 SELECT
                     mx.RecordNO, mx.SerialNo, mo.ProjectNO, mo.ProjectName, mo.FullColor AS targetColor,
                     mx.ProfileNO, mx.ProfileName, mx.Color AS millColor, mx.LinthRe, mx.StoreNo,
-                    mx.QtySend, mx.QtyOut, (mx.QtySend - mx.QtyOut) AS outstanding, mx.SDate
+                    mx.QtyAvl AS QtySend, mx.QtyOut, (mx.QtyAvl - mx.QtyOut) AS outstanding, mx.SDate,
+                    mo.RequstNo, mo.DateSend, mx.Color1
                 FROM guest.MIX mx JOIN guest.MIXO mo ON mx.RecordNO = mo.RecordNO
                 ${whereClause}
                 ORDER BY mx.SDate DESC
@@ -1234,7 +1583,9 @@ router.get("/mix/outstanding", async (req, res) => {
 // this is that missing print step, not a new workflow. Registered after
 // the literal /mix/outstanding route above so it doesn't shadow it (Express
 // matches GET routes in registration order, and :recordNo would otherwise
-// swallow the literal "outstanding" path segment first).
+// swallow the literal "outstanding" path segment first). Items query pulls
+// the "sent" quantity from QtyAvl, aliased back to QtySend — see the
+// QtyAvl/QtySend finding documented on GET /mix/outstanding above.
 router.get("/mix/:recordNo", async (req, res) => {
     try {
         const recordNo = parseInt(req.params.recordNo, 10);
@@ -1257,8 +1608,8 @@ router.get("/mix/:recordNo", async (req, res) => {
             const itemsResult = await pool.request()
                 .input("recordNo", recordNo)
                 .query(`
-                    SELECT SerialNo, ProfileNO, ProfileName, Color, LinthRe, QtySend, QtyOut,
-                           (QtySend - QtyOut) AS outstanding
+                    SELECT SerialNo, ProfileNO, ProfileName, Color, LinthRe, QtyAvl AS QtySend, QtyOut,
+                           (QtyAvl - QtyOut) AS outstanding
                     FROM guest.MIX
                     WHERE RecordNO = @recordNo
                     ORDER BY SerialNo
@@ -1584,23 +1935,23 @@ router.get("/remaining", async (req, res) => {
         }
         const coatingWhere = coatingFilters.length ? `AND ${coatingFilters.join(" AND ")}` : "";
 
-        // Filtered to > 0 (not <> 0): some historical MIX rows from the old
-        // Access app never had QtySend populated consistently (0/null with
-        // a real QtyOut anyway), which would otherwise show as a nonsense
-        // negative "in coating" amount. Only genuinely outstanding sends —
-        // this new app's own /mix/send always sets QtySend, so this only
-        // affects legacy rows, not anything created going forward.
+        // QtyAvl, not QtySend, is the real "sent to coating" column here —
+        // see the finding documented on GET /mix/outstanding above (same
+        // legacy label/column mismatch as StockBack.QtyOut/QtyAvl). Using
+        // QtySend meant this silently excluded virtually every in-progress
+        // coating request that originated in the legacy Access app, which
+        // is still in active parallel use, not just "historical" data.
         const inCoatingResult = await coatingRequest.query(`
             SELECT
                 mo.ProjectNO, MAX(mo.ProjectName) AS ProjectName,
                 mx.ProfileNO, MAX(mx.ProfileName) AS ProfileName,
                 mx.Color AS millColor, MAX(mo.FullColor) AS targetColor, mx.LinthRe, mx.StoreNo,
-                SUM(mx.QtySend) AS sent, SUM(mx.QtyOut) AS received,
-                SUM(mx.QtySend) - SUM(mx.QtyOut) AS inCoating
+                SUM(mx.QtyAvl) AS sent, SUM(mx.QtyOut) AS received,
+                SUM(mx.QtyAvl) - SUM(mx.QtyOut) AS inCoating
             FROM guest.MIX mx JOIN guest.MIXO mo ON mx.RecordNO = mo.RecordNO
             WHERE 1=1 ${coatingWhere}
             GROUP BY mo.ProjectNO, mx.ProfileNO, mx.Color, mx.LinthRe, mx.StoreNo
-            HAVING SUM(mx.QtySend) - SUM(mx.QtyOut) > 0
+            HAVING SUM(mx.QtyAvl) - SUM(mx.QtyOut) > 0
             ORDER BY mo.ProjectNO, mx.ProfileNO
         `);
 
@@ -1967,6 +2318,68 @@ router.get("/reservation-f/:recordNo/items", async (req, res) => {
     } catch (err) {
         console.error("❌ STOCK HOUSE RESERVATION-F ITEMS ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to fetch feasibility check items" });
+    }
+});
+
+// DELETE /api/stock-house/reservation-f/:recordNo — cancel a production
+// feasibility check (the legacy "Cancel Request" button on ReservationFO,
+// COM/VBA-confirmed to call the same shared M1.Cancel() sub as MIXO/
+// RequstO/RequstRO — see DELETE /mix/:recordNo above for the full finding).
+// Same deliberate improvement over the legacy behavior: cascade-deletes
+// ReservationF line items in the same transaction (the legacy delete only
+// removes the ReservationFO header, orphaning ReservationF rows — confirmed
+// via COM: no FK, no subform cascade), and blocks (409) if any line item
+// already has QtyOut > 0 (material already consumed against this
+// feasibility check).
+router.delete("/reservation-f/:recordNo", async (req, res) => {
+    try {
+        const recordNo = parseInt(req.params.recordNo, 10);
+        if (!Number.isInteger(recordNo)) {
+            return res.status(400).json({ success: false, message: "Invalid recordNo" });
+        }
+
+        const result = await withSqlRetry("stockhouse", async (pool) => {
+            const existing = await pool.request()
+                .input("recordNo", recordNo)
+                .query("SELECT StoreNo FROM guest.ReservationFO WHERE RecordNO = @recordNo");
+            const row = existing.recordset[0];
+            if (!row) return { error: "notFound" };
+            if (req.user.assignedStore && row.StoreNo !== req.user.assignedStore) return { error: "forbidden" };
+
+            const consumedResult = await pool.request()
+                .input("recordNo", recordNo)
+                .query("SELECT ISNULL(SUM(QtyOut), 0) AS consumed FROM guest.ReservationF WHERE RecordNO = @recordNo");
+            if (consumedResult.recordset[0].consumed > 0) return { error: "alreadyConsumed" };
+
+            const transaction = pool.transaction();
+            await transaction.begin();
+            try {
+                await transaction.request().input("recordNo", recordNo).query("DELETE FROM guest.ReservationF WHERE RecordNO = @recordNo");
+                await transaction.request().input("recordNo", recordNo).query("DELETE FROM guest.ReservationFO WHERE RecordNO = @recordNo");
+                await transaction.commit();
+            } catch (txErr) {
+                await transaction.rollback();
+                throw txErr;
+            }
+            return { ok: true };
+        });
+
+        if (result.error === "notFound") {
+            return res.status(404).json({ success: false, message: "Feasibility check record not found" });
+        }
+        if (result.error === "forbidden") {
+            return res.status(403).json({ success: false, message: "Not accessible from your store" });
+        }
+        if (result.error === "alreadyConsumed") {
+            return res.status(409).json({
+                success: false,
+                message: "Cannot cancel — material has already been consumed against this feasibility check",
+            });
+        }
+        res.json({ success: true });
+    } catch (err) {
+        console.error("❌ STOCK HOUSE RESERVATION-F CANCEL ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to cancel feasibility check record" });
     }
 });
 

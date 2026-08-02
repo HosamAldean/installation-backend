@@ -3,7 +3,9 @@
 // Offices). See Migration Blueprint §07 "Clients".
 import express from 'express';
 import { Op } from 'sequelize';
-import { authenticateToken, authorizeRoles } from '../middleware/auth.js';
+import { authenticateToken } from '../middleware/auth.js';
+import { requirePermission } from '../middleware/permissions.js';
+import { PERMISSIONS } from '../constants/permissions.js';
 import { Client } from '../models/Client.js';
 import { ClientReference } from '../models/ClientReference.js';
 import { ArchOffice } from '../models/ArchOffice.js';
@@ -11,14 +13,11 @@ import { ArchOffice } from '../models/ArchOffice.js';
 const router = express.Router();
 router.use(authenticateToken);
 
-const canWrite = authorizeRoles('sales', 'sales_manager', 'project_manager', 'admin');
-const canRead = authorizeRoles(
-    'sales',
-    'sales_manager',
-    'project_manager',
-    'accounting',
-    'admin',
-);
+// Also reused below by archOfficesRouter -- Arch Offices has no separate
+// frontend page/nav item of its own (it's a lookup used within
+// Clients/Offers forms), so it shares the Clients permission key rather
+// than getting a 12th key of its own.
+const canAccess = requirePermission(PERMISSIONS.PETRA_ERP_CLIENTS);
 
 function whitelist(model, body, excluding = []) {
     const attrs = Object.keys(model.getAttributes()).filter((a) => !excluding.includes(a));
@@ -30,7 +29,7 @@ function whitelist(model, body, excluding = []) {
 /* ---------------- Clients ---------------- */
 
 // GET /api/clients?page=&pageSize=&q=
-router.get('/', canRead, async (req, res) => {
+router.get('/', canAccess, async (req, res) => {
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const pageSize = Math.min(200, Math.max(1, parseInt(req.query.pageSize) || 50));
     const q = String(req.query.q || '').trim();
@@ -46,14 +45,14 @@ router.get('/', canRead, async (req, res) => {
 });
 
 // GET /api/clients/:id
-router.get('/:id', canRead, async (req, res) => {
+router.get('/:id', canAccess, async (req, res) => {
     const client = await Client.findByPk(req.params.id);
     if (!client) return res.status(404).json({ message: 'Not found' });
     res.json(client);
 });
 
 // POST /api/clients
-router.post('/', canWrite, async (req, res) => {
+router.post('/', canAccess, async (req, res) => {
     if (!req.body.clientName || !String(req.body.clientName).trim()) {
         return res.status(400).json({ message: 'clientName is required' });
     }
@@ -62,7 +61,7 @@ router.post('/', canWrite, async (req, res) => {
 });
 
 // PATCH /api/clients/:id
-router.patch('/:id', canWrite, async (req, res) => {
+router.patch('/:id', canAccess, async (req, res) => {
     const client = await Client.findByPk(req.params.id);
     if (!client) return res.status(404).json({ message: 'Not found' });
     await client.update(whitelist(Client, req.body, ['clientId']));
@@ -72,13 +71,13 @@ router.patch('/:id', canWrite, async (req, res) => {
 /* ---------------- Client References ---------------- */
 
 // GET /api/clients/:id/references
-router.get('/:id/references', canRead, async (req, res) => {
+router.get('/:id/references', canAccess, async (req, res) => {
     const references = await ClientReference.findAll({ where: { clientId: req.params.id } });
     res.json({ references });
 });
 
 // POST /api/clients/:id/references
-router.post('/:id/references', canWrite, async (req, res) => {
+router.post('/:id/references', canAccess, async (req, res) => {
     if (!req.body.clientReferenceName || !String(req.body.clientReferenceName).trim()) {
         return res.status(400).json({ message: 'clientReferenceName is required' });
     }
@@ -88,7 +87,7 @@ router.post('/:id/references', canWrite, async (req, res) => {
 });
 
 // PATCH /api/clients/:id/references/:refId
-router.patch('/:id/references/:refId', canWrite, async (req, res) => {
+router.patch('/:id/references/:refId', canAccess, async (req, res) => {
     const reference = await ClientReference.findOne({
         where: { clientReferenceId: req.params.refId, clientId: req.params.id },
     });
@@ -98,7 +97,7 @@ router.patch('/:id/references/:refId', canWrite, async (req, res) => {
 });
 
 // DELETE /api/clients/:id/references/:refId
-router.delete('/:id/references/:refId', canWrite, async (req, res) => {
+router.delete('/:id/references/:refId', canAccess, async (req, res) => {
     const deleted = await ClientReference.destroy({
         where: { clientReferenceId: req.params.refId, clientId: req.params.id },
     });
@@ -115,7 +114,7 @@ export default router;
 export const archOfficesRouter = express.Router();
 archOfficesRouter.use(authenticateToken);
 
-archOfficesRouter.get('/', canRead, async (req, res) => {
+archOfficesRouter.get('/', canAccess, async (req, res) => {
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const pageSize = Math.min(200, Math.max(1, parseInt(req.query.pageSize) || 50));
     const q = String(req.query.q || '').trim();
@@ -130,13 +129,13 @@ archOfficesRouter.get('/', canRead, async (req, res) => {
     res.json({ total: count, archOffices: rows });
 });
 
-archOfficesRouter.get('/:id', canRead, async (req, res) => {
+archOfficesRouter.get('/:id', canAccess, async (req, res) => {
     const office = await ArchOffice.findByPk(req.params.id);
     if (!office) return res.status(404).json({ message: 'Not found' });
     res.json(office);
 });
 
-archOfficesRouter.post('/', canWrite, async (req, res) => {
+archOfficesRouter.post('/', canAccess, async (req, res) => {
     if (!req.body.archOfficeName || !String(req.body.archOfficeName).trim()) {
         return res.status(400).json({ message: 'archOfficeName is required' });
     }
@@ -144,7 +143,7 @@ archOfficesRouter.post('/', canWrite, async (req, res) => {
     res.status(201).json(office);
 });
 
-archOfficesRouter.patch('/:id', canWrite, async (req, res) => {
+archOfficesRouter.patch('/:id', canAccess, async (req, res) => {
     const office = await ArchOffice.findByPk(req.params.id);
     if (!office) return res.status(404).json({ message: 'Not found' });
     await office.update(whitelist(ArchOffice, req.body, ['archOfficeId']));

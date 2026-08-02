@@ -1,13 +1,15 @@
 ﻿import express from 'express';
 import { withSqlRetry } from '../config/db.js';
-import { authenticateToken, authorizeRoles } from '../middleware/auth.js';
+import { authenticateToken } from '../middleware/auth.js';
+import { requirePermission } from '../middleware/permissions.js';
+import { PERMISSIONS } from '../constants/permissions.js';
 
 const router = express.Router();
 // Previously unauthenticated — leaked every active employee's hourly salary
 // (Basic_Salary / 240) to any caller with network access. Gate to
 // manager/admin like the rest of the employee/team-management surface.
 router.use(authenticateToken);
-router.use(authorizeRoles('installation_manager', 'admin'));
+router.use(requirePermission(PERMISSIONS.INSTALLATION_EMPLOYEES));
 
 /**
  * ✅ GET /api/employees

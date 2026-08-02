@@ -2,7 +2,9 @@
 import express from "express";
 import { sequelize, sequelize2, withSqlRetry } from "../config/db.js";
 import { QueryTypes } from "sequelize";
-import { authenticateToken, authorizeRoles } from "../middleware/auth.js";
+import { authenticateToken } from "../middleware/auth.js";
+import { requirePermission } from "../middleware/permissions.js";
+import { PERMISSIONS } from "../constants/permissions.js";
 import multer from "multer";
 import path from "path";
 import fs from "fs";
@@ -89,7 +91,7 @@ const safeArabic = (text) => {
 ================================================================ */
 // GET /api/follow-up/my-orders
 // GET /api/follow-up/my-orders
-router.get('/my-orders', authenticateToken, authorizeRoles('user', 'admin'), async (req, res) => {
+router.get('/my-orders', authenticateToken, requirePermission(PERMISSIONS.FIELD_TRACKING), async (req, res) => {
     try {
         const assignedEmpNo = req.user.assignedEmpNo; // make sure this exists on req.user
 
@@ -343,7 +345,7 @@ async function upsertTeamLocation(teamId, lat, lng) {
 // ("media") is generic on purpose, since it may be either an image or a
 // video; multer/storage don't care about content type, and image_after is
 // just a URL string column regardless of what kind of file it points to.
-router.post("/order-step/update", authenticateToken, authorizeRoles('user', 'admin'), upload.single("media"), async (req, res) => {
+router.post("/order-step/update", authenticateToken, requirePermission(PERMISSIONS.FIELD_TRACKING), upload.single("media"), async (req, res) => {
     try {
         const { stepId, status, lat, lng } = req.body;
         const userId = req.user.userId;
@@ -504,7 +506,7 @@ router.post("/order-step/photo", authenticateToken, upload.single("photo"), asyn
 });
 
 // ------------------------ POST Step Issue ------------------------
-router.post("/order-step/issue", authenticateToken, authorizeRoles('user', 'admin'), upload.single("photo"), async (req, res) => {
+router.post("/order-step/issue", authenticateToken, requirePermission(PERMISSIONS.FIELD_TRACKING), upload.single("photo"), async (req, res) => {
     try {
         const { stepId, note, lat, lng } = req.body;
         const userId = req.user.userId;
@@ -556,7 +558,7 @@ router.post("/order-step/issue", authenticateToken, authorizeRoles('user', 'admi
 /** ------------------------
  * POST Team Checkpoint
  * ------------------------ */
-router.post("/team/checkpoint", authenticateToken, authorizeRoles('user', 'admin'), async (req, res) => {
+router.post("/team/checkpoint", authenticateToken, requirePermission(PERMISSIONS.FIELD_TRACKING), async (req, res) => {
     try {
         const { lat, lng, checkpointType, orderId, notes } = req.body;
         if (typeof lat !== 'number' || typeof lng !== 'number') {
@@ -620,7 +622,7 @@ router.post("/team/checkpoint", authenticateToken, authorizeRoles('user', 'admin
 /** ------------------------
  * GET Live Team Locations
  * ------------------------ */
-router.get('/team/locations', authenticateToken, authorizeRoles('installation_manager', 'admin'), async (req, res) => {
+router.get('/team/locations', authenticateToken, requirePermission(PERMISSIONS.INSTALLATION_REPORTS), async (req, res) => {
     try {
         // Return latest row per team with team info (optimized for MySQL/MariaDB)
         const rows = await sequelize2.query(
@@ -650,7 +652,7 @@ router.get('/team/locations', authenticateToken, authorizeRoles('installation_ma
  * indicator — a team is online if any of its logged-in members currently
  * has isOnline=true (set on login, cleared on explicit logout).
  */
-router.get('/team/online-status', authenticateToken, authorizeRoles('installation_manager', 'admin'), async (req, res) => {
+router.get('/team/online-status', authenticateToken, requirePermission(PERMISSIONS.INSTALLATION_REPORTS), async (req, res) => {
     try {
         // InsUser.teamId is stale/unreliable (the JWT deliberately omits it —
         // see auth.js login) — the real team is resolved the same way every
@@ -682,7 +684,7 @@ router.get('/team/online-status', authenticateToken, authorizeRoles('installatio
  * GET history for a team
  * Returns last N pings for team_id ordered by ping_time asc (for proper path drawing)
  */
-router.get('/team/history/:teamId', authenticateToken, authorizeRoles('installation_manager', 'admin'), async (req, res) => {
+router.get('/team/history/:teamId', authenticateToken, requirePermission(PERMISSIONS.INSTALLATION_REPORTS), async (req, res) => {
     try {
         const teamId = parseInt(req.params.teamId, 10);
         if (!teamId) return res.status(400).json({ success: false, message: 'teamId required' });
@@ -752,7 +754,7 @@ router.get("/my-orders/:orderId/last-checkpoint", authenticateToken, async (req,
 // ===============================
 // STEP 1: GET STOCK + STOCKO
 // ===============================
-router.get("/scan-basic/:barcode", authenticateToken, authorizeRoles('user', 'admin'), async (req, res) => {
+router.get("/scan-basic/:barcode", authenticateToken, requirePermission(PERMISSIONS.FIELD_TRACKING), async (req, res) => {
     try {
         const { barcode } = req.params;
 
@@ -880,7 +882,7 @@ router.get("/scan-basic/:barcode", authenticateToken, authorizeRoles('user', 'ad
 });
 
 // GET /api/follow-up/delivered-items
-router.get('/delivered-items', authenticateToken, authorizeRoles('user', 'admin'), async (req, res) => {
+router.get('/delivered-items', authenticateToken, requirePermission(PERMISSIONS.FIELD_TRACKING), async (req, res) => {
     try {
         const assignedEmpNo = req.user.assignedEmpNo;
 
@@ -1146,7 +1148,7 @@ router.post("/confirm-delivery-batch", authenticateToken, async (req, res) => {
 
 // POST /api/follow-up/delivery-status
 // Confirms a delivery as DELIVERED or MISSING, with an optional photo (mobile).
-router.post("/delivery-status", authenticateToken, authorizeRoles('user', 'admin'), uploadDeliveryPhoto.single("photo"), async (req, res) => {
+router.post("/delivery-status", authenticateToken, requirePermission(PERMISSIONS.FIELD_TRACKING), uploadDeliveryPhoto.single("photo"), async (req, res) => {
     try {
         const { barcode, note } = req.body;
         const status = (req.body.status || "DELIVERED").toUpperCase();
@@ -1207,7 +1209,7 @@ router.post("/location", authenticateToken, async (req, res) => {
  * the same team+order, and counts installation steps completed by that
  * team's members while on-site during that visit.
  * ------------------------ */
-router.get('/reports/checkin-checkout', authenticateToken, authorizeRoles('installation_manager', 'admin'), async (req, res) => {
+router.get('/reports/checkin-checkout', authenticateToken, requirePermission(PERMISSIONS.INSTALLATION_REPORTS), async (req, res) => {
     try {
         // Team names read correctly via sequelize2, but the `project` table's
         // Arabic text needs the primary `sequelize` connection's latin1->UTF-8
@@ -1346,7 +1348,7 @@ router.get('/reports/checkin-checkout', authenticateToken, authorizeRoles('insta
  * (which step design/training tends to cause problems) and by team (which
  * teams report issues disproportionately).
  * ------------------------ */
-router.get('/reports/issues', authenticateToken, authorizeRoles('installation_manager', 'admin'), async (req, res) => {
+router.get('/reports/issues', authenticateToken, requirePermission(PERMISSIONS.INSTALLATION_REPORTS), async (req, res) => {
     try {
         // sequelize2 (not the primary sequelize connection) reads Arabic
         // text from instSteps correctly — same inconsistent per-table
@@ -1512,7 +1514,7 @@ async function fetchUnoByBarcodeChunked(pool, barcodes, selectCols) {
  * SQL Server (barcode -> UNO), so this requires bridging two separate
  * database engines rather than a single SQL join.
  * ------------------------ */
-router.get('/reports/delivery-lag', authenticateToken, authorizeRoles('installation_manager', 'admin'), async (req, res) => {
+router.get('/reports/delivery-lag', authenticateToken, requirePermission(PERMISSIONS.INSTALLATION_REPORTS), async (req, res) => {
     try {
         const delivered = await sequelize2.query(
             `SELECT Insbarcode, InsDeliverdDate FROM IIT_Petra.InsDelivered WHERE Insbarcode IS NOT NULL`,
@@ -1604,7 +1606,7 @@ router.get('/reports/delivery-lag', authenticateToken, authorizeRoles('installat
  * consecutive step completions within the same item (ordered by
  * stepOrder) as a defensible proxy for how long each step actually took.
  * ------------------------ */
-router.get('/reports/standard-time-calibration', authenticateToken, authorizeRoles('installation_manager', 'admin'), async (req, res) => {
+router.get('/reports/standard-time-calibration', authenticateToken, requirePermission(PERMISSIONS.INSTALLATION_REPORTS), async (req, res) => {
     try {
         const { from, to } = req.query;
         const dateFilter = [];
@@ -1683,7 +1685,7 @@ router.get('/reports/standard-time-calibration', authenticateToken, authorizeRol
  * matching approach as /reports/delivery-lag), aggregated per project and
  * per team so a manager can see delivery completion at a glance.
  * ------------------------ */
-router.get('/reports/delivery-status', authenticateToken, authorizeRoles('installation_manager', 'admin'), async (req, res) => {
+router.get('/reports/delivery-status', authenticateToken, requirePermission(PERMISSIONS.INSTALLATION_REPORTS), async (req, res) => {
     try {
         // Team names read correctly via sequelize2 but not through the
         // primary `sequelize` connection used below for `project` (same
@@ -1785,7 +1787,7 @@ router.get('/reports/delivery-status', authenticateToken, authorizeRoles('instal
  * issues reported today. Accepts an optional ?date=YYYY-MM-DD to look at a
  * past day instead of today.
  * ------------------------ */
-router.get('/reports/daily-activity', authenticateToken, authorizeRoles('installation_manager', 'admin'), async (req, res) => {
+router.get('/reports/daily-activity', authenticateToken, requirePermission(PERMISSIONS.INSTALLATION_REPORTS), async (req, res) => {
     try {
         const dateParam = /^\d{4}-\d{2}-\d{2}$/.test(req.query?.date || '') ? req.query.date : null;
 

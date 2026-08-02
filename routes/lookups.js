@@ -3,30 +3,24 @@
 // in models/lookupModels.js. See Migration Blueprint §07 "Lookups".
 import express from 'express';
 import { Op } from 'sequelize';
-import { authenticateToken, authorizeReadWrite } from '../middleware/auth.js';
+import { authenticateToken, authorizeRoles } from '../middleware/auth.js';
+import { requirePermission } from '../middleware/permissions.js';
+import { PERMISSIONS } from '../constants/permissions.js';
 import { LOOKUP_REGISTRY, LOOKUP_TYPES } from '../models/lookupModels.js';
 
 const router = express.Router();
 
-// Editing reference data is admin-only, matching Migration Blueprint §07's
-// "Roles: admin" -- but *reading* it can't be, since Orders/Cash Flow (and
-// any future Petra ERP form) need these for their own dropdowns (order
-// type/status, payment type, bank, ...). Originally admin-only for both;
-// found broken when Cash Flow's payment-type/bank dropdowns needed this
-// and every other Petra ERP role would have 403'd reading it. 'user' is
-// also included here (unlike other Petra ERP routes) specifically so the
-// admin+testuser soft launch (Migration Blueprint Rev F) can exercise
-// these dropdowns -- testuser's actual role is the generic 'user', not
-// one of the Petra ERP roles. Reference data is read-only and has no PII,
-// so this is a low-risk broadening; worth revisiting once the soft launch
-// ends and access opens to the real Petra ERP roles.
-router.use(
-    authenticateToken,
-    authorizeReadWrite(
-        ['sales', 'sales_manager', 'accounting', 'project_manager', 'user', 'admin'],
-        ['admin'],
-    ),
-);
+// View is admin-editable via the PermissionGrant table (see
+// PERMISSIONS.LOOKUPS_VIEW) since Orders/Cash Flow (and any future Petra
+// ERP form) need these for their own dropdowns (order type/status, payment
+// type, bank, ...) and who needs that varies by ordinary business role.
+// Editing reference data stays hardcoded admin-only on purpose, same as
+// routes/permissions.js's own admin-only gate -- not made grantable, since
+// reference/lookup data is shared company-wide and a bad edit here is
+// higher-blast-radius than a bad edit to one's own module's data.
+router.use(authenticateToken);
+const requireView = requirePermission(PERMISSIONS.LOOKUPS_VIEW);
+const requireEdit = authorizeRoles('admin');
 
 // `:type` is validated against the fixed registry below on every route —
 // this is a generic table proxy, so that allow-list is what stands in for
@@ -41,12 +35,12 @@ router.param('type', (req, res, next, type) => {
 });
 
 // GET /api/lookups  — list of valid types, for building the admin picker
-router.get('/', (req, res) => {
+router.get('/', requireView, (req, res) => {
     res.json({ types: LOOKUP_TYPES });
 });
 
 // GET /api/lookups/:type?page=&pageSize=&q=
-router.get('/:type', async (req, res) => {
+router.get('/:type', requireView, async (req, res) => {
     const { model, nameField } = req.lookup;
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const pageSize = Math.min(200, Math.max(1, parseInt(req.query.pageSize) || 50));
@@ -64,7 +58,7 @@ router.get('/:type', async (req, res) => {
 });
 
 // GET /api/lookups/:type/:id
-router.get('/:type/:id', async (req, res) => {
+router.get('/:type/:id', requireView, async (req, res) => {
     const { model } = req.lookup;
     const row = await model.findByPk(req.params.id);
     if (!row) return res.status(404).json({ message: 'Not found' });
@@ -72,7 +66,7 @@ router.get('/:type/:id', async (req, res) => {
 });
 
 // POST /api/lookups/:type
-router.post('/:type', async (req, res) => {
+router.post('/:type', requireEdit, async (req, res) => {
     const { model, pkField } = req.lookup;
     // Never let the request body set the primary key on create — only
     // whitelist the model's real (non-PK) attributes.
@@ -93,7 +87,7 @@ router.post('/:type', async (req, res) => {
 });
 
 // PATCH /api/lookups/:type/:id
-router.patch('/:type/:id', async (req, res) => {
+router.patch('/:type/:id', requireEdit, async (req, res) => {
     const { model, pkField } = req.lookup;
     const row = await model.findByPk(req.params.id);
     if (!row) return res.status(404).json({ message: 'Not found' });
@@ -115,7 +109,7 @@ router.patch('/:type/:id', async (req, res) => {
 });
 
 // DELETE /api/lookups/:type/:id
-router.delete('/:type/:id', async (req, res) => {
+router.delete('/:type/:id', requireEdit, async (req, res) => {
     const { model } = req.lookup;
     const row = await model.findByPk(req.params.id);
     if (!row) return res.status(404).json({ message: 'Not found' });

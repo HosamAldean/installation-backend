@@ -2,33 +2,48 @@
 // Read/write API for the "Glass" fabrication-order system — previously only
 // browsable through a separate MS Access front-end (Glass -2024.MDB) linked
 // via pass-through queries to the same live SQL Server "Glass" database this
-// module talks to directly. Confirmed from the Access app's Main Menu VBA
-// that the live workflow is: Sorders (order header) -> Sorderdetails (glass
-// item specs: dimensions/color/type/thickness/spacer/section/shape) ->
-// SSTOCK (received-into-store quantities) -> billing. A separate
-// orders/orderdetails/STOCK/thenewstore table set exists in the same
-// database but is not reachable from any Main Menu button in the Access
-// app — it's the pre-cutover archive (orderNo tops out around 314054),
-// superseded by Sorders/Sorderdetails/SSTOCK (orderNo picks up around
-// 323097+), intentionally not used here.
+// module talks to directly. Live workflow: Sorders (order header) ->
+// Sorderdetails (glass item specs) -> SSTOCK (received-into-store
+// quantities) -> billing.
+//
+// CORRECTION (2026-08-01, superseding the "not reachable from any Main Menu
+// button" claim that used to be here): the orders/orderDetails/STOCK table
+// set is NOT a dead pre-cutover archive. "Main Menu"'s Command6 button opens
+// "ordersQ", whose Command14_Click runs appendorders/appendOrdDet/appdSt
+// (INSERT the current order into orders/orderDetails/STOCK) then
+// delorders/delOrdDet/delSt (DELETE that same orderNo from
+// Sorders/Sorderdetails/SSTOCK) -- confirmed by reading the live VBA/SQL
+// directly, not inferred. This is a still-actively-used, one-order-at-a-time
+// "archive & bill" action (356 rows added to the legacy Bill table since
+// Jan 2026 alone) -- every time staff run it, that order silently
+// disappears from every endpoint below that only reads Sorders/
+// Sorderdetails/SSTOCK. The list/detail/items GETs now fall back to (list:
+// UNION with) the orders/orderDetails/STOCK archive so an archived order
+// stays visible here instead of 404ing / vanishing from the list -- see the
+// `archived` flag on each row. Archived orders are intentionally read-only
+// here: write endpoints stay scoped to Sorders/Sorderdetails/SSTOCK, since
+// archiving is this app's own signal that an order is closed.
 //
 // Billing (price/price1/plusCost/pricingType/billNote columns on
 // Sorderdetails, plus the SBill table) mirrors the Access app's
-// CheckBill/Bill tables and its Check1/Check2 stored-proc pricing formulas
-// — but those procs/tables only ever targeted the legacy orderdetails
-// table (CheckBill's max orderNo is exactly orders' max orderNo, 314054)
-// and were never updated after the cutover, so billing has been silently
-// unavailable for every order placed since. These columns/table were added
-// directly to the live Sorderdetails table (additive, nullable) so billing
-// works for current orders going forward; CheckBill/Bill remain untouched
-// as the historical record for pre-cutover orders.
+// CheckBill/Bill tables and its Check1/Check2 stored-proc pricing formulas.
+// Despite an earlier claim that this legacy billing path was dead since
+// 2021, live data shows it is not: CheckBill/Bill are still being written by
+// the archive action above (Bill: 3,212 rows, most recent 2026-04-28) while
+// SBill (this app's own invoice table) has never recorded a single row.
+// These columns/table were added directly to the live Sorderdetails table
+// (additive, nullable) so billing can work for current orders going
+// forward; CheckBill/Bill remain the real, still-growing historical record
+// and are not superseded by anything here yet.
 import express from "express";
 import { withSqlRetry } from "../config/db.js";
-import { authenticateToken, authorizeRoles } from "../middleware/auth.js";
+import { authenticateToken } from "../middleware/auth.js";
+import { requirePermission } from "../middleware/permissions.js";
+import { PERMISSIONS } from "../constants/permissions.js";
 import { pushFinishedUnitToMinStock } from "../utils/minStockSync.js";
 
 const router = express.Router();
-router.use(authenticateToken, authorizeRoles("shipping_manager", "admin"));
+router.use(authenticateToken, requirePermission(PERMISSIONS.SHIPPING_GLASS));
 
 // Matches the Access VBA's ItemNOC sub (M1 module): barcode = 2-digit year +
 // last 4 digits of orderNo + serialNo, all concatenated then stored as an
@@ -52,6 +67,11 @@ function buildBarcode(orderNo, serialNo) {
 // SendOrdersDetails dashboard (backed by the [Q-OrdersNew] view): total
 // ordered qty vs. total received (SSTOCK.QTYIN) vs. count of lines not yet
 // fully received.
+//
+// UNIONed with the orders/orderDetails/STOCK archive (see the file header
+// comment) so an order that's been through the legacy "archive & bill"
+// action still shows up here instead of silently disappearing. `archived`
+// tells the frontend to render it read-only.
 router.get("/orders", async (req, res) => {
     try {
         const page = Math.max(1, parseInt(req.query.page) || 1);
@@ -59,20 +79,13 @@ router.get("/orders", async (req, res) => {
         const offset = (page - 1) * pageSize;
         const search = String(req.query.search || "").trim();
 
-        const whereClause = search ? "WHERE (o.projName LIKE @search OR o.projNo LIKE @search OR o.JPO LIKE @search)" : "";
+        const whereClause = search ? "WHERE (projName LIKE @search OR projNo LIKE @search OR JPO LIKE @search)" : "";
 
-        const { total, rows } = await withSqlRetry("glass", async (pool) => {
-            const countRequest = pool.request();
-            if (search) countRequest.input("search", `%${search}%`);
-            const countResult = await countRequest.query(`SELECT COUNT(*) AS total FROM Sorders o ${whereClause}`);
-
-            const rowsRequest = pool.request();
-            rowsRequest.input("offset", offset);
-            rowsRequest.input("pageSize", pageSize);
-            if (search) rowsRequest.input("search", `%${search}%`);
-            const rowsResult = await rowsRequest.query(`
+        const combinedCte = `
+            WITH combined AS (
                 SELECT
                     o.orderNo, o.projNo, o.projName, o.projMgr, o.oderDate, o.JPO, o.ProdctionNO,
+                    CAST(0 AS BIT) AS archived,
                     ISNULL(lines.totalQty, 0) AS totalQty,
                     ISNULL(received.totalReceived, 0) AS totalReceived,
                     ISNULL(lines.lineCount, 0) AS lineCount
@@ -87,8 +100,43 @@ router.get("/orders", async (req, res) => {
                     FROM SSTOCK
                     GROUP BY OrderNo
                 ) received ON received.OrderNo = o.orderNo
+
+                UNION ALL
+
+                SELECT
+                    a.orderNo, a.projNo, a.projName, a.projMgr, a.oderDate, a.Jpo AS JPO, a.ProdctionNO,
+                    CAST(1 AS BIT) AS archived,
+                    ISNULL(alines.totalQty, 0) AS totalQty,
+                    ISNULL(areceived.totalReceived, 0) AS totalReceived,
+                    ISNULL(alines.lineCount, 0) AS lineCount
+                FROM orders a
+                LEFT JOIN (
+                    SELECT orderNo, SUM(qty) AS totalQty, COUNT(*) AS lineCount
+                    FROM orderDetails
+                    GROUP BY orderNo
+                ) alines ON alines.orderNo = a.orderNo
+                LEFT JOIN (
+                    SELECT OrderNo, SUM(QTYIN) AS totalReceived
+                    FROM STOCK
+                    GROUP BY OrderNo
+                ) areceived ON areceived.OrderNo = a.orderNo
+            )
+        `;
+
+        const { total, rows } = await withSqlRetry("glass", async (pool) => {
+            const countRequest = pool.request();
+            if (search) countRequest.input("search", `%${search}%`);
+            const countResult = await countRequest.query(`${combinedCte} SELECT COUNT(*) AS total FROM combined ${whereClause}`);
+
+            const rowsRequest = pool.request();
+            rowsRequest.input("offset", offset);
+            rowsRequest.input("pageSize", pageSize);
+            if (search) rowsRequest.input("search", `%${search}%`);
+            const rowsResult = await rowsRequest.query(`
+                ${combinedCte}
+                SELECT * FROM combined
                 ${whereClause}
-                ORDER BY o.orderNo DESC
+                ORDER BY orderNo DESC
                 OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY
             `);
 
@@ -106,6 +154,10 @@ router.get("/orders", async (req, res) => {
 // list rows above. Used by report pages to deep-link straight into an
 // order's detail view without re-implementing the search-by-orderNo the
 // list endpoint doesn't support (it only searches projName/projNo/JPO).
+//
+// Falls back to the orders archive if not found in Sorders (see the file
+// header comment) — an archived order deep-links correctly instead of
+// 404ing.
 router.get("/orders/:orderNo", async (req, res) => {
     const orderNo = parseInt(req.params.orderNo);
     if (!Number.isInteger(orderNo)) {
@@ -117,6 +169,7 @@ router.get("/orders/:orderNo", async (req, res) => {
             .query(`
                 SELECT
                     o.orderNo, o.projNo, o.projName, o.projMgr, o.oderDate, o.JPO, o.ProdctionNO,
+                    CAST(0 AS BIT) AS archived,
                     ISNULL(lines.totalQty, 0) AS totalQty,
                     ISNULL(received.totalReceived, 0) AS totalReceived,
                     ISNULL(lines.lineCount, 0) AS lineCount
@@ -133,10 +186,36 @@ router.get("/orders/:orderNo", async (req, res) => {
                 ) received ON received.OrderNo = o.orderNo
                 WHERE o.orderNo = @orderNo
             `));
-        if (result.recordset.length === 0) {
+        if (result.recordset.length > 0) {
+            return res.json({ success: true, order: result.recordset[0] });
+        }
+
+        const archivedResult = await withSqlRetry("glass", (pool) => pool.request()
+            .input("orderNo", orderNo)
+            .query(`
+                SELECT
+                    a.orderNo, a.projNo, a.projName, a.projMgr, a.oderDate, a.Jpo AS JPO, a.ProdctionNO,
+                    CAST(1 AS BIT) AS archived,
+                    ISNULL(alines.totalQty, 0) AS totalQty,
+                    ISNULL(areceived.totalReceived, 0) AS totalReceived,
+                    ISNULL(alines.lineCount, 0) AS lineCount
+                FROM orders a
+                LEFT JOIN (
+                    SELECT orderNo, SUM(qty) AS totalQty, COUNT(*) AS lineCount
+                    FROM orderDetails
+                    GROUP BY orderNo
+                ) alines ON alines.orderNo = a.orderNo
+                LEFT JOIN (
+                    SELECT OrderNo, SUM(QTYIN) AS totalReceived
+                    FROM STOCK
+                    GROUP BY OrderNo
+                ) areceived ON areceived.OrderNo = a.orderNo
+                WHERE a.orderNo = @orderNo
+            `));
+        if (archivedResult.recordset.length === 0) {
             return res.status(404).json({ success: false, message: "Order not found" });
         }
-        res.json({ success: true, order: result.recordset[0] });
+        res.json({ success: true, order: archivedResult.recordset[0] });
     } catch (err) {
         console.error("❌ GLASS GET ORDER ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to fetch glass order" });
@@ -209,6 +288,10 @@ router.put("/orders/:orderNo", async (req, res) => {
 // joined with SSTOCK for received qty and a computed area in m^2 (matches
 // the Access app's Round(height*width*qty/10000, 2) area expression used
 // throughout its forms/reports/billing).
+//
+// Falls back to the orderDetails/STOCK archive if the order isn't in
+// Sorderdetails (see the file header comment) — an archived order's items
+// still show up instead of an empty list.
 router.get("/orders/:orderNo/items", async (req, res) => {
     try {
         const orderNo = parseInt(req.params.orderNo);
@@ -233,7 +316,28 @@ router.get("/orders/:orderNo/items", async (req, res) => {
                 ORDER BY d.serialNo ASC
             `));
 
-        res.json({ success: true, items: result.recordset });
+        if (result.recordset.length > 0) {
+            return res.json({ success: true, items: result.recordset });
+        }
+
+        const archivedResult = await withSqlRetry("glass", (pool) => pool.request()
+            .input("orderNo", orderNo)
+            .query(`
+                SELECT
+                    d.orderNo, d.serialNo, d.itemNo, d.height, d.width, d.qty,
+                    d.incolor, d.intype, d.inthickness, d.spacer,
+                    d.outcolor, d.outtype, d.outthickness,
+                    d.section, d.shape, d.note, d.expectdate, d.status, d.person, d.dept,
+                    d.barcode, d.[financial notes] AS financialNotes,
+                    Round((d.height * d.width * d.qty) / 10000, 2) AS area,
+                    ISNULL(s.QTYIN, 0) AS receivedQty
+                FROM orderDetails d
+                LEFT JOIN STOCK s ON s.OrderNo = d.orderNo AND s.SerialNo = d.serialNo
+                WHERE d.orderNo = @orderNo
+                ORDER BY d.serialNo ASC
+            `));
+
+        res.json({ success: true, items: archivedResult.recordset });
     } catch (err) {
         console.error("❌ GLASS ORDER ITEMS ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to fetch glass order items" });
@@ -956,8 +1060,18 @@ router.get("/orders/:orderNo/billing", async (req, res) => {
 
         const items = result.recordset.map(row => ({ ...row, ...computeBilling(row) }));
         const orderTotal = round3(items.reduce((sum, it) => sum + it.totalPU, 0));
+        // Confirmed live (COM-inspected): the legacy Bill form's own two
+        // adjacent controls are "قيمة الفتورة بدون ضريبة" (invoice value
+        // without tax, bound to Price) and "قيمة الفاتورة مع ضريبة"
+        // (invoice value with tax, bound to =([Price]*0.16)+[Price]) --
+        // a standard 16% VAT-inclusive total shown alongside every plain
+        // total. No tax concept existed anywhere in this app before. Kept
+        // at the order-total level only, matching where legacy computes
+        // it (Bill is an invoice-level record, not itemized) rather than
+        // guessing a per-line breakdown legacy itself doesn't show.
+        const orderTotalWithVat = round3(orderTotal * 1.16);
 
-        res.json({ success: true, items, orderTotal });
+        res.json({ success: true, items, orderTotal, orderTotalWithVat });
     } catch (err) {
         console.error("❌ GLASS BILLING ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to fetch billing" });

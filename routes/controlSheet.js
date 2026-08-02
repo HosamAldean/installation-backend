@@ -23,15 +23,16 @@
 // for this exact module).
 import express from 'express';
 import { QueryTypes } from 'sequelize';
-import { authenticateToken, authorizeRoles } from '../middleware/auth.js';
+import { authenticateToken } from '../middleware/auth.js';
+import { requirePermission } from '../middleware/permissions.js';
+import { PERMISSIONS } from '../constants/permissions.js';
 import { sequelize2PetraErp } from '../config/db.js';
 import { ControlSheetUnit } from '../models/ControlSheetUnit.js';
 
 const router = express.Router();
 router.use(authenticateToken);
 
-const canWrite = authorizeRoles('project_manager', 'admin');
-const canRead = authorizeRoles('project_manager', 'installation_manager', 'admin');
+const canAccess = requirePermission(PERMISSIONS.PETRA_ERP_CONTROL_SHEET);
 
 const PERCENT_FIELDS = ['mResPerc', 'poPerc', 'proCompPerc', 'installCompPerc', 'finishDelPerc'];
 
@@ -52,7 +53,7 @@ function whitelist(model, body, excluding = []) {
 }
 
 // GET /api/control-sheets?projectId=&orderId=&q=&page=&pageSize=&includeDeleted=
-router.get('/', canRead, async (req, res) => {
+router.get('/', canAccess, async (req, res) => {
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const pageSize = Math.min(200, Math.max(1, parseInt(req.query.pageSize) || 50));
 
@@ -82,14 +83,14 @@ router.get('/', canRead, async (req, res) => {
 });
 
 // GET /api/control-sheets/:id
-router.get('/:id', canRead, async (req, res) => {
+router.get('/:id', canAccess, async (req, res) => {
     const unit = await ControlSheetUnit.findByPk(req.params.id);
     if (!unit) return res.status(404).json({ message: 'Not found' });
     res.json(unit);
 });
 
 // POST /api/control-sheets  { projectId, unitIdContract?, unitIdDetail?, profileSectionId?, height?, width?, ... }
-router.post('/', canWrite, async (req, res) => {
+router.post('/', canAccess, async (req, res) => {
     if (!req.body.projectId) {
         return res.status(400).json({ message: 'projectId is required' });
     }
@@ -99,7 +100,7 @@ router.post('/', canWrite, async (req, res) => {
 });
 
 // PATCH /api/control-sheets/:id
-router.patch('/:id', canWrite, async (req, res) => {
+router.patch('/:id', canAccess, async (req, res) => {
     const unit = await ControlSheetUnit.findByPk(req.params.id);
     if (!unit) return res.status(404).json({ message: 'Not found' });
     const values = applyPercentClamp(whitelist(ControlSheetUnit, req.body, ['rowId']));
@@ -110,7 +111,7 @@ router.patch('/:id', canWrite, async (req, res) => {
 // DELETE /api/control-sheets/:id -- soft delete, matches the existing
 // `deleted` column already in use on live data (same convention as
 // Order.js/petraErpOrders.js).
-router.delete('/:id', canWrite, async (req, res) => {
+router.delete('/:id', canAccess, async (req, res) => {
     const unit = await ControlSheetUnit.findByPk(req.params.id);
     if (!unit) return res.status(404).json({ message: 'Not found' });
     await unit.update({ deleted: 1 });

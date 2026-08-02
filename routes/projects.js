@@ -7,25 +7,19 @@
 // only project_manager/admin create or edit them.
 import express from 'express';
 import { Op } from 'sequelize';
-import { authenticateToken, authorizeRoles } from '../middleware/auth.js';
+import { authenticateToken } from '../middleware/auth.js';
+import { requirePermission } from '../middleware/permissions.js';
+import { PERMISSIONS } from '../constants/permissions.js';
 import { Project } from '../models/Project.js';
 import { ProjectTeam } from '../models/ProjectTeam.js';
 
 const router = express.Router();
 router.use(authenticateToken);
 
-const canWrite = authorizeRoles('project_manager', 'admin');
-const canRead = authorizeRoles(
-    'project_manager',
-    'sales',
-    'sales_manager',
-    'accounting',
-    'installation_manager',
-    'admin',
-);
+const canAccess = requirePermission(PERMISSIONS.PETRA_ERP_PROJECTS);
 
 // GET /api/projects?page=&pageSize=&q=&statusId=&typeId=
-router.get('/', canRead, async (req, res) => {
+router.get('/', canAccess, async (req, res) => {
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const pageSize = Math.min(200, Math.max(1, parseInt(req.query.pageSize) || 50));
     const q = String(req.query.q || '').trim();
@@ -50,14 +44,14 @@ router.get('/', canRead, async (req, res) => {
 });
 
 // GET /api/projects/:id
-router.get('/:id', canRead, async (req, res) => {
+router.get('/:id', canAccess, async (req, res) => {
     const project = await Project.findByPk(req.params.id);
     if (!project) return res.status(404).json({ message: 'Not found' });
     res.json(project);
 });
 
 // POST /api/projects
-router.post('/', canWrite, async (req, res) => {
+router.post('/', canAccess, async (req, res) => {
     const { projectName, projectNo } = req.body;
     if (!projectName || !String(projectName).trim()) {
         return res.status(400).json({ message: 'projectName is required' });
@@ -79,7 +73,7 @@ router.post('/', canWrite, async (req, res) => {
 });
 
 // PATCH /api/projects/:id
-router.patch('/:id', canWrite, async (req, res) => {
+router.patch('/:id', canAccess, async (req, res) => {
     const project = await Project.findByPk(req.params.id);
     if (!project) return res.status(404).json({ message: 'Not found' });
 
@@ -100,13 +94,13 @@ router.patch('/:id', canWrite, async (req, res) => {
 });
 
 // GET /api/projects/:id/team
-router.get('/:id/team', canRead, async (req, res) => {
+router.get('/:id/team', canAccess, async (req, res) => {
     const team = await ProjectTeam.findAll({ where: { projectId: req.params.id } });
     res.json({ team });
 });
 
 // POST /api/projects/:id/team  { userId, teamClassId }
-router.post('/:id/team', canWrite, async (req, res) => {
+router.post('/:id/team', canAccess, async (req, res) => {
     const { userId, teamClassId } = req.body;
     if (!userId || teamClassId === undefined) {
         return res.status(400).json({ message: 'userId and teamClassId are required' });
@@ -120,7 +114,7 @@ router.post('/:id/team', canWrite, async (req, res) => {
 });
 
 // DELETE /api/projects/:id/team/:userId
-router.delete('/:id/team/:userId', canWrite, async (req, res) => {
+router.delete('/:id/team/:userId', canAccess, async (req, res) => {
     const deleted = await ProjectTeam.destroy({
         where: { projectId: req.params.id, userId: req.params.userId },
     });

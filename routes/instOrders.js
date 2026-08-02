@@ -1,7 +1,9 @@
 ﻿import express from 'express';
 import { sequelize, sequelize2, sequelize3 } from '../config/db.js';
 import { QueryTypes } from 'sequelize';
-import { authenticateToken, authorizeRoles } from '../middleware/auth.js';
+import { authenticateToken } from '../middleware/auth.js';
+import { requirePermission } from '../middleware/permissions.js';
+import { PERMISSIONS } from '../constants/permissions.js';
 
 const router = express.Router();
 // Every route in this file operates on order/project data and previously had
@@ -11,7 +13,7 @@ const router = express.Router();
 // already gates to manager/admin (see router.tsx) — this mirrors that same
 // restriction on the backend so it can't be bypassed by calling the API directly.
 router.use(authenticateToken);
-router.use(authorizeRoles('installation_manager', 'admin'));
+router.use(requirePermission(PERMISSIONS.INSTALLATION_MANAGE_ORDERS));
 
 const ARABIC_RE = /[اأإآابتثجحخدذرزسشصضطظعغفقكلمنهوي]/;
 const fixArabic = (str) => {

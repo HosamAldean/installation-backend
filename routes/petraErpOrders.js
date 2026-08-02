@@ -16,22 +16,16 @@
 // building against it, so items here are read straight off masterControl.
 import express from 'express';
 import { QueryTypes } from 'sequelize';
-import { authenticateToken, authorizeRoles } from '../middleware/auth.js';
+import { authenticateToken } from '../middleware/auth.js';
+import { requirePermission } from '../middleware/permissions.js';
+import { PERMISSIONS } from '../constants/permissions.js';
 import { sequelize2PetraErp as sequelize2 } from '../config/db.js';
 import { Order } from '../models/Order.js';
 
 const router = express.Router();
 router.use(authenticateToken);
 
-const canWrite = authorizeRoles('project_manager', 'admin');
-const canRead = authorizeRoles(
-    'project_manager',
-    'sales',
-    'sales_manager',
-    'accounting',
-    'installation_manager',
-    'admin',
-);
+const canAccess = requirePermission(PERMISSIONS.PETRA_ERP_ORDERS);
 
 function whitelist(model, body, excluding = []) {
     const attrs = Object.keys(model.getAttributes()).filter((a) => !excluding.includes(a));
@@ -44,7 +38,7 @@ function whitelist(model, body, excluding = []) {
 // Raw join (rather than the plain Order model) so the list carries
 // project/type/status names, not just ids — matches how list views are
 // built elsewhere in this codebase (followUp.js, instOrders.js).
-router.get('/', canRead, async (req, res) => {
+router.get('/', canAccess, async (req, res) => {
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const pageSize = Math.min(200, Math.max(1, parseInt(req.query.pageSize) || 50));
 
@@ -75,7 +69,7 @@ router.get('/', canRead, async (req, res) => {
 });
 
 // GET /api/petra-erp/orders/:id
-router.get('/:id', canRead, async (req, res) => {
+router.get('/:id', canAccess, async (req, res) => {
     const order = await Order.findByPk(req.params.id);
     if (!order) return res.status(404).json({ message: 'Not found' });
     res.json(order);
@@ -84,7 +78,7 @@ router.get('/:id', canRead, async (req, res) => {
 // POST /api/petra-erp/orders  { projectId, orderTypeId, orderDesc?, pmId? }
 // orderNumber is sequential per project (matches the legacy app's
 // getMaxOrderId() convention), not globally unique or client-supplied.
-router.post('/', canWrite, async (req, res) => {
+router.post('/', canAccess, async (req, res) => {
     const { projectId, orderTypeId } = req.body;
     if (!projectId || !orderTypeId) {
         return res.status(400).json({ message: 'projectId and orderTypeId are required' });
@@ -112,7 +106,7 @@ router.post('/', canWrite, async (req, res) => {
 });
 
 // PATCH /api/petra-erp/orders/:id
-router.patch('/:id', canWrite, async (req, res) => {
+router.patch('/:id', canAccess, async (req, res) => {
     const order = await Order.findByPk(req.params.id);
     if (!order) return res.status(404).json({ message: 'Not found' });
     await order.update(whitelist(Order, req.body, ['orderId', 'userId', 'deleted']));
@@ -120,7 +114,7 @@ router.patch('/:id', canWrite, async (req, res) => {
 });
 
 // PATCH /api/petra-erp/orders/:id/status  { orderStatusId }
-router.patch('/:id/status', canWrite, async (req, res) => {
+router.patch('/:id/status', canAccess, async (req, res) => {
     const { orderStatusId } = req.body;
     if (orderStatusId === undefined) {
         return res.status(400).json({ message: 'orderStatusId is required' });
@@ -132,7 +126,7 @@ router.patch('/:id/status', canWrite, async (req, res) => {
 });
 
 // PATCH /api/petra-erp/orders/:id/gm-note  { gmNote }
-router.patch('/:id/gm-note', canWrite, async (req, res) => {
+router.patch('/:id/gm-note', canAccess, async (req, res) => {
     const order = await Order.findByPk(req.params.id);
     if (!order) return res.status(404).json({ message: 'Not found' });
     await order.update({ gmNote: req.body.gmNote ?? '', gmDate: new Date() });
@@ -141,7 +135,7 @@ router.patch('/:id/gm-note', canWrite, async (req, res) => {
 
 // DELETE /api/petra-erp/orders/:id — soft delete, matches the `deleted`
 // column already in use on live data.
-router.delete('/:id', canWrite, async (req, res) => {
+router.delete('/:id', canAccess, async (req, res) => {
     const order = await Order.findByPk(req.params.id);
     if (!order) return res.status(404).json({ message: 'Not found' });
     await order.update({ deleted: 1 });
@@ -150,7 +144,7 @@ router.delete('/:id', canWrite, async (req, res) => {
 
 // GET /api/petra-erp/orders/:id/items — control-sheet units (masterControl
 // rows) currently assigned to this order.
-router.get('/:id/items', canRead, async (req, res) => {
+router.get('/:id/items', canAccess, async (req, res) => {
     const items = await sequelize2.query(
         `SELECT m.rowId, m.unitIdContract, m.unitIdDetail, m.height, m.width,
                 m.unityStatusId, p.profileSectionName
@@ -165,7 +159,7 @@ router.get('/:id/items', canRead, async (req, res) => {
 
 // POST /api/petra-erp/orders/:id/items  { rowIds: number[] }
 // Assigns existing control-sheet units to this order.
-router.post('/:id/items', canWrite, async (req, res) => {
+router.post('/:id/items', canAccess, async (req, res) => {
     const { rowIds } = req.body;
     if (!Array.isArray(rowIds) || rowIds.length === 0) {
         return res.status(400).json({ message: 'rowIds must be a non-empty array' });
@@ -178,7 +172,7 @@ router.post('/:id/items', canWrite, async (req, res) => {
 });
 
 // DELETE /api/petra-erp/orders/:id/items/:rowId
-router.delete('/:id/items/:rowId', canWrite, async (req, res) => {
+router.delete('/:id/items/:rowId', canAccess, async (req, res) => {
     await sequelize2.query(
         'UPDATE masterControl SET orderId = 0 WHERE rowId = :rowId AND orderId = :orderId',
         { replacements: { rowId: req.params.rowId, orderId: req.params.id }, type: QueryTypes.UPDATE },
