@@ -56,16 +56,32 @@ router.post('/', canAccess, async (req, res) => {
     if (!req.body.clientName || !String(req.body.clientName).trim()) {
         return res.status(400).json({ message: 'clientName is required' });
     }
-    const client = await Client.create(whitelist(Client, req.body, ['clientId']));
-    res.status(201).json(client);
+    try {
+        const client = await Client.create(whitelist(Client, req.body, ['clientId']));
+        res.status(201).json(client);
+    } catch (err) {
+        if (err.name === 'SequelizeUniqueConstraintError') {
+            return res.status(409).json({ message: 'A client with that value already exists' });
+        }
+        console.error('Error creating client:', err);
+        res.status(500).json({ message: 'Failed to create client' });
+    }
 });
 
 // PATCH /api/clients/:id
 router.patch('/:id', canAccess, async (req, res) => {
     const client = await Client.findByPk(req.params.id);
     if (!client) return res.status(404).json({ message: 'Not found' });
-    await client.update(whitelist(Client, req.body, ['clientId']));
-    res.json(client);
+    try {
+        await client.update(whitelist(Client, req.body, ['clientId']));
+        res.json(client);
+    } catch (err) {
+        if (err.name === 'SequelizeUniqueConstraintError') {
+            return res.status(409).json({ message: 'A client with that value already exists' });
+        }
+        console.error('Error updating client:', err);
+        res.status(500).json({ message: 'Failed to update client' });
+    }
 });
 
 /* ---------------- Client References ---------------- */
@@ -81,9 +97,14 @@ router.post('/:id/references', canAccess, async (req, res) => {
     if (!req.body.clientReferenceName || !String(req.body.clientReferenceName).trim()) {
         return res.status(400).json({ message: 'clientReferenceName is required' });
     }
-    const values = whitelist(ClientReference, req.body, ['clientReferenceId', 'clientId']);
-    const reference = await ClientReference.create({ ...values, clientId: req.params.id });
-    res.status(201).json(reference);
+    try {
+        const values = whitelist(ClientReference, req.body, ['clientReferenceId', 'clientId']);
+        const reference = await ClientReference.create({ ...values, clientId: req.params.id });
+        res.status(201).json(reference);
+    } catch (err) {
+        console.error('Error creating client reference:', err);
+        res.status(500).json({ message: 'Failed to create reference' });
+    }
 });
 
 // PATCH /api/clients/:id/references/:refId
@@ -92,17 +113,27 @@ router.patch('/:id/references/:refId', canAccess, async (req, res) => {
         where: { clientReferenceId: req.params.refId, clientId: req.params.id },
     });
     if (!reference) return res.status(404).json({ message: 'Not found' });
-    await reference.update(whitelist(ClientReference, req.body, ['clientReferenceId', 'clientId']));
-    res.json(reference);
+    try {
+        await reference.update(whitelist(ClientReference, req.body, ['clientReferenceId', 'clientId']));
+        res.json(reference);
+    } catch (err) {
+        console.error('Error updating client reference:', err);
+        res.status(500).json({ message: 'Failed to update reference' });
+    }
 });
 
 // DELETE /api/clients/:id/references/:refId
 router.delete('/:id/references/:refId', canAccess, async (req, res) => {
-    const deleted = await ClientReference.destroy({
-        where: { clientReferenceId: req.params.refId, clientId: req.params.id },
-    });
-    if (!deleted) return res.status(404).json({ message: 'Not found' });
-    res.json({ message: 'deleted' });
+    try {
+        const deleted = await ClientReference.destroy({
+            where: { clientReferenceId: req.params.refId, clientId: req.params.id },
+        });
+        if (!deleted) return res.status(404).json({ message: 'Not found' });
+        res.json({ message: 'deleted' });
+    } catch (err) {
+        console.error('Error deleting client reference:', err);
+        res.status(500).json({ message: 'Failed to delete reference' });
+    }
 });
 
 export default router;
@@ -139,13 +170,29 @@ archOfficesRouter.post('/', canAccess, async (req, res) => {
     if (!req.body.archOfficeName || !String(req.body.archOfficeName).trim()) {
         return res.status(400).json({ message: 'archOfficeName is required' });
     }
-    const office = await ArchOffice.create(whitelist(ArchOffice, req.body, ['archOfficeId']));
-    res.status(201).json(office);
+    try {
+        const office = await ArchOffice.create(whitelist(ArchOffice, req.body, ['archOfficeId']));
+        res.status(201).json(office);
+    } catch (err) {
+        if (err.name === 'SequelizeUniqueConstraintError') {
+            return res.status(409).json({ message: 'An architect office with that value already exists' });
+        }
+        console.error('Error creating architect office:', err);
+        res.status(500).json({ message: 'Failed to create architect office' });
+    }
 });
 
 archOfficesRouter.patch('/:id', canAccess, async (req, res) => {
     const office = await ArchOffice.findByPk(req.params.id);
     if (!office) return res.status(404).json({ message: 'Not found' });
-    await office.update(whitelist(ArchOffice, req.body, ['archOfficeId']));
-    res.json(office);
+    try {
+        await office.update(whitelist(ArchOffice, req.body, ['archOfficeId']));
+        res.json(office);
+    } catch (err) {
+        if (err.name === 'SequelizeUniqueConstraintError') {
+            return res.status(409).json({ message: 'An architect office with that value already exists' });
+        }
+        console.error('Error updating architect office:', err);
+        res.status(500).json({ message: 'Failed to update architect office' });
+    }
 });

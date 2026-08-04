@@ -84,33 +84,46 @@ router.post('/', canAccess, async (req, res) => {
         return res.status(400).json({ message: 'projectId and orderTypeId are required' });
     }
 
-    const [{ maxOrderNumber }] = await sequelize2.query(
-        'SELECT COALESCE(MAX(orderNumber), 0) AS maxOrderNumber FROM orders WHERE projectId = :projectId',
-        { replacements: { projectId }, type: QueryTypes.SELECT },
-    );
+    try {
+        const [{ maxOrderNumber }] = await sequelize2.query(
+            'SELECT COALESCE(MAX(orderNumber), 0) AS maxOrderNumber FROM orders WHERE projectId = :projectId',
+            { replacements: { projectId }, type: QueryTypes.SELECT },
+        );
 
-    const values = whitelist(Order, req.body, ['orderId', 'orderNumber', 'userId', 'deleted', 'gmDate']);
-    const order = await Order.create({
-        ...values,
-        projectId,
-        orderTypeId,
-        orderNumber: (maxOrderNumber || 0) + 1,
-        userId: req.user.userId,
-        pmId: req.body.pmId ?? req.user.userId,
-        orderDate: req.body.orderDate ?? new Date(),
-        orderStatusId: req.body.orderStatusId ?? 0,
-        deleted: 0,
-        gmDate: new Date(),
-    });
-    res.status(201).json(order);
+        const values = whitelist(Order, req.body, ['orderId', 'orderNumber', 'userId', 'deleted', 'gmDate']);
+        const order = await Order.create({
+            ...values,
+            projectId,
+            orderTypeId,
+            orderNumber: (maxOrderNumber || 0) + 1,
+            userId: req.user.userId,
+            pmId: req.body.pmId ?? req.user.userId,
+            orderDate: req.body.orderDate ?? new Date(),
+            orderStatusId: req.body.orderStatusId ?? 0,
+            deleted: 0,
+            gmDate: new Date(),
+        });
+        res.status(201).json(order);
+    } catch (err) {
+        if (err.name === 'SequelizeUniqueConstraintError') {
+            return res.status(409).json({ message: 'An order with that value already exists' });
+        }
+        console.error('Error creating order:', err);
+        res.status(500).json({ message: 'Failed to create order' });
+    }
 });
 
 // PATCH /api/petra-erp/orders/:id
 router.patch('/:id', canAccess, async (req, res) => {
     const order = await Order.findByPk(req.params.id);
     if (!order) return res.status(404).json({ message: 'Not found' });
-    await order.update(whitelist(Order, req.body, ['orderId', 'userId', 'deleted']));
-    res.json(order);
+    try {
+        await order.update(whitelist(Order, req.body, ['orderId', 'userId', 'deleted']));
+        res.json(order);
+    } catch (err) {
+        console.error('Error updating order:', err);
+        res.status(500).json({ message: 'Failed to update order' });
+    }
 });
 
 // PATCH /api/petra-erp/orders/:id/status  { orderStatusId }
@@ -121,16 +134,26 @@ router.patch('/:id/status', canAccess, async (req, res) => {
     }
     const order = await Order.findByPk(req.params.id);
     if (!order) return res.status(404).json({ message: 'Not found' });
-    await order.update({ orderStatusId });
-    res.json(order);
+    try {
+        await order.update({ orderStatusId });
+        res.json(order);
+    } catch (err) {
+        console.error('Error updating order status:', err);
+        res.status(500).json({ message: 'Failed to update order status' });
+    }
 });
 
 // PATCH /api/petra-erp/orders/:id/gm-note  { gmNote }
 router.patch('/:id/gm-note', canAccess, async (req, res) => {
     const order = await Order.findByPk(req.params.id);
     if (!order) return res.status(404).json({ message: 'Not found' });
-    await order.update({ gmNote: req.body.gmNote ?? '', gmDate: new Date() });
-    res.json(order);
+    try {
+        await order.update({ gmNote: req.body.gmNote ?? '', gmDate: new Date() });
+        res.json(order);
+    } catch (err) {
+        console.error('Error updating GM note:', err);
+        res.status(500).json({ message: 'Failed to update GM note' });
+    }
 });
 
 // DELETE /api/petra-erp/orders/:id — soft delete, matches the `deleted`
@@ -138,8 +161,13 @@ router.patch('/:id/gm-note', canAccess, async (req, res) => {
 router.delete('/:id', canAccess, async (req, res) => {
     const order = await Order.findByPk(req.params.id);
     if (!order) return res.status(404).json({ message: 'Not found' });
-    await order.update({ deleted: 1 });
-    res.json({ message: 'deleted' });
+    try {
+        await order.update({ deleted: 1 });
+        res.json({ message: 'deleted' });
+    } catch (err) {
+        console.error('Error deleting order:', err);
+        res.status(500).json({ message: 'Failed to delete order' });
+    }
 });
 
 // GET /api/petra-erp/orders/:id/items — control-sheet units (masterControl
@@ -164,20 +192,30 @@ router.post('/:id/items', canAccess, async (req, res) => {
     if (!Array.isArray(rowIds) || rowIds.length === 0) {
         return res.status(400).json({ message: 'rowIds must be a non-empty array' });
     }
-    await sequelize2.query(
-        'UPDATE masterControl SET orderId = :orderId WHERE rowId IN (:rowIds)',
-        { replacements: { orderId: req.params.id, rowIds }, type: QueryTypes.UPDATE },
-    );
-    res.json({ message: 'assigned' });
+    try {
+        await sequelize2.query(
+            'UPDATE masterControl SET orderId = :orderId WHERE rowId IN (:rowIds)',
+            { replacements: { orderId: req.params.id, rowIds }, type: QueryTypes.UPDATE },
+        );
+        res.json({ message: 'assigned' });
+    } catch (err) {
+        console.error('Error assigning items to order:', err);
+        res.status(500).json({ message: 'Failed to assign items' });
+    }
 });
 
 // DELETE /api/petra-erp/orders/:id/items/:rowId
 router.delete('/:id/items/:rowId', canAccess, async (req, res) => {
-    await sequelize2.query(
-        'UPDATE masterControl SET orderId = 0 WHERE rowId = :rowId AND orderId = :orderId',
-        { replacements: { rowId: req.params.rowId, orderId: req.params.id }, type: QueryTypes.UPDATE },
-    );
-    res.json({ message: 'unassigned' });
+    try {
+        await sequelize2.query(
+            'UPDATE masterControl SET orderId = 0 WHERE rowId = :rowId AND orderId = :orderId',
+            { replacements: { rowId: req.params.rowId, orderId: req.params.id }, type: QueryTypes.UPDATE },
+        );
+        res.json({ message: 'unassigned' });
+    } catch (err) {
+        console.error('Error unassigning item from order:', err);
+        res.status(500).json({ message: 'Failed to unassign item' });
+    }
 });
 
 export default router;

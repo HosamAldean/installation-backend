@@ -94,18 +94,34 @@ router.post('/', canAccess, async (req, res) => {
     if (!req.body.projectId) {
         return res.status(400).json({ message: 'projectId is required' });
     }
-    const values = applyPercentClamp(whitelist(ControlSheetUnit, req.body, ['rowId']));
-    const unit = await ControlSheetUnit.create(values);
-    res.status(201).json(unit);
+    try {
+        const values = applyPercentClamp(whitelist(ControlSheetUnit, req.body, ['rowId']));
+        const unit = await ControlSheetUnit.create(values);
+        res.status(201).json(unit);
+    } catch (err) {
+        if (err.name === 'SequelizeUniqueConstraintError') {
+            return res.status(409).json({ message: 'A unit with that value already exists' });
+        }
+        console.error('Error creating control sheet unit:', err);
+        res.status(500).json({ message: 'Failed to create unit' });
+    }
 });
 
 // PATCH /api/control-sheets/:id
 router.patch('/:id', canAccess, async (req, res) => {
     const unit = await ControlSheetUnit.findByPk(req.params.id);
     if (!unit) return res.status(404).json({ message: 'Not found' });
-    const values = applyPercentClamp(whitelist(ControlSheetUnit, req.body, ['rowId']));
-    await unit.update(values);
-    res.json(unit);
+    try {
+        const values = applyPercentClamp(whitelist(ControlSheetUnit, req.body, ['rowId']));
+        await unit.update(values);
+        res.json(unit);
+    } catch (err) {
+        if (err.name === 'SequelizeUniqueConstraintError') {
+            return res.status(409).json({ message: 'A unit with that value already exists' });
+        }
+        console.error('Error updating control sheet unit:', err);
+        res.status(500).json({ message: 'Failed to update unit' });
+    }
 });
 
 // DELETE /api/control-sheets/:id -- soft delete, matches the existing
@@ -114,8 +130,13 @@ router.patch('/:id', canAccess, async (req, res) => {
 router.delete('/:id', canAccess, async (req, res) => {
     const unit = await ControlSheetUnit.findByPk(req.params.id);
     if (!unit) return res.status(404).json({ message: 'Not found' });
-    await unit.update({ deleted: 1 });
-    res.json({ message: 'deleted' });
+    try {
+        await unit.update({ deleted: 1 });
+        res.json({ message: 'deleted' });
+    } catch (err) {
+        console.error('Error deleting control sheet unit:', err);
+        res.status(500).json({ message: 'Failed to delete unit' });
+    }
 });
 
 export default router;

@@ -42,23 +42,28 @@ router.put('/', async (req, res) => {
         return res.status(400).json({ success: false, message: 'Unknown permission key' });
     }
 
-    if (granted) {
-        await PermissionGrant.findOrCreate({
-            where: { role, permissionKey },
-            defaults: { grantedByUserId: req.user.userId },
+    try {
+        if (granted) {
+            await PermissionGrant.findOrCreate({
+                where: { role, permissionKey },
+                defaults: { grantedByUserId: req.user.userId },
+            });
+        } else {
+            await PermissionGrant.destroy({ where: { role, permissionKey } });
+        }
+
+        invalidatePermissionsCache();
+
+        const grants = await PermissionGrant.findAll({
+            attributes: ['role', 'permissionKey'],
         });
-    } else {
-        await PermissionGrant.destroy({ where: { role, permissionKey } });
+        res.json({
+            grants: grants.map((g) => ({ role: g.role, permissionKey: g.permissionKey })),
+        });
+    } catch (err) {
+        console.error('Error updating permission grant:', err);
+        res.status(500).json({ success: false, message: 'Failed to update permission grant' });
     }
-
-    invalidatePermissionsCache();
-
-    const grants = await PermissionGrant.findAll({
-        attributes: ['role', 'permissionKey'],
-    });
-    res.json({
-        grants: grants.map((g) => ({ role: g.role, permissionKey: g.permissionKey })),
-    });
 });
 
 export default router;

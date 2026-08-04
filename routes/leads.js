@@ -57,16 +57,32 @@ router.post('/', async (req, res) => {
     if (!req.body.leadName?.trim() || !req.body.leadDate) {
         return res.status(400).json({ message: 'leadName and leadDate are required' });
     }
-    const lead = await Lead.create(whitelist(Lead, req.body, ['leadId']));
-    res.status(201).json(lead);
+    try {
+        const lead = await Lead.create(whitelist(Lead, req.body, ['leadId']));
+        res.status(201).json(lead);
+    } catch (err) {
+        if (err.name === 'SequelizeUniqueConstraintError') {
+            return res.status(409).json({ message: 'A lead with that value already exists' });
+        }
+        console.error('Error creating lead:', err);
+        res.status(500).json({ message: 'Failed to create lead' });
+    }
 });
 
 // PATCH /api/leads/:id
 router.patch('/:id', async (req, res) => {
     const lead = await Lead.findByPk(req.params.id);
     if (!lead) return res.status(404).json({ message: 'Not found' });
-    await lead.update(whitelist(Lead, req.body, ['leadId']));
-    res.json(lead);
+    try {
+        await lead.update(whitelist(Lead, req.body, ['leadId']));
+        res.json(lead);
+    } catch (err) {
+        if (err.name === 'SequelizeUniqueConstraintError') {
+            return res.status(409).json({ message: 'A lead with that value already exists' });
+        }
+        console.error('Error updating lead:', err);
+        res.status(500).json({ message: 'Failed to update lead' });
+    }
 });
 
 export default router;

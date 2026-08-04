@@ -117,6 +117,21 @@ router.post("/leave-requests", authenticateToken, async (req, res) => {
     if (!["departure", "leave"].includes(kind)) {
         return res.status(400).json({ success: false, message: "kind must be 'departure' or 'leave'" });
     }
+    if (!reason || !String(reason).trim()) {
+        return res.status(400).json({ success: false, message: "reason is required" });
+    }
+    if (kind === "departure") {
+        if (!fromTime || !toTime) {
+            return res.status(400).json({ success: false, message: "fromTime and toTime are required for a departure request" });
+        }
+    } else {
+        if (!fromDate || !toDate || !leaveType) {
+            return res.status(400).json({ success: false, message: "fromDate, toDate, and leaveType are required for a leave request" });
+        }
+        if (new Date(toDate) < new Date(fromDate)) {
+            return res.status(400).json({ success: false, message: "toDate cannot be before fromDate" });
+        }
+    }
     try {
         const request = await HrLeaveRequest.create({
             requesterUserId: req.user.userId,
@@ -304,6 +319,12 @@ router.post("/transport-requests", authenticateToken, async (req, res) => {
     }
     if (!["private_car", "public_transport"].includes(transportMethod)) {
         return res.status(400).json({ success: false, message: "transportMethod must be 'private_car' or 'public_transport'" });
+    }
+    if (transportMethod === "private_car" && kmDriven != null && (!Number.isFinite(Number(kmDriven)) || Number(kmDriven) < 0)) {
+        return res.status(400).json({ success: false, message: "kmDriven must be a non-negative number" });
+    }
+    if (transportMethod === "public_transport" && farePaid != null && (!Number.isFinite(Number(farePaid)) || Number(farePaid) < 0)) {
+        return res.status(400).json({ success: false, message: "farePaid must be a non-negative number" });
     }
     try {
         const request = await HrTransportRequest.create({

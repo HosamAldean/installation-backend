@@ -18,6 +18,14 @@ router.use(authenticateToken);
 
 const canAccess = requirePermission(PERMISSIONS.PETRA_ERP_PROJECTS);
 
+// contractValue is a currency field -- reject a negative value outright
+// rather than letting it silently distort financial reporting downstream.
+function invalidContractValue(body) {
+    return body.contractValue !== undefined
+        && body.contractValue !== null
+        && (typeof body.contractValue !== 'number' || body.contractValue < 0);
+}
+
 // GET /api/projects?page=&pageSize=&q=&statusId=&typeId=
 router.get('/', canAccess, async (req, res) => {
     const page = Math.max(1, parseInt(req.query.page) || 1);
@@ -56,6 +64,9 @@ router.post('/', canAccess, async (req, res) => {
     if (!projectName || !String(projectName).trim()) {
         return res.status(400).json({ message: 'projectName is required' });
     }
+    if (invalidContractValue(req.body)) {
+        return res.status(400).json({ message: 'contractValue must be a non-negative number' });
+    }
     const attrs = Object.keys(Project.getAttributes()).filter((a) => a !== 'projectId');
     const values = {};
     for (const a of attrs) if (req.body[a] !== undefined) values[a] = req.body[a];
@@ -76,6 +87,10 @@ router.post('/', canAccess, async (req, res) => {
 router.patch('/:id', canAccess, async (req, res) => {
     const project = await Project.findByPk(req.params.id);
     if (!project) return res.status(404).json({ message: 'Not found' });
+
+    if (invalidContractValue(req.body)) {
+        return res.status(400).json({ message: 'contractValue must be a non-negative number' });
+    }
 
     const attrs = Object.keys(Project.getAttributes()).filter((a) => a !== 'projectId');
     const updates = {};
