@@ -9,7 +9,9 @@
 // the generic /:id so Express doesn't swallow them as an :id param.
 import express from 'express';
 import { QueryTypes } from 'sequelize';
-import { authenticateToken, authorizeRoles } from '../middleware/auth.js';
+import { authenticateToken } from '../middleware/auth.js';
+import { requirePermission } from '../middleware/permissions.js';
+import { PERMISSIONS } from '../constants/permissions.js';
 import { sequelize2PetraErp } from '../config/db.js';
 import { CashFlow } from '../models/CashFlow.js';
 import { CashFlowDetails } from '../models/CashFlowDetails.js';
@@ -17,7 +19,7 @@ import { CashFlowNotes } from '../models/CashFlowNotes.js';
 import { CashFlowExpected } from '../models/CashFlowExpected.js';
 
 const router = express.Router();
-router.use(authenticateToken, authorizeRoles('accounting', 'admin'));
+router.use(authenticateToken, requirePermission(PERMISSIONS.PETRA_ERP_CASH_FLOW));
 
 function whitelist(model, body, excluding = []) {
     const attrs = Object.keys(model.getAttributes()).filter((a) => !excluding.includes(a));
@@ -43,13 +45,18 @@ router.post('/notes', async (req, res) => {
     if (!req.body.projectId || !req.body.note?.trim()) {
         return res.status(400).json({ message: 'projectId and note are required' });
     }
-    const note = await CashFlowNotes.create({
-        projectId: req.body.projectId,
-        note: req.body.note,
-        cashFlowNoteUserId: req.user.userId,
-        noteDate: new Date(),
-    });
-    res.status(201).json(note);
+    try {
+        const note = await CashFlowNotes.create({
+            projectId: req.body.projectId,
+            note: req.body.note,
+            cashFlowNoteUserId: req.user.userId,
+            noteDate: new Date(),
+        });
+        res.status(201).json(note);
+    } catch (err) {
+        console.error('Error creating cash flow note:', err);
+        res.status(500).json({ message: 'Failed to create note' });
+    }
 });
 
 /* ---------------- Expected amounts ---------------- */
@@ -66,14 +73,22 @@ router.get('/expected', async (req, res) => {
 
 // POST /api/cash-flow/expected  { projectId, expectedAmount, dueDate?, note? }
 router.post('/expected', async (req, res) => {
-    if (!req.body.projectId || req.body.expectedAmount === undefined) {
+    if (!req.body.projectId || req.body.expectedAmount === undefined || req.body.expectedAmount === null) {
         return res.status(400).json({ message: 'projectId and expectedAmount are required' });
     }
-    const entry = await CashFlowExpected.create({
-        ...whitelist(CashFlowExpected, req.body, ['cashFlowExpectedId']),
-        entryDate: new Date(),
-    });
-    res.status(201).json(entry);
+    if (typeof req.body.expectedAmount !== 'number' || req.body.expectedAmount < 0) {
+        return res.status(400).json({ message: 'expectedAmount must be a non-negative number' });
+    }
+    try {
+        const entry = await CashFlowExpected.create({
+            ...whitelist(CashFlowExpected, req.body, ['cashFlowExpectedId']),
+            entryDate: new Date(),
+        });
+        res.status(201).json(entry);
+    } catch (err) {
+        console.error('Error creating expected amount:', err);
+        res.status(500).json({ message: 'Failed to create expected amount entry' });
+    }
 });
 
 /* ---------------- Cash Flow stage entries ---------------- */
@@ -115,16 +130,32 @@ router.post('/', async (req, res) => {
     if (!req.body.projectId) {
         return res.status(400).json({ message: 'projectId is required' });
     }
-    const entry = await CashFlow.create(whitelist(CashFlow, req.body, ['cashFlowId']));
-    res.status(201).json(entry);
+    try {
+        const entry = await CashFlow.create(whitelist(CashFlow, req.body, ['cashFlowId']));
+        res.status(201).json(entry);
+    } catch (err) {
+        if (err.name === 'SequelizeUniqueConstraintError') {
+            return res.status(409).json({ message: 'A cash flow entry with that value already exists' });
+        }
+        console.error('Error creating cash flow entry:', err);
+        res.status(500).json({ message: 'Failed to create cash flow entry' });
+    }
 });
 
 // PATCH /api/cash-flow/:id
 router.patch('/:id', async (req, res) => {
     const entry = await CashFlow.findByPk(req.params.id);
     if (!entry) return res.status(404).json({ message: 'Not found' });
-    await entry.update(whitelist(CashFlow, req.body, ['cashFlowId']));
-    res.json(entry);
+    try {
+        await entry.update(whitelist(CashFlow, req.body, ['cashFlowId']));
+        res.json(entry);
+    } catch (err) {
+        if (err.name === 'SequelizeUniqueConstraintError') {
+            return res.status(409).json({ message: 'A cash flow entry with that value already exists' });
+        }
+        console.error('Error updating cash flow entry:', err);
+        res.status(500).json({ message: 'Failed to update cash flow entry' });
+    }
 });
 
 /* ---------------- Payments (cashFlowDetails) ---------------- */
@@ -145,9 +176,20 @@ router.get('/:id/payments', async (req, res) => {
 
 // POST /api/cash-flow/:id/payments  { paymentValue, paymentTypeId?, paymentDate?, expectedPaymentDate?, paid?, bankId?, docId? }
 router.post('/:id/payments', async (req, res) => {
-    const values = whitelist(CashFlowDetails, req.body, ['cashFlowDetailsId', 'cashFlowId']);
-    const detail = await CashFlowDetails.create({ ...values, cashFlowId: req.params.id });
-    res.status(201).json(detail);
+    if (req.body.paymentValue === undefined || req.body.paymentValue === null) {
+        return res.status(400).json({ message: 'paymentValue is required' });
+    }
+    if (typeof req.body.paymentValue !== 'number' || req.body.paymentValue < 0) {
+        return res.status(400).json({ message: 'paymentValue must be a non-negative number' });
+    }
+    try {
+        const values = whitelist(CashFlowDetails, req.body, ['cashFlowDetailsId', 'cashFlowId']);
+        const detail = await CashFlowDetails.create({ ...values, cashFlowId: req.params.id });
+        res.status(201).json(detail);
+    } catch (err) {
+        console.error('Error creating payment:', err);
+        res.status(500).json({ message: 'Failed to create payment' });
+    }
 });
 
 // PATCH /api/cash-flow/:id/payments/:detailId
@@ -156,17 +198,32 @@ router.patch('/:id/payments/:detailId', async (req, res) => {
         where: { cashFlowDetailsId: req.params.detailId, cashFlowId: req.params.id },
     });
     if (!detail) return res.status(404).json({ message: 'Not found' });
-    await detail.update(whitelist(CashFlowDetails, req.body, ['cashFlowDetailsId', 'cashFlowId']));
-    res.json(detail);
+    if (req.body.paymentValue !== undefined) {
+        if (req.body.paymentValue === null || typeof req.body.paymentValue !== 'number' || req.body.paymentValue < 0) {
+            return res.status(400).json({ message: 'paymentValue must be a non-negative number' });
+        }
+    }
+    try {
+        await detail.update(whitelist(CashFlowDetails, req.body, ['cashFlowDetailsId', 'cashFlowId']));
+        res.json(detail);
+    } catch (err) {
+        console.error('Error updating payment:', err);
+        res.status(500).json({ message: 'Failed to update payment' });
+    }
 });
 
 // DELETE /api/cash-flow/:id/payments/:detailId
 router.delete('/:id/payments/:detailId', async (req, res) => {
-    const deleted = await CashFlowDetails.destroy({
-        where: { cashFlowDetailsId: req.params.detailId, cashFlowId: req.params.id },
-    });
-    if (!deleted) return res.status(404).json({ message: 'Not found' });
-    res.json({ message: 'deleted' });
+    try {
+        const deleted = await CashFlowDetails.destroy({
+            where: { cashFlowDetailsId: req.params.detailId, cashFlowId: req.params.id },
+        });
+        if (!deleted) return res.status(404).json({ message: 'Not found' });
+        res.json({ message: 'deleted' });
+    } catch (err) {
+        console.error('Error deleting payment:', err);
+        res.status(500).json({ message: 'Failed to delete payment' });
+    }
 });
 
 export default router;

@@ -16,7 +16,9 @@
 // +installation_manager read.
 import express from 'express';
 import { QueryTypes } from 'sequelize';
-import { authenticateToken, authorizeRoles } from '../middleware/auth.js';
+import { authenticateToken } from '../middleware/auth.js';
+import { requirePermission } from '../middleware/permissions.js';
+import { PERMISSIONS } from '../constants/permissions.js';
 import { sequelize2PetraErp } from '../config/db.js';
 import { CR09Master } from '../models/CR09Master.js';
 import { CR09Details } from '../models/CR09Details.js';
@@ -24,8 +26,7 @@ import { CR09Details } from '../models/CR09Details.js';
 const router = express.Router();
 router.use(authenticateToken);
 
-const canWrite = authorizeRoles('project_manager', 'admin');
-const canRead = authorizeRoles('project_manager', 'installation_manager', 'admin');
+const canAccess = requirePermission(PERMISSIONS.PETRA_ERP_CR09);
 
 function whitelist(model, body, excluding = []) {
     const attrs = Object.keys(model.getAttributes()).filter((a) => !excluding.includes(a));
@@ -37,33 +38,46 @@ function whitelist(model, body, excluding = []) {
 /* ---------------- Master (project-level preset) ---------------- */
 
 // GET /api/cr09/master?projectId=
-router.get('/master', canRead, async (req, res) => {
+router.get('/master', canAccess, async (req, res) => {
     if (!req.query.projectId) return res.status(400).json({ message: 'projectId is required' });
     const master = await CR09Master.findOne({ where: { projectId: req.query.projectId } });
     res.json(master);
 });
 
 // POST /api/cr09/master  { projectId, colorInfoId?, ... } -- one per project
-router.post('/master', canWrite, async (req, res) => {
+router.post('/master', canAccess, async (req, res) => {
     if (!req.body.projectId) return res.status(400).json({ message: 'projectId is required' });
-    const existing = await CR09Master.findOne({ where: { projectId: req.body.projectId } });
-    if (existing) return res.status(409).json({ message: 'A CR09 preset already exists for this project' });
-    const master = await CR09Master.create(whitelist(CR09Master, req.body, ['CR09Id']));
-    res.status(201).json(master);
+    try {
+        const existing = await CR09Master.findOne({ where: { projectId: req.body.projectId } });
+        if (existing) return res.status(409).json({ message: 'A CR09 preset already exists for this project' });
+        const master = await CR09Master.create(whitelist(CR09Master, req.body, ['CR09Id']));
+        res.status(201).json(master);
+    } catch (err) {
+        if (err.name === 'SequelizeUniqueConstraintError') {
+            return res.status(409).json({ message: 'A CR09 preset already exists for this project' });
+        }
+        console.error('Error creating CR09 master:', err);
+        res.status(500).json({ message: 'Failed to create CR09 preset' });
+    }
 });
 
 // PATCH /api/cr09/master/:id
-router.patch('/master/:id', canWrite, async (req, res) => {
+router.patch('/master/:id', canAccess, async (req, res) => {
     const master = await CR09Master.findByPk(req.params.id);
     if (!master) return res.status(404).json({ message: 'Not found' });
-    await master.update(whitelist(CR09Master, req.body, ['CR09Id', 'projectId']));
-    res.json(master);
+    try {
+        await master.update(whitelist(CR09Master, req.body, ['CR09Id', 'projectId']));
+        res.json(master);
+    } catch (err) {
+        console.error('Error updating CR09 master:', err);
+        res.status(500).json({ message: 'Failed to update CR09 preset' });
+    }
 });
 
 /* ---------------- Details (per-unit) ---------------- */
 
 // GET /api/cr09/details?projectId=&page=&pageSize=
-router.get('/details', canRead, async (req, res) => {
+router.get('/details', canAccess, async (req, res) => {
     if (!req.query.projectId) return res.status(400).json({ message: 'projectId is required' });
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const pageSize = Math.min(200, Math.max(1, parseInt(req.query.pageSize) || 50));
@@ -86,18 +100,31 @@ router.get('/details', canRead, async (req, res) => {
 });
 
 // POST /api/cr09/details  { projectId, rowId?, glassId?, aluminumColorId?, ... }
-router.post('/details', canWrite, async (req, res) => {
+router.post('/details', canAccess, async (req, res) => {
     if (!req.body.projectId) return res.status(400).json({ message: 'projectId is required' });
-    const detail = await CR09Details.create(whitelist(CR09Details, req.body, ['CR09DetailId']));
-    res.status(201).json(detail);
+    try {
+        const detail = await CR09Details.create(whitelist(CR09Details, req.body, ['CR09DetailId']));
+        res.status(201).json(detail);
+    } catch (err) {
+        if (err.name === 'SequelizeUniqueConstraintError') {
+            return res.status(409).json({ message: 'A CR09 detail with that value already exists' });
+        }
+        console.error('Error creating CR09 detail:', err);
+        res.status(500).json({ message: 'Failed to create CR09 detail' });
+    }
 });
 
 // PATCH /api/cr09/details/:id
-router.patch('/details/:id', canWrite, async (req, res) => {
+router.patch('/details/:id', canAccess, async (req, res) => {
     const detail = await CR09Details.findByPk(req.params.id);
     if (!detail) return res.status(404).json({ message: 'Not found' });
-    await detail.update(whitelist(CR09Details, req.body, ['CR09DetailId', 'projectId']));
-    res.json(detail);
+    try {
+        await detail.update(whitelist(CR09Details, req.body, ['CR09DetailId', 'projectId']));
+        res.json(detail);
+    } catch (err) {
+        console.error('Error updating CR09 detail:', err);
+        res.status(500).json({ message: 'Failed to update CR09 detail' });
+    }
 });
 
 export default router;

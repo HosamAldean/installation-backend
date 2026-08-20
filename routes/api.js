@@ -1,7 +1,9 @@
 // backend/routes/api.js
 import express from 'express';
 import { sequelize } from '../config/db.js'; // adjust to your DB config
-import { authenticateToken, authorizeRoles } from '../middleware/auth.js';
+import { authenticateToken } from '../middleware/auth.js';
+import { requirePermission } from '../middleware/permissions.js';
+import { PERMISSIONS } from '../constants/permissions.js';
 const router = express.Router();
 
 // Health check
@@ -10,7 +12,7 @@ router.get('/health', (req, res) => res.json({ ok: true }));
 // Dashboard stats — previously unauthenticated, exposing internal
 // user/team/project counts to any caller. Only called from the
 // manager/admin-gated Dashboard pages.
-router.get('/stats', authenticateToken, authorizeRoles('installation_manager', 'admin'), async (req, res) => {
+router.get('/stats', authenticateToken, requirePermission(PERMISSIONS.INSTALLATION_DASHBOARD_STATS), async (req, res) => {
     try {
         const [[{ userCount }]] = await sequelize.query(`SELECT COUNT(*) AS userCount FROM InsUser`);
         const [[{ teamCount }]] = await sequelize.query(`SELECT COUNT(*) AS teamCount FROM instTeams`);

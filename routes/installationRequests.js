@@ -2,7 +2,9 @@
 import express from 'express';
 import { sequelize, sequelize2 } from '../config/db.js';
 import { QueryTypes } from 'sequelize';
-import { authenticateToken, authorizeRoles } from '../middleware/auth.js';
+import { authenticateToken } from '../middleware/auth.js';
+import { requirePermission } from '../middleware/permissions.js';
+import { PERMISSIONS } from '../constants/permissions.js';
 
 const router = express.Router();
 // This entire router previously had no authentication at all — contract
@@ -11,7 +13,7 @@ const router = express.Router();
 // already gated to manager/admin via RoleProtectedRoute — mirror that here
 // so it can't be bypassed by calling the API directly, matching instOrders.js.
 router.use(authenticateToken);
-router.use(authorizeRoles('installation_manager', 'admin'));
+router.use(requirePermission(PERMISSIONS.INSTALLATION_REQUESTS));
 
 /** -------------------------------------------------------
  *  🔧 Arabic Auto-Recovery (Fix double-encoded UTF-8 text)

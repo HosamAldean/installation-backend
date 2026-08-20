@@ -5,6 +5,7 @@ import jwt from 'jsonwebtoken';
 import dotenv from 'dotenv';
 import { User } from '../models/User.js';
 import { authenticateToken, authorizeRoles } from '../middleware/auth.js';
+import { getPermissionsForRole } from '../middleware/permissions.js';
 
 dotenv.config();
 const router = express.Router();
@@ -90,7 +91,7 @@ router.post('/signup', checkRateLimit, authenticateToken, authorizeRoles('admin'
             username,
             password: hash,
             email,
-            role: role || 'user',
+            role: role || 'installation_employee',
             firstName,
             lastName,
          //   teamId: teamId || null,
@@ -170,7 +171,14 @@ router.post('/login', checkRateLimit, async (req, res) => {
               //  teamId: user.teamId,
                 assignedEmpNo: user.assignedEmpNo,
                 assignedStore: user.assignedStore ?? null,
-                avatarUrl: user.avatarUrl || null
+                avatarUrl: user.avatarUrl || null,
+                // Mirrors /auth/me's payload.permissions -- the mobile app
+                // persists this whole `user` object on-device and gates its
+                // menu on permission keys instead of hardcoded roles, so
+                // admin's grant-matrix toggles (routes/permissions.js)
+                // control mobile visibility the same way they already
+                // control web routing (see PermissionRoute.tsx).
+                permissions: await getPermissionsForRole(user.role)
             }
         });
     } catch (error) {
@@ -269,7 +277,10 @@ router.get('/me', authenticateToken, async (req, res) => {
             return res.status(404).json({ message: 'User not found' });
         }
 
-        res.json({ user });
+        const payload = user.toJSON();
+        payload.permissions = await getPermissionsForRole(payload.role);
+
+        res.json({ user: payload });
     } catch (err) {
         console.error(err);
         res.status(500).json({ message: 'Failed to fetch user info' });

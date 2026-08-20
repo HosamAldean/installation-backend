@@ -2,7 +2,9 @@
 import express from 'express';
 import { sequelize, sequelize2 } from '../config/db.js';
 import { QueryTypes } from 'sequelize';
-import { authenticateToken, authorizeRoles } from '../middleware/auth.js';
+import { authenticateToken } from '../middleware/auth.js';
+import { requirePermission } from '../middleware/permissions.js';
+import { PERMISSIONS } from '../constants/permissions.js';
 
 const router = express.Router();
 // Previously unauthenticated — anyone could create/edit/delete the step
@@ -10,7 +12,7 @@ const router = express.Router();
 // order's progress/at-risk calculations. The frontend (InstallationSteps.tsx)
 // is already gated to manager/admin via RoleProtectedRoute — mirror that here.
 router.use(authenticateToken);
-router.use(authorizeRoles('installation_manager', 'admin'));
+router.use(requirePermission(PERMISSIONS.INSTALLATION_STEPS));
 
 const fixArabic = (str) => {
     if (!str || typeof str !== 'string') return str;

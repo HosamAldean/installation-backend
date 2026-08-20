@@ -35,7 +35,7 @@ export const User = sequelize2.define(
         role: {
             type: DataTypes.STRING,
             allowNull: false,
-            defaultValue: 'user',
+            defaultValue: 'installation_employee',
         },
 
         firstName: {

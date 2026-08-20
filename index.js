@@ -14,6 +14,7 @@ import cookieParser from 'cookie-parser';
 // import routes
 import followUpRouter from "./routes/followUp.js";
 import followUpNotesRouter from "./routes/followUpNotes.js";
+import scanAuditLogRouter from "./routes/scanAuditLog.js";
 
 // import models (this triggers model definition + associations in models/index)
 import './models/index.js';
@@ -21,7 +22,6 @@ import './models/index.js';
 // Routes
 import authRouter from "./routes/auth.js";
 import usersRouter from "./routes/users.js";
-import itemsRouter from "./routes/items.js";
 import uploadRouter from "./routes/upload.js";
 import employeeRoutes from "./routes/employees.js";
 import apiRouter from "./routes/api.js";
@@ -46,6 +46,7 @@ import leadsRouter from "./routes/leads.js";
 import timesheetsRouter from "./routes/timesheets.js";
 import cr09Router from "./routes/cr09.js";
 import cr09TagsRouter from "./routes/cr09Tags.js";
+import permissionsRouter from "./routes/permissions.js";
 import hrRequestsRouter from "./routes/hrRequests.js";
 import hrReportsRouter from "./routes/hrReports.js";
  // follow-up module
@@ -133,6 +134,7 @@ app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
 // ======================
 app.use("/api/follow-up", followUpRouter); // follow-up
 app.use("/api/follow-up-notes", followUpNotesRouter); // manager/PM follow-up notes tracker
+app.use("/api/scan-audit-log", scanAuditLogRouter); // server-persisted warehouse scan history
 
 // ======================
 // Health check
@@ -142,7 +144,6 @@ app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 
 app.use("/api/auth", authRouter);
 app.use("/api/users", usersRouter);
-app.use("/api/items", itemsRouter);
 app.use("/api/employees", employeeRoutes);
 app.use("/api/upload", uploadRouter);
 app.use("/api/teams", teamsRouter);
@@ -166,6 +167,7 @@ app.use("/api/sales-analytics", salesAnalyticsRouter);
 app.use("/api/leads", leadsRouter);
 app.use("/api/timesheets", timesheetsRouter);
 app.use("/api/cr09", cr09Router);
+app.use("/api/admin/permissions", permissionsRouter);
 app.use("/api/cr09/tags", cr09TagsRouter);
 app.use("/api/hr-requests", hrRequestsRouter);
 app.use("/api/hr-reports", hrReportsRouter);

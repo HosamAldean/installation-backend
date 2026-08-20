@@ -12,8 +12,14 @@
 // rather than trusting a snapshot taken at submission time -- correct
 // even if someone's supervisor changes between submission and review.
 import express from "express";
+import { Op } from "sequelize";
+import multer from "multer";
+import path from "path";
+import fs from "fs";
 import { withSqlRetry } from "../config/db.js";
-import { authenticateToken, authorizeRoles } from "../middleware/auth.js";
+import { authenticateToken } from "../middleware/auth.js";
+import { requirePermission } from "../middleware/permissions.js";
+import { PERMISSIONS } from "../constants/permissions.js";
 import {
     HrLeaveRequest,
     HrAttendanceCorrectionRequest,
@@ -21,12 +27,126 @@ import {
     HrTransportRequest,
     HrTransportAccompanier,
 } from "../models/index.js";
-import { isSupervisorOf, getSupervisedEmpNos } from "../utils/supervisorLookup.js";
+import { isSupervisorOf, getSupervisedEmpNos, hasRealSupervisor, getEmpNosWithoutRealSupervisor, getSupervisorUserId, getFallbackManagerUserIds } from "../utils/supervisorLookup.js";
+import { isHrScopedRole, getHrQueueEmpNos, isInHrQueueScope, getHrReviewerUserIds, getFinanceReviewerUserIds } from "../utils/hrScope.js";
 import { resolveEmployeeNames } from "../utils/employeeLookup.js";
 import { resolveUserNames } from "../utils/userLookup.js";
+import { resolveProjectLabels, withProjectDisplay } from "../utils/projectLookup.js";
 import { sendPushToUser } from "../services/pushNotifications.js";
 
 const router = express.Router();
+
+// Defense in depth for the 3 hr-decision endpoints below: GET /hr-queue
+// already filters the LIST by scope, but a scoped HR role could otherwise
+// still call PUT .../hr-decision directly with a known id belonging to a
+// requester outside their scope. Returns true (allowed) for hr_manager/admin
+// (unscoped) and for any HR-tier role whose scope actually covers this
+// requester; false otherwise.
+async function isHrDecisionInScope(role, requesterEmpNo) {
+    if (!isHrScopedRole(role)) return true;
+    return isInHrQueueScope(role, requesterEmpNo);
+}
+
+// Manager-decision authorization for the 3 endpoints below: the real
+// supervisor (per PayEmp.Supervisor_No) or admin, same as always -- plus
+// hr_manager as a fallback ONLY for employees who genuinely have no
+// resolvable real supervisor (see hasRealSupervisor), so a request from a
+// normal employee still can't be short-circuited by hr_manager past their
+// actual manager.
+// Best-effort notifications to whoever needs to act next at each stage --
+// a missing account/device token should never block the request itself
+// (same reasoning as sendPushToUser's own try/catch), so every call site
+// below fires without awaiting and swallows its own errors.
+async function notifyManagerOfNewRequest(requesterEmpNo, { title, body }) {
+    try {
+        const supervisorUserId = await getSupervisorUserId(requesterEmpNo);
+        if (supervisorUserId) {
+            sendPushToUser(supervisorUserId, { title, body });
+            return;
+        }
+        // No resolvable real supervisor -- same hr_manager fallback as
+        // isAuthorizedManagerDecision.
+        const fallbackIds = await getFallbackManagerUserIds();
+        fallbackIds.forEach((id) => sendPushToUser(id, { title, body }));
+    } catch (err) {
+        console.error("❌ Failed to notify manager of new request:", err);
+    }
+}
+
+async function notifyHrReviewers(requesterEmpNo, { title, body }) {
+    try {
+        const reviewerIds = await getHrReviewerUserIds(requesterEmpNo);
+        reviewerIds.forEach((id) => sendPushToUser(id, { title, body }));
+    } catch (err) {
+        console.error("❌ Failed to notify HR reviewers:", err);
+    }
+}
+
+async function notifyFinanceReviewers({ title, body }) {
+    try {
+        const reviewerIds = await getFinanceReviewerUserIds();
+        reviewerIds.forEach((id) => sendPushToUser(id, { title, body }));
+    } catch (err) {
+        console.error("❌ Failed to notify finance reviewers:", err);
+    }
+}
+
+// Resolves which requesterEmpNos this caller may see across
+// /manager-approvals and /manager-approvals-history -- null means
+// unscoped (admin). Shared so the hr_manager orphan-fallback logic isn't
+// duplicated across both endpoints.
+async function getSupervisedEmpNosForCaller(req) {
+    const supervisorEmpNo = req.user.assignedEmpNo ? parseInt(req.user.assignedEmpNo) : null;
+    if (req.user.role === "admin") return null;
+    let supervisedEmpNos = await getSupervisedEmpNos(supervisorEmpNo);
+    // hr_manager also sees (and, per isAuthorizedManagerDecision above, may
+    // approve) requests from employees who have no resolvable real
+    // supervisor at all -- otherwise that fallback capability would only
+    // be usable by guessing a request id.
+    if (req.user.role === "hr_manager") {
+        const orphanedEmpNos = await getEmpNosWithoutRealSupervisor();
+        supervisedEmpNos = [...new Set([...supervisedEmpNos, ...orphanedEmpNos])];
+    }
+    return supervisedEmpNos;
+}
+
+async function isAuthorizedManagerDecision(req, requesterEmpNo) {
+    if (req.user.role === "admin") return true;
+    const callerEmpNo = req.user.assignedEmpNo ? parseInt(req.user.assignedEmpNo) : null;
+    if (await isSupervisorOf(callerEmpNo, requesterEmpNo)) return true;
+    if (req.user.role === "hr_manager" && !(await hasRealSupervisor(requesterEmpNo))) return true;
+    return false;
+}
+
+// Sick-note / death-certificate attachment on a leave request -- mandatory
+// for leaveType 'sick' and 'condolence_occasional' (enforced below),
+// optional for every other type. Image or PDF, unlike the avatar upload
+// (routes/upload.js), which is image-only. Mirrors that same
+// disk-storage + fileFilter + size-limit pattern.
+const attachmentsDir = path.resolve(process.cwd(), "uploads/hr-attachments");
+fs.mkdirSync(attachmentsDir, { recursive: true });
+const attachmentStorage = multer.diskStorage({
+    destination: (req, file, cb) => cb(null, attachmentsDir),
+    filename: (req, file, cb) => {
+        const ext = path.extname(file.originalname).toLowerCase() || ".jpg";
+        const uniqueName = Date.now() + "-" + Math.random().toString(36).substring(2, 10) + ext;
+        cb(null, uniqueName);
+    },
+});
+const attachmentAllowedExts = new Set([".jpg", ".jpeg", ".png", ".webp", ".pdf"]);
+const attachmentMimeRegex = /^(image\/(jpeg|png|webp)|application\/pdf)$/;
+const attachmentUpload = multer({
+    storage: attachmentStorage,
+    fileFilter: (req, file, cb) => {
+        const ext = path.extname(file.originalname).toLowerCase();
+        if (attachmentMimeRegex.test(file.mimetype) && attachmentAllowedExts.has(ext)) {
+            return cb(null, true);
+        }
+        return cb(new Error("Only image (JPG/PNG/WebP) or PDF attachments are allowed"));
+    },
+    limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB -- documents scan larger than avatar photos
+});
+const LEAVE_TYPES_REQUIRING_ATTACHMENT = new Set(["sick", "condolence_occasional"]);
 
 function requireEmpNo(req, res) {
     if (!req.user.assignedEmpNo) {
@@ -108,12 +228,35 @@ router.get("/vacation-balance", authenticateToken, async (req, res) => {
 // ============================================================
 // POST /leave-requests
 // ============================================================
-router.post("/leave-requests", authenticateToken, async (req, res) => {
+router.post("/leave-requests", authenticateToken, attachmentUpload.single("attachment"), async (req, res) => {
     const empNo = requireEmpNo(req, res);
     if (empNo === null) return;
     const { kind, fromTime, toTime, fromDate, toDate, leaveType, reason } = req.body;
     if (!["departure", "leave"].includes(kind)) {
         return res.status(400).json({ success: false, message: "kind must be 'departure' or 'leave'" });
+    }
+    if (!reason || !String(reason).trim()) {
+        return res.status(400).json({ success: false, message: "reason is required" });
+    }
+    if (kind === "departure") {
+        if (!fromDate || !fromTime || !toTime) {
+            return res.status(400).json({ success: false, message: "fromDate, fromTime, and toTime are required for a departure request" });
+        }
+    } else {
+        if (!fromDate || !toDate || !leaveType) {
+            return res.status(400).json({ success: false, message: "fromDate, toDate, and leaveType are required for a leave request" });
+        }
+        if (new Date(toDate) < new Date(fromDate)) {
+            return res.status(400).json({ success: false, message: "toDate cannot be before fromDate" });
+        }
+        if (LEAVE_TYPES_REQUIRING_ATTACHMENT.has(leaveType) && !req.file) {
+            return res.status(400).json({
+                success: false,
+                message: leaveType === "sick"
+                    ? "A sick note attachment is required for sick leave"
+                    : "A death certificate attachment is required for bereavement/occasional leave",
+            });
+        }
     }
     try {
         const request = await HrLeaveRequest.create({
@@ -126,6 +269,12 @@ router.post("/leave-requests", authenticateToken, async (req, res) => {
             toDate: toDate || null,
             leaveType: leaveType || null,
             reason: reason || null,
+            attachmentUrl: req.file ? `/uploads/hr-attachments/${req.file.filename}` : null,
+            attachmentMimeType: req.file ? req.file.mimetype : null,
+        });
+        notifyManagerOfNewRequest(empNo, {
+            title: kind === "departure" ? "New departure request" : "New leave request",
+            body: "A request from your team needs your approval.",
         });
         res.json({ success: true, id: request.id });
     } catch (err) {
@@ -146,8 +295,9 @@ router.put("/leave-requests/:id/manager-decision", authenticateToken, async (req
             return res.status(400).json({ success: false, message: "This request is not awaiting manager review" });
         }
         const callerEmpNo = req.user.assignedEmpNo ? parseInt(req.user.assignedEmpNo) : null;
-        const authorized = req.user.role === "admin" || await isSupervisorOf(callerEmpNo, request.requesterEmpNo);
-        if (!authorized) return res.status(403).json({ success: false, message: "You are not this employee's supervisor" });
+        if (!(await isAuthorizedManagerDecision(req, request.requesterEmpNo))) {
+            return res.status(403).json({ success: false, message: "You are not this employee's supervisor" });
+        }
 
         await request.update({
             managerApproverEmpNo: callerEmpNo,
@@ -160,6 +310,12 @@ router.put("/leave-requests/:id/manager-decision", authenticateToken, async (req
             title: "Leave request update",
             body: decision === "approved" ? "Your manager approved your leave request — now awaiting HR." : "Your manager rejected your leave request.",
         });
+        if (decision === "approved") {
+            notifyHrReviewers(request.requesterEmpNo, {
+                title: "Leave request awaiting HR",
+                body: "A manager-approved leave request needs your review.",
+            });
+        }
         res.json({ success: true });
     } catch (err) {
         console.error("❌ HR LEAVE MANAGER DECISION ERROR:", err);
@@ -167,7 +323,7 @@ router.put("/leave-requests/:id/manager-decision", authenticateToken, async (req
     }
 });
 
-router.put("/leave-requests/:id/hr-decision", authenticateToken, authorizeRoles("hr", "hr_manager", "admin"), async (req, res) => {
+router.put("/leave-requests/:id/hr-decision", authenticateToken, requirePermission(PERMISSIONS.HR_REQUESTS_QUEUE), async (req, res) => {
     const { decision, note } = req.body;
     if (!["approved", "rejected"].includes(decision)) {
         return res.status(400).json({ success: false, message: "decision must be 'approved' or 'rejected'" });
@@ -175,6 +331,9 @@ router.put("/leave-requests/:id/hr-decision", authenticateToken, authorizeRoles(
     try {
         const request = await HrLeaveRequest.findByPk(req.params.id);
         if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+        if (!(await isHrDecisionInScope(req.user.role, request.requesterEmpNo))) {
+            return res.status(403).json({ success: false, message: "Forbidden" });
+        }
         if (request.status !== "pending_hr") {
             return res.status(400).json({ success: false, message: "This request is not awaiting HR review" });
         }
@@ -218,6 +377,10 @@ router.post("/attendance-corrections", authenticateToken, async (req, res) => {
             exitTime: r.exitTime || null,
             notes: r.notes || null,
         })));
+        notifyManagerOfNewRequest(empNo, {
+            title: "New attendance correction request",
+            body: "A request from your team needs your approval.",
+        });
         res.json({ success: true, id: request.id });
     } catch (err) {
         console.error("❌ HR CREATE ATTENDANCE CORRECTION ERROR:", err);
@@ -237,8 +400,9 @@ router.put("/attendance-corrections/:id/manager-decision", authenticateToken, as
             return res.status(400).json({ success: false, message: "This request is not awaiting manager review" });
         }
         const callerEmpNo = req.user.assignedEmpNo ? parseInt(req.user.assignedEmpNo) : null;
-        const authorized = req.user.role === "admin" || await isSupervisorOf(callerEmpNo, request.requesterEmpNo);
-        if (!authorized) return res.status(403).json({ success: false, message: "You are not this employee's supervisor" });
+        if (!(await isAuthorizedManagerDecision(req, request.requesterEmpNo))) {
+            return res.status(403).json({ success: false, message: "You are not this employee's supervisor" });
+        }
 
         await request.update({
             managerApproverEmpNo: callerEmpNo,
@@ -251,6 +415,12 @@ router.put("/attendance-corrections/:id/manager-decision", authenticateToken, as
             title: "Attendance correction update",
             body: decision === "approved" ? "Your manager approved your attendance correction — now awaiting HR." : "Your manager rejected your attendance correction.",
         });
+        if (decision === "approved") {
+            notifyHrReviewers(request.requesterEmpNo, {
+                title: "Attendance correction awaiting HR",
+                body: "A manager-approved attendance correction needs your review.",
+            });
+        }
         res.json({ success: true });
     } catch (err) {
         console.error("❌ HR ATTENDANCE MANAGER DECISION ERROR:", err);
@@ -258,7 +428,7 @@ router.put("/attendance-corrections/:id/manager-decision", authenticateToken, as
     }
 });
 
-router.put("/attendance-corrections/:id/hr-decision", authenticateToken, authorizeRoles("hr", "hr_manager", "admin"), async (req, res) => {
+router.put("/attendance-corrections/:id/hr-decision", authenticateToken, requirePermission(PERMISSIONS.HR_REQUESTS_QUEUE), async (req, res) => {
     const { decision, note } = req.body;
     if (!["approved", "rejected"].includes(decision)) {
         return res.status(400).json({ success: false, message: "decision must be 'approved' or 'rejected'" });
@@ -266,6 +436,9 @@ router.put("/attendance-corrections/:id/hr-decision", authenticateToken, authori
     try {
         const request = await HrAttendanceCorrectionRequest.findByPk(req.params.id);
         if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+        if (!(await isHrDecisionInScope(req.user.role, request.requesterEmpNo))) {
+            return res.status(403).json({ success: false, message: "Forbidden" });
+        }
         if (request.status !== "pending_hr") {
             return res.status(400).json({ success: false, message: "This request is not awaiting HR review" });
         }
@@ -303,6 +476,12 @@ router.post("/transport-requests", authenticateToken, async (req, res) => {
     if (!["private_car", "public_transport"].includes(transportMethod)) {
         return res.status(400).json({ success: false, message: "transportMethod must be 'private_car' or 'public_transport'" });
     }
+    if (transportMethod === "private_car" && kmDriven != null && (!Number.isFinite(Number(kmDriven)) || Number(kmDriven) < 0)) {
+        return res.status(400).json({ success: false, message: "kmDriven must be a non-negative number" });
+    }
+    if (transportMethod === "public_transport" && farePaid != null && (!Number.isFinite(Number(farePaid)) || Number(farePaid) < 0)) {
+        return res.status(400).json({ success: false, message: "farePaid must be a non-negative number" });
+    }
     try {
         const request = await HrTransportRequest.create({
             requesterUserId: req.user.userId,
@@ -325,6 +504,10 @@ router.post("/transport-requests", authenticateToken, async (req, res) => {
                 reason: r.reason || null,
             })));
         }
+        notifyManagerOfNewRequest(empNo, {
+            title: "New transportation request",
+            body: "A request from your team needs your approval.",
+        });
         res.json({ success: true, id: request.id });
     } catch (err) {
         console.error("❌ HR CREATE TRANSPORT REQUEST ERROR:", err);
@@ -344,8 +527,9 @@ router.put("/transport-requests/:id/manager-decision", authenticateToken, async 
             return res.status(400).json({ success: false, message: "This request is not awaiting manager review" });
         }
         const callerEmpNo = req.user.assignedEmpNo ? parseInt(req.user.assignedEmpNo) : null;
-        const authorized = req.user.role === "admin" || await isSupervisorOf(callerEmpNo, request.requesterEmpNo);
-        if (!authorized) return res.status(403).json({ success: false, message: "You are not this employee's supervisor" });
+        if (!(await isAuthorizedManagerDecision(req, request.requesterEmpNo))) {
+            return res.status(403).json({ success: false, message: "You are not this employee's supervisor" });
+        }
 
         await request.update({
             managerApproverEmpNo: callerEmpNo,
@@ -358,6 +542,12 @@ router.put("/transport-requests/:id/manager-decision", authenticateToken, async 
             title: "Transportation request update",
             body: decision === "approved" ? "Your manager approved your transportation request — now awaiting HR audit." : "Your manager rejected your transportation request.",
         });
+        if (decision === "approved") {
+            notifyHrReviewers(request.requesterEmpNo, {
+                title: "Transportation request awaiting HR audit",
+                body: "A manager-approved transportation request needs your review.",
+            });
+        }
         res.json({ success: true });
     } catch (err) {
         console.error("❌ HR TRANSPORT MANAGER DECISION ERROR:", err);
@@ -365,7 +555,7 @@ router.put("/transport-requests/:id/manager-decision", authenticateToken, async 
     }
 });
 
-router.put("/transport-requests/:id/hr-decision", authenticateToken, authorizeRoles("hr", "hr_manager", "admin"), async (req, res) => {
+router.put("/transport-requests/:id/hr-decision", authenticateToken, requirePermission(PERMISSIONS.HR_REQUESTS_QUEUE), async (req, res) => {
     const { decision, note } = req.body;
     if (!["approved", "rejected"].includes(decision)) {
         return res.status(400).json({ success: false, message: "decision must be 'approved' or 'rejected'" });
@@ -373,6 +563,9 @@ router.put("/transport-requests/:id/hr-decision", authenticateToken, authorizeRo
     try {
         const request = await HrTransportRequest.findByPk(req.params.id);
         if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+        if (!(await isHrDecisionInScope(req.user.role, request.requesterEmpNo))) {
+            return res.status(403).json({ success: false, message: "Forbidden" });
+        }
         if (request.status !== "pending_hr_audit") {
             return res.status(400).json({ success: false, message: "This request is not awaiting HR audit" });
         }
@@ -387,6 +580,12 @@ router.put("/transport-requests/:id/hr-decision", authenticateToken, authorizeRo
             title: "Transportation request update",
             body: decision === "approved" ? "HR audited and approved your transportation request — now awaiting finance." : "HR rejected your transportation request.",
         });
+        if (decision === "approved") {
+            notifyFinanceReviewers({
+                title: "Transportation request awaiting finance",
+                body: "An HR-audited transportation request needs your review.",
+            });
+        }
         res.json({ success: true });
     } catch (err) {
         console.error("❌ HR TRANSPORT HR DECISION ERROR:", err);
@@ -394,7 +593,7 @@ router.put("/transport-requests/:id/hr-decision", authenticateToken, authorizeRo
     }
 });
 
-router.put("/transport-requests/:id/finance-decision", authenticateToken, authorizeRoles("accounting", "accounting_manager", "admin"), async (req, res) => {
+router.put("/transport-requests/:id/finance-decision", authenticateToken, requirePermission(PERMISSIONS.ACCOUNTING_REQUESTS_QUEUE), async (req, res) => {
     const { decision, note, kmRate, additionalAmount, additionalAmountNote } = req.body;
     if (!["approved", "rejected"].includes(decision)) {
         return res.status(400).json({ success: false, message: "decision must be 'approved' or 'rejected'" });
@@ -455,7 +654,7 @@ router.put("/transport-requests/:id/finance-decision", authenticateToken, author
 // off) since those are two different real-world events that can happen
 // at different times (approval today, bank transfer next week).
 // ============================================================
-router.put("/transport-requests/:id/mark-paid", authenticateToken, authorizeRoles("accounting", "accounting_manager", "admin"), async (req, res) => {
+router.put("/transport-requests/:id/mark-paid", authenticateToken, requirePermission(PERMISSIONS.ACCOUNTING_REQUESTS_QUEUE), async (req, res) => {
     try {
         const request = await HrTransportRequest.findByPk(req.params.id);
         if (!request) return res.status(404).json({ success: false, message: "Request not found" });
@@ -474,6 +673,234 @@ router.put("/transport-requests/:id/mark-paid", authenticateToken, authorizeRole
     } catch (err) {
         console.error("❌ HR TRANSPORT MARK PAID ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to mark request as paid" });
+    }
+});
+
+// ============================================================
+// PUT /leave-requests/:id, /attendance-corrections/:id,
+// /transport-requests/:id -- self-service edit. Requester-only, and only
+// while still pending_manager -- stricter than cancel's window below,
+// since once even the manager stage has acted, editing the content out
+// from under a decision already made would be misleading. Reuses the
+// exact same field validation as the matching POST create endpoint.
+// ============================================================
+router.put("/leave-requests/:id", authenticateToken, attachmentUpload.single("attachment"), async (req, res) => {
+    const { kind, fromTime, toTime, fromDate, toDate, leaveType, reason } = req.body;
+    if (!["departure", "leave"].includes(kind)) {
+        return res.status(400).json({ success: false, message: "kind must be 'departure' or 'leave'" });
+    }
+    if (!reason || !String(reason).trim()) {
+        return res.status(400).json({ success: false, message: "reason is required" });
+    }
+    if (kind === "departure") {
+        if (!fromDate || !fromTime || !toTime) {
+            return res.status(400).json({ success: false, message: "fromDate, fromTime, and toTime are required for a departure request" });
+        }
+    } else {
+        if (!fromDate || !toDate || !leaveType) {
+            return res.status(400).json({ success: false, message: "fromDate, toDate, and leaveType are required for a leave request" });
+        }
+        if (new Date(toDate) < new Date(fromDate)) {
+            return res.status(400).json({ success: false, message: "toDate cannot be before fromDate" });
+        }
+    }
+    try {
+        const request = await HrLeaveRequest.findByPk(req.params.id);
+        if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+        if (request.requesterUserId !== req.user.userId) {
+            return res.status(403).json({ success: false, message: "You can only edit your own requests" });
+        }
+        if (request.status !== "pending_manager") {
+            return res.status(400).json({ success: false, message: "This request has already entered review and can no longer be edited" });
+        }
+        if (kind === "leave" && LEAVE_TYPES_REQUIRING_ATTACHMENT.has(leaveType) && !req.file && !request.attachmentUrl) {
+            return res.status(400).json({
+                success: false,
+                message: leaveType === "sick"
+                    ? "A sick note attachment is required for sick leave"
+                    : "A death certificate attachment is required for bereavement/occasional leave",
+            });
+        }
+        await request.update({
+            kind,
+            fromTime: fromTime || null,
+            toTime: toTime || null,
+            fromDate: fromDate || null,
+            toDate: toDate || null,
+            leaveType: leaveType || null,
+            reason: reason || null,
+            ...(req.file ? {
+                attachmentUrl: `/uploads/hr-attachments/${req.file.filename}`,
+                attachmentMimeType: req.file.mimetype,
+            } : {}),
+        });
+        res.json({ success: true });
+    } catch (err) {
+        console.error("❌ HR EDIT LEAVE REQUEST ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to update leave request" });
+    }
+});
+
+router.put("/attendance-corrections/:id", authenticateToken, async (req, res) => {
+    const rows = Array.isArray(req.body.rows) ? req.body.rows : [];
+    if (rows.length === 0) {
+        return res.status(400).json({ success: false, message: "At least one correction row is required" });
+    }
+    try {
+        const request = await HrAttendanceCorrectionRequest.findByPk(req.params.id);
+        if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+        if (request.requesterUserId !== req.user.userId) {
+            return res.status(403).json({ success: false, message: "You can only edit your own requests" });
+        }
+        if (request.status !== "pending_manager") {
+            return res.status(400).json({ success: false, message: "This request has already entered review and can no longer be edited" });
+        }
+        const t = await HrAttendanceCorrectionRequest.sequelize.transaction();
+        try {
+            await HrAttendanceCorrectionRow.destroy({ where: { requestId: request.id }, transaction: t });
+            await HrAttendanceCorrectionRow.bulkCreate(rows.map(r => ({
+                requestId: request.id,
+                dayDate: r.dayDate,
+                entryTime: r.entryTime || null,
+                exitTime: r.exitTime || null,
+                notes: r.notes || null,
+            })), { transaction: t });
+            await t.commit();
+        } catch (txErr) {
+            await t.rollback();
+            throw txErr;
+        }
+        res.json({ success: true });
+    } catch (err) {
+        console.error("❌ HR EDIT ATTENDANCE CORRECTION ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to update attendance correction request" });
+    }
+});
+
+router.put("/transport-requests/:id", authenticateToken, async (req, res) => {
+    const {
+        projectLabel, visitReason, departureDate, departureTime, returnTime,
+        transportMethod, kmDriven, farePaid, accompaniers,
+    } = req.body;
+    if (!departureDate) {
+        return res.status(400).json({ success: false, message: "departureDate is required" });
+    }
+    if (!["private_car", "public_transport"].includes(transportMethod)) {
+        return res.status(400).json({ success: false, message: "transportMethod must be 'private_car' or 'public_transport'" });
+    }
+    if (transportMethod === "private_car" && kmDriven != null && (!Number.isFinite(Number(kmDriven)) || Number(kmDriven) < 0)) {
+        return res.status(400).json({ success: false, message: "kmDriven must be a non-negative number" });
+    }
+    if (transportMethod === "public_transport" && farePaid != null && (!Number.isFinite(Number(farePaid)) || Number(farePaid) < 0)) {
+        return res.status(400).json({ success: false, message: "farePaid must be a non-negative number" });
+    }
+    try {
+        const request = await HrTransportRequest.findByPk(req.params.id);
+        if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+        if (request.requesterUserId !== req.user.userId) {
+            return res.status(403).json({ success: false, message: "You can only edit your own requests" });
+        }
+        if (request.status !== "pending_manager") {
+            return res.status(400).json({ success: false, message: "This request has already entered review and can no longer be edited" });
+        }
+        const t = await HrTransportRequest.sequelize.transaction();
+        try {
+            await request.update({
+                projectLabel: projectLabel || null,
+                visitReason: visitReason || null,
+                departureDate,
+                departureTime: departureTime || null,
+                returnTime: returnTime || null,
+                transportMethod,
+                kmDriven: transportMethod === "private_car" ? (kmDriven ?? null) : null,
+                farePaid: transportMethod === "public_transport" ? (farePaid ?? null) : null,
+            }, { transaction: t });
+            await HrTransportAccompanier.destroy({ where: { requestId: request.id }, transaction: t });
+            const accompanierRows = Array.isArray(accompaniers) ? accompaniers : [];
+            if (accompanierRows.length > 0) {
+                await HrTransportAccompanier.bulkCreate(accompanierRows.map(r => ({
+                    requestId: request.id,
+                    empNo: r.empNo || null,
+                    name: r.name,
+                    reason: r.reason || null,
+                })), { transaction: t });
+            }
+            await t.commit();
+        } catch (txErr) {
+            await t.rollback();
+            throw txErr;
+        }
+        res.json({ success: true });
+    } catch (err) {
+        console.error("❌ HR EDIT TRANSPORT REQUEST ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to update transportation request" });
+    }
+});
+
+// ============================================================
+// DELETE /leave-requests/:id, /attendance-corrections/:id,
+// /transport-requests/:id -- self-service cancel. Requester-only, and only
+// while the request is still awaiting a decision (a typo/change-of-mind
+// fix); once any approve/reject decision has landed, canceling would erase
+// a record someone already acted on, so it's blocked past that point.
+// A soft status change (status='canceled', canceledAt set) rather than an
+// actual row DELETE -- a canceled request stays visible on My HR Requests
+// and in reports instead of vanishing without a trace. Kept on the DELETE
+// verb/URL so no client (web or mobile) needed to change how it calls
+// this. No route to un-cancel: withdrawing just means re-submitting a
+// fresh request.
+// ============================================================
+router.delete("/leave-requests/:id", authenticateToken, async (req, res) => {
+    try {
+        const request = await HrLeaveRequest.findByPk(req.params.id);
+        if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+        if (request.requesterUserId !== req.user.userId) {
+            return res.status(403).json({ success: false, message: "You can only cancel your own requests" });
+        }
+        if (["approved", "rejected", "canceled"].includes(request.status)) {
+            return res.status(400).json({ success: false, message: "This request has already been decided and can no longer be canceled" });
+        }
+        await request.update({ status: "canceled", canceledAt: new Date() });
+        res.json({ success: true });
+    } catch (err) {
+        console.error("❌ HR LEAVE CANCEL ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to cancel request" });
+    }
+});
+
+router.delete("/attendance-corrections/:id", authenticateToken, async (req, res) => {
+    try {
+        const request = await HrAttendanceCorrectionRequest.findByPk(req.params.id);
+        if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+        if (request.requesterUserId !== req.user.userId) {
+            return res.status(403).json({ success: false, message: "You can only cancel your own requests" });
+        }
+        if (["approved", "rejected", "canceled"].includes(request.status)) {
+            return res.status(400).json({ success: false, message: "This request has already been decided and can no longer be canceled" });
+        }
+        await request.update({ status: "canceled", canceledAt: new Date() });
+        res.json({ success: true });
+    } catch (err) {
+        console.error("❌ HR ATTENDANCE CANCEL ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to cancel request" });
+    }
+});
+
+router.delete("/transport-requests/:id", authenticateToken, async (req, res) => {
+    try {
+        const request = await HrTransportRequest.findByPk(req.params.id);
+        if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+        if (request.requesterUserId !== req.user.userId) {
+            return res.status(403).json({ success: false, message: "You can only cancel your own requests" });
+        }
+        if (["approved", "rejected", "canceled"].includes(request.status)) {
+            return res.status(400).json({ success: false, message: "This request has already been decided and can no longer be canceled" });
+        }
+        await request.update({ status: "canceled", canceledAt: new Date() });
+        res.json({ success: true });
+    } catch (err) {
+        console.error("❌ HR TRANSPORT CANCEL ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to cancel request" });
     }
 });
 
@@ -500,7 +927,7 @@ router.get("/my-requests", authenticateToken, async (req, res) => {
         // reviewers and the payment confirmer are InsUser.userId (login
         // accounts, not necessarily linked to a payroll record) -- two
         // different lookups, same pattern as routes/hrReports.js.
-        const [empNames, userNames] = await Promise.all([
+        const [empNames, userNames, projectNames] = await Promise.all([
             resolveEmployeeNames([
                 ...leave.map(r => r.managerApproverEmpNo),
                 ...attendance.map(r => r.managerApproverEmpNo),
@@ -513,6 +940,7 @@ router.get("/my-requests", authenticateToken, async (req, res) => {
                 ...transport.map(r => r.financeApproverUserId),
                 ...transport.map(r => r.paidByUserId),
             ]),
+            resolveProjectLabels(transport.map(r => r.projectLabel)),
         ]);
         const approvers = (r, hrField) => ({
             managerApprover: r.managerApproverEmpNo ? (empNames[r.managerApproverEmpNo] || null) : null,
@@ -526,6 +954,7 @@ router.get("/my-requests", authenticateToken, async (req, res) => {
             transport: transport.map(r => ({
                 ...r.toJSON(),
                 type: "transport",
+                projectLabel: withProjectDisplay(r.projectLabel, projectNames),
                 ...approvers(r, "hrAuditorUserId"),
                 financeApprover: r.financeApproverUserId ? (userNames[r.financeApproverUserId] || null) : null,
                 paidBy: r.paidByUserId ? (userNames[r.paidByUserId] || null) : null,
@@ -544,9 +973,8 @@ router.get("/my-requests", authenticateToken, async (req, res) => {
 // ============================================================
 router.get("/manager-approvals", authenticateToken, async (req, res) => {
     try {
-        const supervisorEmpNo = req.user.assignedEmpNo ? parseInt(req.user.assignedEmpNo) : null;
-        const supervisedEmpNos = req.user.role === "admin" ? null : await getSupervisedEmpNos(supervisorEmpNo);
-        if (req.user.role !== "admin" && supervisedEmpNos.length === 0) {
+        const supervisedEmpNos = await getSupervisedEmpNosForCaller(req);
+        if (supervisedEmpNos && supervisedEmpNos.length === 0) {
             return res.json({ success: true, leave: [], attendance: [], transport: [] });
         }
         const where = supervisedEmpNos
@@ -558,12 +986,20 @@ router.get("/manager-approvals", authenticateToken, async (req, res) => {
             HrAttendanceCorrectionRequest.findAll({ where, order: [["createdAt", "ASC"]], include: [{ model: HrAttendanceCorrectionRow, as: "rows" }] }),
             HrTransportRequest.findAll({ where, order: [["createdAt", "ASC"]], include: [{ model: HrTransportAccompanier, as: "accompaniers" }] }),
         ]);
-        const names = await resolveEmployeeNames([...leave, ...attendance, ...transport].map(r => r.requesterEmpNo));
+        const [names, projectNames] = await Promise.all([
+            resolveEmployeeNames([...leave, ...attendance, ...transport].map(r => r.requesterEmpNo)),
+            resolveProjectLabels(transport.map(r => r.projectLabel)),
+        ]);
         res.json({
             success: true,
             leave: leave.map(r => ({ ...r.toJSON(), type: "leave", employee: names[r.requesterEmpNo] || null })),
             attendance: attendance.map(r => ({ ...r.toJSON(), type: "attendance", employee: names[r.requesterEmpNo] || null })),
-            transport: transport.map(r => ({ ...r.toJSON(), type: "transport", employee: names[r.requesterEmpNo] || null })),
+            transport: transport.map(r => ({
+                ...r.toJSON(),
+                type: "transport",
+                projectLabel: withProjectDisplay(r.projectLabel, projectNames),
+                employee: names[r.requesterEmpNo] || null,
+            })),
         });
     } catch (err) {
         console.error("❌ HR MANAGER APPROVALS ERROR:", err);
@@ -572,21 +1008,110 @@ router.get("/manager-approvals", authenticateToken, async (req, res) => {
 });
 
 // ============================================================
+// GET /manager-approvals-history -- requests from anyone this caller
+// supervises that they've already decided on (managerDecidedAt set),
+// regardless of current downstream status, so a manager can see what
+// they approved/rejected and where it stands now.
+// ============================================================
+router.get("/manager-approvals-history", authenticateToken, async (req, res) => {
+    try {
+        const supervisedEmpNos = await getSupervisedEmpNosForCaller(req);
+        if (supervisedEmpNos && supervisedEmpNos.length === 0) {
+            return res.json({ success: true, leave: [], attendance: [], transport: [] });
+        }
+        const where = supervisedEmpNos
+            ? { managerDecidedAt: { [Op.ne]: null }, requesterEmpNo: supervisedEmpNos }
+            : { managerDecidedAt: { [Op.ne]: null } };
+
+        const [leave, attendance, transport] = await Promise.all([
+            HrLeaveRequest.findAll({ where, order: [["managerDecidedAt", "DESC"]], limit: 100 }),
+            HrAttendanceCorrectionRequest.findAll({ where, order: [["managerDecidedAt", "DESC"]], limit: 100, include: [{ model: HrAttendanceCorrectionRow, as: "rows" }] }),
+            HrTransportRequest.findAll({ where, order: [["managerDecidedAt", "DESC"]], limit: 100, include: [{ model: HrTransportAccompanier, as: "accompaniers" }] }),
+        ]);
+        const [empNames, userNames, projectNames] = await Promise.all([
+            resolveEmployeeNames([...leave, ...attendance, ...transport].map(r => r.requesterEmpNo)),
+            resolveUserNames([
+                ...leave.map(r => r.hrReviewerUserId),
+                ...attendance.map(r => r.hrReviewerUserId),
+                ...transport.map(r => r.hrAuditorUserId),
+                ...transport.map(r => r.financeApproverUserId),
+            ]),
+            resolveProjectLabels(transport.map(r => r.projectLabel)),
+        ]);
+        const withNames = (r, hrField) => ({
+            employee: empNames[r.requesterEmpNo] || null,
+            hrApprover: r[hrField] ? (userNames[r[hrField]] || null) : null,
+        });
+        res.json({
+            success: true,
+            leave: leave.map(r => ({ ...r.toJSON(), type: "leave", ...withNames(r, "hrReviewerUserId") })),
+            attendance: attendance.map(r => ({ ...r.toJSON(), type: "attendance", ...withNames(r, "hrReviewerUserId") })),
+            transport: transport.map(r => ({
+                ...r.toJSON(),
+                type: "transport",
+                projectLabel: withProjectDisplay(r.projectLabel, projectNames),
+                ...withNames(r, "hrAuditorUserId"),
+                financeApprover: r.financeApproverUserId ? (userNames[r.financeApproverUserId] || null) : null,
+            })),
+        });
+    } catch (err) {
+        console.error("❌ HR MANAGER APPROVALS HISTORY ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to fetch approvals history" });
+    }
+});
+
+// ============================================================
+// GET /am-i-a-supervisor -- cheap boolean check for whether this caller
+// currently supervises anyone (or, for hr_manager, has anyone in their
+// orphan fallback pool) -- backs client-side nav gating so the Approvals
+// entry point only shows for people who'd actually see anything there.
+// ============================================================
+router.get("/am-i-a-supervisor", authenticateToken, async (req, res) => {
+    try {
+        const supervisedEmpNos = await getSupervisedEmpNosForCaller(req);
+        res.json({ success: true, isSupervisor: supervisedEmpNos === null || supervisedEmpNos.length > 0 });
+    } catch (err) {
+        console.error("❌ HR AM I A SUPERVISOR ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to check supervisor status" });
+    }
+});
+
+// ============================================================
 // GET /hr-queue -- everything awaiting HR review, all 3 types
 // ============================================================
-router.get("/hr-queue", authenticateToken, authorizeRoles("hr", "hr_manager", "admin"), async (req, res) => {
+router.get("/hr-queue", authenticateToken, requirePermission(PERMISSIONS.HR_REQUESTS_QUEUE), async (req, res) => {
     try {
         const [leave, attendance, transport] = await Promise.all([
             HrLeaveRequest.findAll({ where: { status: "pending_hr" }, order: [["createdAt", "ASC"]] }),
             HrAttendanceCorrectionRequest.findAll({ where: { status: "pending_hr" }, order: [["createdAt", "ASC"]], include: [{ model: HrAttendanceCorrectionRow, as: "rows" }] }),
             HrTransportRequest.findAll({ where: { status: "pending_hr_audit" }, order: [["createdAt", "ASC"]], include: [{ model: HrTransportAccompanier, as: "accompaniers" }] }),
         ]);
-        const names = await resolveEmployeeNames([...leave, ...attendance, ...transport].map(r => r.requesterEmpNo));
+        // hr_factory/hr_ittihad/hr are each scoped to a slice of the company
+        // (see utils/hrScope.js) -- hr_manager (and admin, which never
+        // reaches requirePermission's check) stay unscoped/company-wide as
+        // the senior "sees everything" tier.
+        let filterEmpNos = null;
+        if (isHrScopedRole(req.user.role)) {
+            filterEmpNos = new Set((await getHrQueueEmpNos(req.user.role)).map(Number));
+        }
+        const inScope = (r) => !filterEmpNos || filterEmpNos.has(Number(r.requesterEmpNo));
+        const scopedLeave = leave.filter(inScope);
+        const scopedAttendance = attendance.filter(inScope);
+        const scopedTransport = transport.filter(inScope);
+        const [names, projectNames] = await Promise.all([
+            resolveEmployeeNames([...scopedLeave, ...scopedAttendance, ...scopedTransport].map(r => r.requesterEmpNo)),
+            resolveProjectLabels(scopedTransport.map(r => r.projectLabel)),
+        ]);
         res.json({
             success: true,
-            leave: leave.map(r => ({ ...r.toJSON(), type: "leave", employee: names[r.requesterEmpNo] || null })),
-            attendance: attendance.map(r => ({ ...r.toJSON(), type: "attendance", employee: names[r.requesterEmpNo] || null })),
-            transport: transport.map(r => ({ ...r.toJSON(), type: "transport", employee: names[r.requesterEmpNo] || null })),
+            leave: scopedLeave.map(r => ({ ...r.toJSON(), type: "leave", employee: names[r.requesterEmpNo] || null })),
+            attendance: scopedAttendance.map(r => ({ ...r.toJSON(), type: "attendance", employee: names[r.requesterEmpNo] || null })),
+            transport: scopedTransport.map(r => ({
+                ...r.toJSON(),
+                type: "transport",
+                projectLabel: withProjectDisplay(r.projectLabel, projectNames),
+                employee: names[r.requesterEmpNo] || null,
+            })),
         });
     } catch (err) {
         console.error("❌ HR QUEUE ERROR:", err);
@@ -597,18 +1122,56 @@ router.get("/hr-queue", authenticateToken, authorizeRoles("hr", "hr_manager", "a
 // ============================================================
 // GET /finance-queue -- transport requests awaiting finance approval
 // ============================================================
-router.get("/finance-queue", authenticateToken, authorizeRoles("accounting", "accounting_manager", "admin"), async (req, res) => {
+router.get("/finance-queue", authenticateToken, requirePermission(PERMISSIONS.ACCOUNTING_REQUESTS_QUEUE), async (req, res) => {
     try {
         const transport = await HrTransportRequest.findAll({
             where: { status: "pending_finance" },
             order: [["createdAt", "ASC"]],
             include: [{ model: HrTransportAccompanier, as: "accompaniers" }],
         });
-        const names = await resolveEmployeeNames(transport.map(r => r.requesterEmpNo));
-        res.json({ success: true, transport: transport.map(r => ({ ...r.toJSON(), employee: names[r.requesterEmpNo] || null })) });
+        const [names, projectNames] = await Promise.all([
+            resolveEmployeeNames(transport.map(r => r.requesterEmpNo)),
+            resolveProjectLabels(transport.map(r => r.projectLabel)),
+        ]);
+        res.json({
+            success: true,
+            transport: transport.map(r => ({
+                ...r.toJSON(),
+                projectLabel: withProjectDisplay(r.projectLabel, projectNames),
+                employee: names[r.requesterEmpNo] || null,
+            })),
+        });
     } catch (err) {
         console.error("❌ HR FINANCE QUEUE ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to fetch finance queue" });
+    }
+});
+
+// ============================================================
+// GET /finance-queue/employees -- every employee currently sitting in the
+// finance queue, sorted, for its picker filter -- same "only offer
+// employees actually in this view" reasoning as hrReports.js's /employees
+// endpoints.
+// ============================================================
+router.get("/finance-queue/employees", authenticateToken, requirePermission(PERMISSIONS.ACCOUNTING_REQUESTS_QUEUE), async (req, res) => {
+    try {
+        const rows = await HrTransportRequest.findAll({
+            where: { status: "pending_finance" },
+            attributes: ["requesterEmpNo"],
+        });
+        const empNos = rows.map((r) => r.requesterEmpNo);
+        const names = await resolveEmployeeNames(empNos);
+        const data = [...new Set(empNos)]
+            .filter((n) => names[n])
+            .map((empNo) => ({
+                empNo,
+                name: names[empNo].name_ar || names[empNo].name_en || String(empNo),
+            }))
+            .sort((a, b) => a.name.localeCompare(b.name, "ar"));
+        res.json({ success: true, data });
+    } catch (err) {
+        console.error("❌ HR FINANCE QUEUE EMPLOYEES ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to fetch employee list" });
     }
 });
 

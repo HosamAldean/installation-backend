@@ -1,7 +1,9 @@
 ﻿import express from 'express';
 import { sequelize, sequelize2, sequelize3 } from '../config/db.js';
 import { QueryTypes } from 'sequelize';
-import { authenticateToken, authorizeRoles } from '../middleware/auth.js';
+import { authenticateToken } from '../middleware/auth.js';
+import { requirePermission } from '../middleware/permissions.js';
+import { PERMISSIONS } from '../constants/permissions.js';
 
 const router = express.Router();
 // Every route in this file operates on order/project data and previously had
@@ -11,7 +13,7 @@ const router = express.Router();
 // already gates to manager/admin (see router.tsx) — this mirrors that same
 // restriction on the backend so it can't be bypassed by calling the API directly.
 router.use(authenticateToken);
-router.use(authorizeRoles('installation_manager', 'admin'));
+router.use(requirePermission(PERMISSIONS.INSTALLATION_MANAGE_ORDERS));
 
 const ARABIC_RE = /[اأإآابتثجحخدذرزسشصضطظعغفقكلمنهوي]/;
 const fixArabic = (str) => {
@@ -214,20 +216,26 @@ router.post('/create', async (req, res) => {
         const orderHeader = await sequelize2.query(`SELECT LAST_INSERT_ID() AS id`, { type: QueryTypes.SELECT, transaction: trx });
         const instOrderId = orderHeader[0].id;
 
-        const skippedAlreadyAssigned = [];
-        let processedCount = 0;
-        for (const instReqDetId of items) {
-            // Get detail info
-            const detQ = await sequelize2.query(`
-                SELECT d.rowId, d.assignedTeamId, d.instReqMasterId, m.unitIdContract AS unitNo, s.descAr AS itemName, m.height, m.width, o.orderNumber, m.orderId, m.unitShapeId
+        // Batch-fetch every detail row in one query instead of one round
+        // trip per item — this whole block used to issue ~6 queries per
+        // item plus one per step (300+ round trips for a 30-item/5-step
+        // batch, all serialized inside one open transaction holding locks).
+        const detRows = items.length
+            ? await sequelize2.query(`
+                SELECT d.instReqDetId, d.rowId, d.assignedTeamId, d.instReqMasterId, m.unitIdContract AS unitNo, s.descAr AS itemName, m.height, m.width, o.orderNumber, m.orderId, m.unitShapeId
                 FROM IIT_Petra.instReqDet d
                 LEFT JOIN IIT_Petra.masterControl m ON m.rowId = d.rowId
                 LEFT JOIN IIT_Petra.unitShapes s ON m.unitShapeId = s.unitShapeId
                 LEFT JOIN IIT_Petra.orders o ON m.orderId = o.orderId
-                WHERE d.instReqDetId = :id LIMIT 1
-            `, { replacements: { id: instReqDetId }, type: QueryTypes.SELECT, transaction: trx });
+                WHERE d.instReqDetId IN (:ids)
+            `, { replacements: { ids: items }, type: QueryTypes.SELECT, transaction: trx })
+            : [];
+        const detByReqId = new Map(detRows.map((d) => [String(d.instReqDetId), d]));
 
-            const det = detQ[0];
+        const skippedAlreadyAssigned = [];
+        const validDets = [];
+        for (const instReqDetId of items) {
+            const det = detByReqId.get(String(instReqDetId));
             if (!det) continue;
             // Guard against attaching a detail row from a different request
             // (stale frontend state, bad cache, or a direct API call) — never
@@ -242,87 +250,115 @@ router.post('/create', async (req, res) => {
                 skippedAlreadyAssigned.push(instReqDetId);
                 continue;
             }
+            validDets.push({ instReqDetId, ...det });
+        }
 
-            processedCount++;
-            // Insert instOrderItems
+        let processedCount = validDets.length;
+
+        if (processedCount > 0) {
+            // Bulk-insert instOrderItems in one multi-row statement. MySQL
+            // guarantees LAST_INSERT_ID() returns the id of the FIRST row a
+            // multi-row INSERT generated, and that a single INSERT
+            // statement's own generated ids are consecutive — safe to
+            // derive every row's id as firstId + index without a query per
+            // row (see MySQL docs on LAST_INSERT_ID() with multi-row
+            // inserts).
+            const itemsReplacements = { ordId: instOrderId };
+            const itemsValues = validDets.map((d, i) => {
+                itemsReplacements[`detId${i}`] = d.instReqDetId;
+                itemsReplacements[`rowId${i}`] = d.rowId;
+                itemsReplacements[`itemName${i}`] = d.itemName;
+                itemsReplacements[`unitNo${i}`] = d.unitNo;
+                itemsReplacements[`h${i}`] = d.height;
+                itemsReplacements[`w${i}`] = d.width;
+                itemsReplacements[`orderId${i}`] = d.orderId;
+                itemsReplacements[`orderNum${i}`] = d.orderNumber;
+                return `(:ordId, :detId${i}, :rowId${i}, :itemName${i}, :unitNo${i}, :h${i}, :w${i}, :orderId${i}, :orderNum${i}, 'assigned', NOW())`;
+            }).join(', ');
             await sequelize2.query(`
                 INSERT INTO IIT_Petra.instOrderItems
                 (instOrderId, instReqDetId, rowId, itemName, unitNo, height, width, orderId, orderNumber, status, created_at)
-                VALUES (:ordId, :detId, :rowId, :itemName, :unitNo, :h, :w, :orderId, :orderNum, 'assigned', NOW())
-            `, {
-                replacements: {
-                    ordId: instOrderId,
-                    detId: instReqDetId,
-                    rowId: det.rowId,
-                    itemName: det.itemName,
-                    unitNo: det.unitNo,
-                    h: det.height,
-                    w: det.width,
-                    orderId: det.orderId,
-                    orderNum: det.orderNumber
-                },
-                transaction: trx
-            });
-
+                VALUES ${itemsValues}
+            `, { replacements: itemsReplacements, transaction: trx });
             const itemRes = await sequelize2.query(`SELECT LAST_INSERT_ID() AS id`, { type: QueryTypes.SELECT, transaction: trx });
-            const instOrderItemId = itemRes[0].id;
+            const firstItemId = Number(itemRes[0].id);
+            validDets.forEach((d, i) => { d.instOrderItemId = firstItemId + i; });
 
-            // Insert instOrderDetails
+            // Bulk-insert instOrderDetails the same way.
+            const detailsReplacements = { ordId: instOrderId };
+            const detailsValues = validDets.map((d, i) => {
+                detailsReplacements[`rowId${i}`] = d.rowId;
+                detailsReplacements[`w${i}`] = d.width;
+                detailsReplacements[`h${i}`] = d.height;
+                detailsReplacements[`u${i}`] = d.unitShapeId;
+                return `(:ordId, :rowId${i}, 1, :w${i}, :h${i}, NULL, :u${i})`;
+            }).join(', ');
             await sequelize2.query(`
                 INSERT INTO IIT_Petra.instOrderDetails
                 (instOrderId, masterRowId, unitCount, width, height, glassType, unitShapeId)
-                VALUES (:ordId, :rowId, 1, :w, :h, NULL, :u)
-            `, { replacements: { ordId: instOrderId, rowId: det.rowId, w: det.width, h: det.height, u: det.unitShapeId }, transaction: trx });
-
+                VALUES ${detailsValues}
+            `, { replacements: detailsReplacements, transaction: trx });
             const detailRes = await sequelize2.query(`SELECT LAST_INSERT_ID() AS id`, { type: QueryTypes.SELECT, transaction: trx });
-            const instOrderDetailId = detailRes[0].id;
+            const firstDetailId = Number(detailRes[0].id);
+            validDets.forEach((d, i) => { d.instOrderDetailId = firstDetailId + i; });
 
-            // 1️⃣ Insert assignment if team is provided
-            // 1️⃣ Get team leader empNo if team_id is provided
-
-
-            // 2️⃣ Insert assignment using leaderEmpNo
             if (team_id) {
+                const assignReplacements = { team: team_id, by: assignedBy || null, empNo: leaderEmpNo };
+                const assignValues = validDets.map((d, i) => {
+                    assignReplacements[`detId${i}`] = d.instReqDetId;
+                    assignReplacements[`ordId${i}`] = instOrderId;
+                    assignReplacements[`ordDetailId${i}`] = d.instOrderDetailId;
+                    return `(:detId${i}, :empNo, :team, :by, NOW(), 'Pending', 0, :ordId${i}, :ordDetailId${i})`;
+                }).join(', ');
                 await sequelize2.query(`
                     INSERT INTO IIT_Petra.instReqAssignments
                     (instReqDetId, assignedEmpNo, teamId, assignedBy, assignedAt, progressStatus, progressPercent, instOrderId, instOrderDetailId)
-                    VALUES (:detId, :empNo, :team, :by, NOW(), 'Pending', 0, :ordId, :ordDetailId)
-                    ON DUPLICATE KEY UPDATE instOrderId = :ordId, instOrderDetailId = :ordDetailId
-                `, {
-                    replacements: {
-                        detId: instReqDetId,
-                        empNo: leaderEmpNo, // use team leader here
-                        team: team_id,
-                        by: assignedBy || null,
-                        ordId: instOrderId,
-                        ordDetailId: instOrderDetailId
-                    },
-                    transaction: trx
-                });
+                    VALUES ${assignValues}
+                    ON DUPLICATE KEY UPDATE instOrderId = VALUES(instOrderId), instOrderDetailId = VALUES(instOrderDetailId)
+                `, { replacements: assignReplacements, transaction: trx });
 
                 await sequelize2.query(`
-                    UPDATE IIT_Petra.instReqDet SET assignedTeamId = :team WHERE instReqDetId = :id
-                `, { replacements: { team: team_id, id: instReqDetId }, transaction: trx });
+                    UPDATE IIT_Petra.instReqDet SET assignedTeamId = :team WHERE instReqDetId IN (:ids)
+                `, { replacements: { team: team_id, ids: validDets.map((d) => d.instReqDetId) }, transaction: trx });
             }
 
+            // Batch-fetch steps for every distinct unit shape among this
+            // batch's items in one query, instead of one query per item.
+            const distinctShapeIds = [...new Set(validDets.map((d) => d.unitShapeId).filter((v) => v != null))];
+            const stepsByShape = new Map();
+            if (distinctShapeIds.length) {
+                const stepRows = await sequelize2.query(`
+                    SELECT instStepId, stepNumber, unitTypeId
+                    FROM IIT_Petra.instSteps
+                    WHERE unitTypeId IN (:shapeIds)
+                    ORDER BY instStepId ASC
+                `, { replacements: { shapeIds: distinctShapeIds }, type: QueryTypes.SELECT, transaction: trx });
+                for (const row of stepRows) {
+                    if (!stepsByShape.has(row.unitTypeId)) stepsByShape.set(row.unitTypeId, []);
+                    stepsByShape.get(row.unitTypeId).push(row);
+                }
+            }
 
-            // Insert instOrderSteps from instSteps
-            const steps = await sequelize2.query(`
-                SELECT instStepId, stepNumber, standardTime
-                FROM IIT_Petra.instSteps
-                WHERE unitTypeId = :shapeId
-                ORDER BY instStepId ASC
-            `, { replacements: { shapeId: det.unitShapeId }, type: QueryTypes.SELECT, transaction: trx });
-
-            for (const step of steps) {
+            // Bulk-insert every (item, step) pair as one multi-row statement.
+            const stepsReplacements = {};
+            const stepsValues = [];
+            let stepIdx = 0;
+            for (const d of validDets) {
+                const steps = stepsByShape.get(d.unitShapeId) || [];
+                for (const step of steps) {
+                    stepsReplacements[`itemId${stepIdx}`] = d.instOrderItemId;
+                    stepsReplacements[`stepId${stepIdx}`] = step.instStepId;
+                    stepsReplacements[`order${stepIdx}`] = step.stepNumber;
+                    stepsValues.push(`(:itemId${stepIdx}, :stepId${stepIdx}, 'Pending', :order${stepIdx}, NOW(), NOW())`);
+                    stepIdx++;
+                }
+            }
+            if (stepsValues.length) {
                 await sequelize2.query(`
                     INSERT INTO IIT_Petra.instOrderSteps
                     (instOrderItemId, instStepId, status, stepOrder, createdAt, updatedAt)
-                    VALUES (:itemId, :stepId, 'Pending', :order, NOW(), NOW())
-                `, {
-                    replacements: { itemId: instOrderItemId, stepId: step.instStepId, order: step.stepNumber },
-                    transaction: trx
-                });
+                    VALUES ${stepsValues.join(', ')}
+                `, { replacements: stepsReplacements, transaction: trx });
             }
         }
 

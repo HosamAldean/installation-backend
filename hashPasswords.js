@@ -42,7 +42,7 @@ async function updatePasswords() {
             `INSERT INTO InsUser 
             (username, password, email, role, firstName, lastName, active, createdAt, updatedAt)
             VALUES (?, ?, ?, ?, ?, ?, 1, NOW(), NOW())`,
-            [username, hashedPassword, "testuser@example.com", "user", "Test", "User"]
+            [username, hashedPassword, "testuser@example.com", "installation_employee", "Test", "User"]
         );
         console.log(`✅ Added new user '${username}'`);
     } else {

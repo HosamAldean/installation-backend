@@ -146,7 +146,7 @@ router.get('/', requireAuth, async (req, res) => {
 ---------------------------------- */
 router.post('/', requireAuth, async (req, res) => {
     try {
-        const { empNo, role = 'user', teamId: bodyTeamId, password: bodyPassword, assignedStore } = req.body;
+        const { empNo, role = 'installation_employee', teamId: bodyTeamId, password: bodyPassword, assignedStore } = req.body;
         const isAdmin = req.user.role === 'admin';
 
         if (!isAdmin && PRIVILEGED_ROLES.includes(role)) {

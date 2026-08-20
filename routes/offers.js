@@ -8,7 +8,9 @@
 // sales, sales_manager, admin" for this module.
 import express from 'express';
 import { QueryTypes } from 'sequelize';
-import { authenticateToken, authorizeRoles } from '../middleware/auth.js';
+import { authenticateToken } from '../middleware/auth.js';
+import { requirePermission } from '../middleware/permissions.js';
+import { PERMISSIONS } from '../constants/permissions.js';
 import { sequelize2PetraErp } from '../config/db.js';
 import { Offer } from '../models/Offer.js';
 import { OfferNotes } from '../models/OfferNotes.js';
@@ -18,7 +20,7 @@ import { OfferChanges } from '../models/OfferChanges.js';
 import { OfferContractNotes } from '../models/OfferContractNotes.js';
 
 const router = express.Router();
-router.use(authenticateToken, authorizeRoles('sales', 'sales_manager', 'admin'));
+router.use(authenticateToken, requirePermission(PERMISSIONS.PETRA_ERP_OFFERS));
 
 function whitelist(model, body, excluding = []) {
     const attrs = Object.keys(model.getAttributes()).filter((a) => !excluding.includes(a));
@@ -73,29 +75,42 @@ router.post('/', async (req, res) => {
             return res.status(400).json({ message: `${f} is required` });
         }
     }
-    const [{ maxOfferNumber }] = await sequelize2PetraErp.query(
-        'SELECT COALESCE(MAX(offerNumber), 0) AS maxOfferNumber FROM offers',
-        { type: QueryTypes.SELECT },
-    );
-    const values = whitelist(Offer, req.body, ['offerId', 'offerNumber', 'lastUpdated']);
-    const offer = await Offer.create({
-        ...values,
-        offerNumber: (maxOfferNumber || 0) + 1,
-        sentToClientDate: req.body.sentToClientDate || req.body.startDate,
-        lastUpdated: new Date(),
-    });
-    res.status(201).json(offer);
+    try {
+        const [{ maxOfferNumber }] = await sequelize2PetraErp.query(
+            'SELECT COALESCE(MAX(offerNumber), 0) AS maxOfferNumber FROM offers',
+            { type: QueryTypes.SELECT },
+        );
+        const values = whitelist(Offer, req.body, ['offerId', 'offerNumber', 'lastUpdated']);
+        const offer = await Offer.create({
+            ...values,
+            offerNumber: (maxOfferNumber || 0) + 1,
+            sentToClientDate: req.body.sentToClientDate || req.body.startDate,
+            lastUpdated: new Date(),
+        });
+        res.status(201).json(offer);
+    } catch (err) {
+        if (err.name === 'SequelizeUniqueConstraintError') {
+            return res.status(409).json({ message: 'An offer with that value already exists' });
+        }
+        console.error('Error creating offer:', err);
+        res.status(500).json({ message: 'Failed to create offer' });
+    }
 });
 
 // PATCH /api/offers/:id
 router.patch('/:id', async (req, res) => {
     const offer = await Offer.findByPk(req.params.id);
     if (!offer) return res.status(404).json({ message: 'Not found' });
-    await offer.update({
-        ...whitelist(Offer, req.body, ['offerId', 'offerNumber', 'lastUpdated']),
-        lastUpdated: new Date(),
-    });
-    res.json(offer);
+    try {
+        await offer.update({
+            ...whitelist(Offer, req.body, ['offerId', 'offerNumber', 'lastUpdated']),
+            lastUpdated: new Date(),
+        });
+        res.json(offer);
+    } catch (err) {
+        console.error('Error updating offer:', err);
+        res.status(500).json({ message: 'Failed to update offer' });
+    }
 });
 
 /* ---------------- Notes ---------------- */
@@ -114,12 +129,17 @@ router.post('/:id/notes', async (req, res) => {
     if (!req.body.offerNotesText?.trim()) {
         return res.status(400).json({ message: 'offerNotesText is required' });
     }
-    const note = await OfferNotes.create({
-        offerId: req.params.id,
-        offerNotesText: req.body.offerNotesText,
-        offerNotesDate: new Date(),
-    });
-    res.status(201).json(note);
+    try {
+        const note = await OfferNotes.create({
+            offerId: req.params.id,
+            offerNotesText: req.body.offerNotesText,
+            offerNotesDate: new Date(),
+        });
+        res.status(201).json(note);
+    } catch (err) {
+        console.error('Error creating offer note:', err);
+        res.status(500).json({ message: 'Failed to create note' });
+    }
 });
 
 /* ---------------- Client links ---------------- */
@@ -139,21 +159,31 @@ router.get('/:id/clients', async (req, res) => {
 // POST /api/offers/:id/clients  { clientId, offerClientsNote? }
 router.post('/:id/clients', async (req, res) => {
     if (!req.body.clientId) return res.status(400).json({ message: 'clientId is required' });
-    const link = await OfferClients.create({
-        offerId: req.params.id,
-        clientId: req.body.clientId,
-        offerClientsNote: req.body.offerClientsNote || '',
-    });
-    res.status(201).json(link);
+    try {
+        const link = await OfferClients.create({
+            offerId: req.params.id,
+            clientId: req.body.clientId,
+            offerClientsNote: req.body.offerClientsNote || '',
+        });
+        res.status(201).json(link);
+    } catch (err) {
+        console.error('Error creating offer client link:', err);
+        res.status(500).json({ message: 'Failed to create client link' });
+    }
 });
 
 // DELETE /api/offers/:id/clients/:linkId
 router.delete('/:id/clients/:linkId', async (req, res) => {
-    const deleted = await OfferClients.destroy({
-        where: { offerClientsId: req.params.linkId, offerId: req.params.id },
-    });
-    if (!deleted) return res.status(404).json({ message: 'Not found' });
-    res.json({ message: 'deleted' });
+    try {
+        const deleted = await OfferClients.destroy({
+            where: { offerClientsId: req.params.linkId, offerId: req.params.id },
+        });
+        if (!deleted) return res.status(404).json({ message: 'Not found' });
+        res.json({ message: 'deleted' });
+    } catch (err) {
+        console.error('Error deleting offer client link:', err);
+        res.status(500).json({ message: 'Failed to delete client link' });
+    }
 });
 
 /* ---------------- Quotations (pricing line items) ---------------- */
@@ -183,11 +213,21 @@ router.get('/:id/quotations', async (req, res) => {
 router.post('/:id/quotations', async (req, res) => {
     const required = ['profileSectionId', 'value', 'price', 'measurmentId'];
     for (const f of required) {
-        if (req.body[f] === undefined) return res.status(400).json({ message: `${f} is required` });
+        if (req.body[f] === undefined || req.body[f] === null) return res.status(400).json({ message: `${f} is required` });
     }
-    const values = whitelist(Quotation, req.body, ['quotationId', 'offerId']);
-    const quotation = await Quotation.create({ ...values, offerId: req.params.id });
-    res.status(201).json(quotation);
+    for (const f of ['value', 'price']) {
+        if (typeof req.body[f] !== 'number' || req.body[f] < 0) {
+            return res.status(400).json({ message: `${f} must be a non-negative number` });
+        }
+    }
+    try {
+        const values = whitelist(Quotation, req.body, ['quotationId', 'offerId']);
+        const quotation = await Quotation.create({ ...values, offerId: req.params.id });
+        res.status(201).json(quotation);
+    } catch (err) {
+        console.error('Error creating quotation:', err);
+        res.status(500).json({ message: 'Failed to create quotation' });
+    }
 });
 
 // PATCH /api/offers/:id/quotations/:quotationId
@@ -196,17 +236,27 @@ router.patch('/:id/quotations/:quotationId', async (req, res) => {
         where: { quotationId: req.params.quotationId, offerId: req.params.id },
     });
     if (!quotation) return res.status(404).json({ message: 'Not found' });
-    await quotation.update(whitelist(Quotation, req.body, ['quotationId', 'offerId']));
-    res.json(quotation);
+    try {
+        await quotation.update(whitelist(Quotation, req.body, ['quotationId', 'offerId']));
+        res.json(quotation);
+    } catch (err) {
+        console.error('Error updating quotation:', err);
+        res.status(500).json({ message: 'Failed to update quotation' });
+    }
 });
 
 // DELETE /api/offers/:id/quotations/:quotationId
 router.delete('/:id/quotations/:quotationId', async (req, res) => {
-    const deleted = await Quotation.destroy({
-        where: { quotationId: req.params.quotationId, offerId: req.params.id },
-    });
-    if (!deleted) return res.status(404).json({ message: 'Not found' });
-    res.json({ message: 'deleted' });
+    try {
+        const deleted = await Quotation.destroy({
+            where: { quotationId: req.params.quotationId, offerId: req.params.id },
+        });
+        if (!deleted) return res.status(404).json({ message: 'Not found' });
+        res.json({ message: 'deleted' });
+    } catch (err) {
+        console.error('Error deleting quotation:', err);
+        res.status(500).json({ message: 'Failed to delete quotation' });
+    }
 });
 
 /* ---------------- Changes (glass/coating change-request workflow) ---------------- */
@@ -237,17 +287,22 @@ router.post('/:id/changes', async (req, res) => {
     for (const f of required) {
         if (req.body[f] === undefined) return res.status(400).json({ message: `${f} is required` });
     }
-    const [{ maxChangeNo }] = await sequelize2PetraErp.query(
-        'SELECT COALESCE(MAX(changeNo), 0) AS maxChangeNo FROM offerChanges WHERE offerId = :offerId',
-        { replacements: { offerId: req.params.id }, type: QueryTypes.SELECT },
-    );
-    const values = whitelist(OfferChanges, req.body, ['offerChangesId', 'offerId', 'changeNo']);
-    const change = await OfferChanges.create({
-        ...values,
-        offerId: req.params.id,
-        changeNo: req.body.changeNo ?? (maxChangeNo || 0) + 1,
-    });
-    res.status(201).json(change);
+    try {
+        const [{ maxChangeNo }] = await sequelize2PetraErp.query(
+            'SELECT COALESCE(MAX(changeNo), 0) AS maxChangeNo FROM offerChanges WHERE offerId = :offerId',
+            { replacements: { offerId: req.params.id }, type: QueryTypes.SELECT },
+        );
+        const values = whitelist(OfferChanges, req.body, ['offerChangesId', 'offerId', 'changeNo']);
+        const change = await OfferChanges.create({
+            ...values,
+            offerId: req.params.id,
+            changeNo: req.body.changeNo ?? (maxChangeNo || 0) + 1,
+        });
+        res.status(201).json(change);
+    } catch (err) {
+        console.error('Error creating offer change:', err);
+        res.status(500).json({ message: 'Failed to create change' });
+    }
 });
 
 // PATCH /api/offers/:id/changes/:changeId  -- also used to toggle offerApproved
@@ -256,17 +311,27 @@ router.patch('/:id/changes/:changeId', async (req, res) => {
         where: { offerChangesId: req.params.changeId, offerId: req.params.id },
     });
     if (!change) return res.status(404).json({ message: 'Not found' });
-    await change.update(whitelist(OfferChanges, req.body, ['offerChangesId', 'offerId']));
-    res.json(change);
+    try {
+        await change.update(whitelist(OfferChanges, req.body, ['offerChangesId', 'offerId']));
+        res.json(change);
+    } catch (err) {
+        console.error('Error updating offer change:', err);
+        res.status(500).json({ message: 'Failed to update change' });
+    }
 });
 
 // DELETE /api/offers/:id/changes/:changeId
 router.delete('/:id/changes/:changeId', async (req, res) => {
-    const deleted = await OfferChanges.destroy({
-        where: { offerChangesId: req.params.changeId, offerId: req.params.id },
-    });
-    if (!deleted) return res.status(404).json({ message: 'Not found' });
-    res.json({ message: 'deleted' });
+    try {
+        const deleted = await OfferChanges.destroy({
+            where: { offerChangesId: req.params.changeId, offerId: req.params.id },
+        });
+        if (!deleted) return res.status(404).json({ message: 'Not found' });
+        res.json({ message: 'deleted' });
+    } catch (err) {
+        console.error('Error deleting offer change:', err);
+        res.status(500).json({ message: 'Failed to delete change' });
+    }
 });
 
 /* ---------------- Contract notes ---------------- */
@@ -288,13 +353,18 @@ router.post('/:id/contract-notes', async (req, res) => {
             return res.status(400).json({ message: `${f} is required` });
         }
     }
-    const note = await OfferContractNotes.create({
-        offerId: req.params.id,
-        offerContractNotesType: req.body.offerContractNotesType,
-        offerContractNotesDesc: req.body.offerContractNotesDesc,
-        offerContractNotesDate: new Date(),
-    });
-    res.status(201).json(note);
+    try {
+        const note = await OfferContractNotes.create({
+            offerId: req.params.id,
+            offerContractNotesType: req.body.offerContractNotesType,
+            offerContractNotesDesc: req.body.offerContractNotesDesc,
+            offerContractNotesDate: new Date(),
+        });
+        res.status(201).json(note);
+    } catch (err) {
+        console.error('Error creating contract note:', err);
+        res.status(500).json({ message: 'Failed to create contract note' });
+    }
 });
 
 // PATCH /api/offers/:id/contract-notes/:noteId
@@ -303,17 +373,27 @@ router.patch('/:id/contract-notes/:noteId', async (req, res) => {
         where: { offerContractNotesId: req.params.noteId, offerId: req.params.id },
     });
     if (!note) return res.status(404).json({ message: 'Not found' });
-    await note.update(whitelist(OfferContractNotes, req.body, ['offerContractNotesId', 'offerId']));
-    res.json(note);
+    try {
+        await note.update(whitelist(OfferContractNotes, req.body, ['offerContractNotesId', 'offerId']));
+        res.json(note);
+    } catch (err) {
+        console.error('Error updating contract note:', err);
+        res.status(500).json({ message: 'Failed to update contract note' });
+    }
 });
 
 // DELETE /api/offers/:id/contract-notes/:noteId
 router.delete('/:id/contract-notes/:noteId', async (req, res) => {
-    const deleted = await OfferContractNotes.destroy({
-        where: { offerContractNotesId: req.params.noteId, offerId: req.params.id },
-    });
-    if (!deleted) return res.status(404).json({ message: 'Not found' });
-    res.json({ message: 'deleted' });
+    try {
+        const deleted = await OfferContractNotes.destroy({
+            where: { offerContractNotesId: req.params.noteId, offerId: req.params.id },
+        });
+        if (!deleted) return res.status(404).json({ message: 'Not found' });
+        res.json({ message: 'deleted' });
+    } catch (err) {
+        console.error('Error deleting contract note:', err);
+        res.status(500).json({ message: 'Failed to delete contract note' });
+    }
 });
 
 export default router;

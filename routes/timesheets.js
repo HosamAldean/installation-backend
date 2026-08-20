@@ -3,12 +3,14 @@
 // §07 "Offers" (timesheets listed as its own page). Same roles as Offers.
 import express from 'express';
 import { QueryTypes } from 'sequelize';
-import { authenticateToken, authorizeRoles } from '../middleware/auth.js';
+import { authenticateToken } from '../middleware/auth.js';
+import { requirePermission } from '../middleware/permissions.js';
+import { PERMISSIONS } from '../constants/permissions.js';
 import { sequelize2PetraErp } from '../config/db.js';
 import { TimeSheet } from '../models/TimeSheet.js';
 
 const router = express.Router();
-router.use(authenticateToken, authorizeRoles('sales', 'sales_manager', 'admin'));
+router.use(authenticateToken, requirePermission(PERMISSIONS.PETRA_ERP_TIMESHEETS));
 
 function whitelist(model, body, excluding = []) {
     const attrs = Object.keys(model.getAttributes()).filter((a) => !excluding.includes(a));
@@ -49,19 +51,29 @@ router.post('/', async (req, res) => {
     if (!req.body.timeSheetStartTime || !req.body.timeSheetEndTime) {
         return res.status(400).json({ message: 'timeSheetStartTime and timeSheetEndTime are required' });
     }
-    const timeSheet = await TimeSheet.create({
-        ...whitelist(TimeSheet, req.body, ['timeSheetId']),
-        userId: req.body.userId ?? req.user.userId,
-    });
-    res.status(201).json(timeSheet);
+    try {
+        const timeSheet = await TimeSheet.create({
+            ...whitelist(TimeSheet, req.body, ['timeSheetId']),
+            userId: req.body.userId ?? req.user.userId,
+        });
+        res.status(201).json(timeSheet);
+    } catch (err) {
+        console.error('Error creating timesheet:', err);
+        res.status(500).json({ message: 'Failed to create timesheet' });
+    }
 });
 
 // PATCH /api/timesheets/:id
 router.patch('/:id', async (req, res) => {
     const timeSheet = await TimeSheet.findByPk(req.params.id);
     if (!timeSheet) return res.status(404).json({ message: 'Not found' });
-    await timeSheet.update(whitelist(TimeSheet, req.body, ['timeSheetId']));
-    res.json(timeSheet);
+    try {
+        await timeSheet.update(whitelist(TimeSheet, req.body, ['timeSheetId']));
+        res.json(timeSheet);
+    } catch (err) {
+        console.error('Error updating timesheet:', err);
+        res.status(500).json({ message: 'Failed to update timesheet' });
+    }
 });
 
 export default router;
