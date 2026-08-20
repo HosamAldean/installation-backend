@@ -1,17 +1,28 @@
 ﻿import express from 'express';
-import { sequelize2, withSqlRetry } from '../config/db.js';
+import { sequelize, sequelize2, withSqlRetry } from '../config/db.js';
 import { QueryTypes } from 'sequelize';
 import { authenticateToken } from '../middleware/auth.js';
-import { requirePermission } from '../middleware/permissions.js';
+import { requirePermission, blockWritesForReadOnlyRoles } from '../middleware/permissions.js';
 import { PERMISSIONS } from '../constants/permissions.js';
+import { ROLE_EXTRA_WORK_PLACES } from '../utils/supervisorLookup.js';
+import { resolveEmployeeNames } from '../utils/employeeLookup.js';
 
 const router = express.Router();
+
+// Employees eligible to appear in the team-member/leader picker: the full
+// installation department tree (see ROLE_EXTRA_WORK_PLACES in
+// supervisorLookup.js, which already includes the 7200 core department) --
+// without this, employees outside 7200 could be turned into
+// installation_employee accounts but never actually placed on a team, which
+// defeats the point of extending scope to those departments.
+const TEAM_ELIGIBLE_WORK_PLACES = ROLE_EXTRA_WORK_PLACES.installation_manager;
 // This entire router previously had no authentication at all — team
 // creation/deletion, member assignment, and leader changes were reachable by
 // anyone with network access. The frontend (EmployeeCardPage.tsx) is already
 // gated to manager/admin via RoleProtectedRoute — mirror that here.
 router.use(authenticateToken);
 router.use(requirePermission(PERMISSIONS.INSTALLATION_TEAMS));
+router.use(blockWritesForReadOnlyRoles);
 
 /** -------------------------------------------------------
  *  🔧 Arabic Auto-Recovery (Fix double-encoded UTF-8 text)
@@ -43,15 +54,15 @@ const fixArabicFields = (row) => {
 router.post('/', async (req, res) => {
     const trx = await sequelize2.transaction();
     try {
-        const { name, description, leaderEmpNo } = req.body;
+        const { name, description, leaderEmpNo, supervisorEmpNo } = req.body;
         if (!name) {
             await trx.rollback();
             return res.status(400).json({ success: false, message: 'Team name required' });
         }
 
         const result = await sequelize2.query(
-            'INSERT INTO instTeams (name, description, leader_emp_no, createdAt, updatedAt) VALUES (:name, :description, :leaderEmpNo, NOW(), NOW())',
-            { replacements: { name, description, leaderEmpNo }, type: QueryTypes.INSERT, transaction: trx }
+            'INSERT INTO instTeams (name, description, leader_emp_no, supervisor_emp_no, createdAt, updatedAt) VALUES (:name, :description, :leaderEmpNo, :supervisorEmpNo, NOW(), NOW())',
+            { replacements: { name, description, leaderEmpNo, supervisorEmpNo: supervisorEmpNo || null }, type: QueryTypes.INSERT, transaction: trx }
         );
 
         const teamId = result[0];
@@ -77,9 +88,16 @@ router.post('/', async (req, res) => {
  */
 router.get('/', async (req, res) => {
     try {
+        // installation_supervisor sees only the teams assigned to them
+        // (supervisor_emp_no) -- previously unscoped, returning every team
+        // in the company regardless of role. Admin/installation_manager
+        // (and anyone else holding INSTALLATION_TEAMS) keep the full list.
+        const isScoped = req.user.role === 'installation_supervisor';
+        const empNo = req.user.assignedEmpNo ? parseInt(req.user.assignedEmpNo) : null;
+        const where = isScoped ? 'WHERE supervisor_emp_no = :empNo' : '';
         const teams = await sequelize2.query(
-            'SELECT * FROM instTeams ORDER BY createdAt DESC',
-            { type: QueryTypes.SELECT }
+            `SELECT * FROM instTeams ${where} ORDER BY createdAt DESC`,
+            { replacements: { empNo }, type: QueryTypes.SELECT }
         );
 
         const mapped = teams.map(fixArabicFields);
@@ -96,7 +114,7 @@ router.get('/', async (req, res) => {
 router.put('/:teamId', async (req, res) => {
     try {
         const { teamId } = req.params;
-        let { name, description, leaderEmpNo } = req.body;
+        let { name, description, leaderEmpNo, supervisorEmpNo } = req.body;
 
         if (!name) return res.status(400).json({ success: false, message: 'Team name required' });
 
@@ -104,8 +122,8 @@ router.put('/:teamId', async (req, res) => {
         description = fixArabic(description);
 
         const [, updateMeta] = await sequelize2.query(
-            'UPDATE instTeams SET name = :name, description = :description, leader_emp_no = :leaderEmpNo, updatedAt = NOW() WHERE id = :teamId',
-            { replacements: { teamId, name, description, leaderEmpNo } }
+            'UPDATE instTeams SET name = :name, description = :description, leader_emp_no = :leaderEmpNo, supervisor_emp_no = :supervisorEmpNo, updatedAt = NOW() WHERE id = :teamId',
+            { replacements: { teamId, name, description, leaderEmpNo, supervisorEmpNo: supervisorEmpNo || null } }
         );
         if (!updateMeta?.affectedRows) {
             return res.status(404).json({ success: false, message: 'Team not found' });
@@ -337,6 +355,19 @@ router.delete('/:teamId', async (req, res) => {
             }
         }
 
+        // instTeamCheckpoints/instTeamLocations both have an enforced FK to
+        // instTeams.id -- any team that ever recorded a single GPS
+        // check-in/location ping (i.e. essentially every real team) left
+        // the final DELETE FROM instTeams below failing its FK constraint
+        // with a raw 500, confirmed live against real teams 67/19.
+        await sequelize2.query(
+            'DELETE FROM instTeamCheckpoints WHERE team_id = :teamId',
+            { replacements: { teamId }, transaction: trx }
+        );
+        await sequelize2.query(
+            'DELETE FROM instTeamLocations WHERE team_id = :teamId',
+            { replacements: { teamId }, transaction: trx }
+        );
         await sequelize2.query(
             'DELETE FROM instTeamMembers WHERE team_id = :teamId',
             { replacements: { teamId }, transaction: trx }
@@ -394,7 +425,7 @@ router.get('/employees', async (req, res) => {
             LEFT JOIN ${sqlDB}.dbo.Pay_Job AS j
                 ON e.Job_code = j.job_code AND j.Comp_num = '1'
             WHERE e.Work_status = '1'
-              AND e.Work_place = '7200'
+              AND e.Work_place IN (${TEAM_ELIGIBLE_WORK_PLACES.map(w => `'${w}'`).join(',')})
 
         `;
 
@@ -451,7 +482,7 @@ router.get('/employees/leaders', async (req, res) => {
             LEFT JOIN ${sqlDB}.dbo.Pay_Job AS j
                 ON e.Job_code = j.job_code AND j.Comp_num = '1'
             WHERE e.Work_status = '1'
-              AND e.Work_place = '7200'
+              AND e.Work_place IN (${TEAM_ELIGIBLE_WORK_PLACES.map(w => `'${w}'`).join(',')})
               AND e.Job_code <> '191'
         `;
 
@@ -474,6 +505,40 @@ router.get('/employees/leaders', async (req, res) => {
     }
 });
 
-
+/**
+ * GET /teams/employees/supervisors
+ * Every InsUser account on the installation_supervisor role -- "supervisor"
+ * is a login-account/role concept (who can actually sign in and see a
+ * scoped view), unlike "leader" which is a plain ERP employee (see
+ * /employees/leaders above), so the account set comes from InsUser. The
+ * display name doesn't, though -- InsUser.firstName/lastName is corrupted
+ * garbage ("????...") for several real supervisor accounts (confirmed
+ * live, looks like a bad bulk-import), so the name is resolved from
+ * PayEmp via assignedEmpNo instead, the same reliable source every other
+ * name lookup in this app already uses (see utils/employeeLookup.js).
+ */
+router.get('/employees/supervisors', async (req, res) => {
+    try {
+        const supervisors = await sequelize.query(
+            `SELECT userId, username, assignedEmpNo
+             FROM InsUser
+             WHERE role = 'installation_supervisor' AND active = 1`,
+            { type: QueryTypes.SELECT }
+        );
+        const withEmpNo = supervisors.filter((u) => u.assignedEmpNo != null);
+        const names = await resolveEmployeeNames(withEmpNo.map((u) => u.assignedEmpNo));
+        res.json({
+            success: true,
+            eligibleSupervisors: withEmpNo.map((u) => ({
+                empNo: u.assignedEmpNo,
+                userId: u.userId,
+                name: names[u.assignedEmpNo]?.name_ar || names[u.assignedEmpNo]?.name_en || u.username,
+            })),
+        });
+    } catch (err) {
+        console.error('❌ Error fetching eligible supervisors:', err);
+        res.status(500).json({ success: false, message: 'Server error fetching supervisors' });
+    }
+});
 
 export default router;
