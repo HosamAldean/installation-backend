@@ -3,7 +3,7 @@ import express from 'express';
 import { sequelize, sequelize2 } from '../config/db.js';
 import { QueryTypes } from 'sequelize';
 import { authenticateToken } from '../middleware/auth.js';
-import { requirePermission } from '../middleware/permissions.js';
+import { requirePermission, blockWritesForReadOnlyRoles } from '../middleware/permissions.js';
 import { PERMISSIONS } from '../constants/permissions.js';
 
 const router = express.Router();
@@ -13,6 +13,10 @@ const router = express.Router();
 // is already gated to manager/admin via RoleProtectedRoute — mirror that here.
 router.use(authenticateToken);
 router.use(requirePermission(PERMISSIONS.INSTALLATION_STEPS));
+// HR-tier roles hold this same key for view-only oversight (added
+// 2026-08-27) -- gm/installation_manager keep full read/write since they're
+// not in READ_ONLY_ROLES.
+router.use(blockWritesForReadOnlyRoles);
 
 const fixArabic = (str) => {
     if (!str || typeof str !== 'string') return str;

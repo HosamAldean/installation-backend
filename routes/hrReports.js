@@ -14,7 +14,7 @@ import express from "express";
 import { Op } from "sequelize";
 import { withSqlRetry } from "../config/db.js";
 import { authenticateToken } from "../middleware/auth.js";
-import { requirePermission } from "../middleware/permissions.js";
+import { requirePermission, blockGmWrites } from "../middleware/permissions.js";
 import { PERMISSIONS } from "../constants/permissions.js";
 import {
     HrLeaveRequest,
@@ -22,6 +22,7 @@ import {
     HrAttendanceCorrectionRow,
     HrTransportRequest,
     HrTransportAccompanier,
+    HrOvertimeRequest,
 } from "../models/index.js";
 import { resolveEmployeeNames } from "../utils/employeeLookup.js";
 import { resolveUserNames } from "../utils/userLookup.js";
@@ -38,6 +39,7 @@ async function hrReportScopeFilter(role) {
     if (!isHrScopedRole(role)) return null;
     return new Set((await getHrScopedEmpNos(role)).map(Number));
 }
+
 
 // Optional display-only slice by Emp_num prefix "100" vs everyone else --
 // not a role/scope boundary (see getEmpNosByPrefixGroup's own comment),
@@ -128,9 +130,30 @@ router.get("/leave-attendance/employees", authenticateToken, requirePermission(P
     }
 });
 
+// ============================================================
+// GET /overtime/employees -- every employee with an overtime request,
+// scoped the same way GET /overtime itself is.
+// ============================================================
+router.get("/overtime/employees", authenticateToken, requirePermission(PERMISSIONS.HR_REPORTS_OVERTIME), async (req, res) => {
+    try {
+        const scopeFilter = await hrReportScopeFilter(req.user.role);
+        const rows = await HrOvertimeRequest.findAll({ attributes: ["requesterEmpNo"] });
+        let empNos = rows.map((r) => r.requesterEmpNo);
+        if (scopeFilter) empNos = empNos.filter((n) => scopeFilter.has(Number(n)));
+        res.json({ success: true, data: await sortedEmployeeList(empNos) });
+    } catch (err) {
+        console.error("❌ HR OVERTIME EMPLOYEES ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to fetch employee list" });
+    }
+});
+
 function daysInLeave(r) {
     if (r.kind !== "leave" || !r.fromDate || !r.toDate) return 0;
     return Math.round((new Date(r.toDate) - new Date(r.fromDate)) / 86400000) + 1;
+}
+
+function overtimeHours(rows) {
+    return rows.reduce((s, r) => s + (r.hours || 0), 0);
 }
 
 function countByStatus(rows) {
@@ -154,10 +177,11 @@ router.get("/summary", authenticateToken, requirePermission(PERMISSIONS.HR_REPOR
         const scopeFilter = await hrReportScopeFilter(req.user.role);
         const inScope = (r) => !scopeFilter || scopeFilter.has(Number(r.requesterEmpNo));
 
-        const [allLeaveAndDeparture, allAttendance, allTransport] = await Promise.all([
+        const [allLeaveAndDeparture, allAttendance, allTransport, allOvertime] = await Promise.all([
             HrLeaveRequest.findAll().then((rows) => rows.filter(inScope)),
             HrAttendanceCorrectionRequest.findAll().then((rows) => rows.filter(inScope)),
             HrTransportRequest.findAll().then((rows) => rows.filter(inScope)),
+            HrOvertimeRequest.findAll().then((rows) => rows.filter(inScope)),
         ]);
         // HrLeaveRequest covers both full-day leave (kind='leave') and
         // partial-day work departure (kind='departure', Form 10-20's other
@@ -208,6 +232,11 @@ router.get("/summary", authenticateToken, requirePermission(PERMISSIONS.HR_REPOR
                 approvedKmThisMonth: sumApproved(allTransport.filter((r) => r.departureDate >= monthStart), "kmDriven"),
                 approvedAmountThisMonth: sumApproved(allTransport.filter((r) => r.departureDate >= monthStart), "totalAmount"),
                 approvedAmountThisYear: sumApproved(allTransport.filter((r) => r.departureDate >= yearStart), "totalAmount"),
+            },
+            overtime: {
+                byStatus: countByStatus(allOvertime),
+                approvedHoursThisMonth: overtimeHours(allOvertime.filter((r) => r.status === "approved" && r.date >= monthStart)),
+                approvedHoursThisYear: overtimeHours(allOvertime.filter((r) => r.status === "approved" && r.date >= yearStart)),
             },
         });
     } catch (err) {
@@ -407,6 +436,73 @@ router.get("/transport", authenticateToken, requirePermission(PERMISSIONS.HR_REP
 });
 
 // ============================================================
+// GET /overtime -- overtime request history, for HR record-keeping. Same
+// HR-tier scope as /leave-attendance (see hrReportScopeFilter) -- overtime
+// has no Finance/payment stage, so no company-wide exception like
+// /transport's.
+// ============================================================
+router.get("/overtime", authenticateToken, requirePermission(PERMISSIONS.HR_REPORTS_OVERTIME), async (req, res) => {
+    try {
+        const { page, pageSize } = parsePagination(req.query);
+        const { status, dateFrom, dateTo, search, exported, empGroup } = req.query;
+
+        let empNoFilter = await resolveSearchToEmpNos(search);
+        const scopeFilter = await hrReportScopeFilter(req.user.role);
+        const groupFilter = await empGroupFilter(empGroup);
+        for (const filter of [scopeFilter, groupFilter]) {
+            if (!filter) continue;
+            empNoFilter = empNoFilter
+                ? empNoFilter.filter((n) => filter.has(Number(n)))
+                : [...filter];
+        }
+        if (empNoFilter && empNoFilter.length === 0) {
+            return res.json({ success: true, items: [], total: 0, page, pageSize });
+        }
+
+        const where = {};
+        if (status) where.status = status;
+        if (empNoFilter) where.requesterEmpNo = { [Op.in]: empNoFilter };
+        if (dateFrom || dateTo) {
+            where.date = {};
+            if (dateFrom) where.date[Op.gte] = dateFrom;
+            if (dateTo) where.date[Op.lte] = dateTo;
+        }
+        if (exported === "no") where.exportedAt = null;
+        else if (exported === "yes") where.exportedAt = { [Op.ne]: null };
+
+        const overtime = await HrOvertimeRequest.findAll({
+            where,
+            order: [["date", "DESC"]],
+        });
+
+        const [empNames, userNames] = await Promise.all([
+            resolveEmployeeNames([
+                ...overtime.map((r) => r.requesterEmpNo),
+                ...overtime.map((r) => r.managerApproverEmpNo),
+            ]),
+            resolveUserNames([
+                ...overtime.map((r) => r.gmApproverUserId),
+                ...overtime.map((r) => r.hrReviewerUserId),
+            ]),
+        ]);
+        const enriched = overtime.map((r) => ({
+            ...r.toJSON(),
+            employee: empNames[r.requesterEmpNo] || null,
+            managerApprover: r.managerApproverEmpNo ? (empNames[r.managerApproverEmpNo] || null) : null,
+            gmApprover: r.gmApproverUserId ? (userNames[r.gmApproverUserId] || null) : null,
+            hrApprover: r.hrReviewerUserId ? (userNames[r.hrReviewerUserId] || null) : null,
+        }));
+
+        const total = enriched.length;
+        const items = enriched.slice((page - 1) * pageSize, page * pageSize);
+        res.json({ success: true, items, total, page, pageSize });
+    } catch (err) {
+        console.error("❌ HR OVERTIME REPORT ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to fetch overtime report" });
+    }
+});
+
+// ============================================================
 // PUT /leave-attendance/mark-exported -- marks all currently-unexported
 // leave/attendance rows matching the given filters as exported (sets
 // exportedAt = NOW()). Same filter semantics as the GET endpoint above
@@ -414,7 +510,7 @@ router.get("/transport", authenticateToken, requirePermission(PERMISSIONS.HR_REP
 // rows) -- called after a CSV/PDF export completes so a fresh export
 // naturally only grabs new records next time.
 // ============================================================
-router.put("/leave-attendance/mark-exported", authenticateToken, requirePermission(PERMISSIONS.HR_REPORTS_LEAVE_ATTENDANCE), async (req, res) => {
+router.put("/leave-attendance/mark-exported", authenticateToken, requirePermission(PERMISSIONS.HR_REPORTS_LEAVE_ATTENDANCE), blockGmWrites, async (req, res) => {
     try {
         const { status, type, dateFrom, dateTo, search, empGroup } = req.body;
 
@@ -477,7 +573,7 @@ router.put("/leave-attendance/mark-exported", authenticateToken, requirePermissi
 // PUT /transport/mark-exported -- marks all currently-unexported
 // transport rows matching the given filters as exported.
 // ============================================================
-router.put("/transport/mark-exported", authenticateToken, requirePermission(PERMISSIONS.HR_REPORTS_TRANSPORT), async (req, res) => {
+router.put("/transport/mark-exported", authenticateToken, requirePermission(PERMISSIONS.HR_REPORTS_TRANSPORT), blockGmWrites, async (req, res) => {
     try {
         const { status, dateFrom, dateTo, search, paidStatus, empGroup } = req.body;
 
@@ -512,6 +608,46 @@ router.put("/transport/mark-exported", authenticateToken, requirePermission(PERM
         res.json({ success: true, count });
     } catch (err) {
         console.error("❌ HR TRANSPORT MARK-EXPORTED ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to mark records as exported" });
+    }
+});
+
+// ============================================================
+// PUT /overtime/mark-exported -- marks all currently-unexported overtime
+// rows matching the given filters as exported. date is a plain column
+// here (unlike leave-attendance's computed effectiveDate), so this can
+// update directly by `where` rather than fetch-then-filter-by-id.
+// ============================================================
+router.put("/overtime/mark-exported", authenticateToken, requirePermission(PERMISSIONS.HR_REPORTS_OVERTIME), blockGmWrites, async (req, res) => {
+    try {
+        const { status, dateFrom, dateTo, search, empGroup } = req.body;
+
+        let empNoFilter = await resolveSearchToEmpNos(search);
+        const scopeFilter = await hrReportScopeFilter(req.user.role);
+        const groupFilter = await empGroupFilter(empGroup);
+        for (const filter of [scopeFilter, groupFilter]) {
+            if (!filter) continue;
+            empNoFilter = empNoFilter
+                ? empNoFilter.filter((n) => filter.has(Number(n)))
+                : [...filter];
+        }
+        if (empNoFilter && empNoFilter.length === 0) {
+            return res.json({ success: true, count: 0 });
+        }
+
+        const where = { exportedAt: null };
+        if (status) where.status = status;
+        if (empNoFilter) where.requesterEmpNo = { [Op.in]: empNoFilter };
+        if (dateFrom || dateTo) {
+            where.date = {};
+            if (dateFrom) where.date[Op.gte] = dateFrom;
+            if (dateTo) where.date[Op.lte] = dateTo;
+        }
+
+        const [count] = await HrOvertimeRequest.update({ exportedAt: new Date() }, { where });
+        res.json({ success: true, count });
+    } catch (err) {
+        console.error("❌ HR OVERTIME MARK-EXPORTED ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to mark records as exported" });
     }
 });

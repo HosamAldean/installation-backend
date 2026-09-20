@@ -6,6 +6,7 @@
 import express from 'express';
 import { authenticateToken, authorizeRoles } from '../middleware/auth.js';
 import { PermissionGrant } from '../models/PermissionGrant.js';
+import { PermissionGrantAudit } from '../models/PermissionGrantAudit.js';
 import { invalidatePermissionsCache } from '../middleware/permissions.js';
 import {
     PERMISSION_LIST,
@@ -44,12 +45,20 @@ router.put('/', async (req, res) => {
 
     try {
         if (granted) {
-            await PermissionGrant.findOrCreate({
+            const [, created] = await PermissionGrant.findOrCreate({
                 where: { role, permissionKey },
                 defaults: { grantedByUserId: req.user.userId },
             });
+            // Only log an actual state change -- toggling "on" a permission
+            // that's already granted is a no-op, not a real grant event.
+            if (created) {
+                await PermissionGrantAudit.create({ role, permissionKey, action: 'granted', performedByUserId: req.user.userId });
+            }
         } else {
-            await PermissionGrant.destroy({ where: { role, permissionKey } });
+            const deletedCount = await PermissionGrant.destroy({ where: { role, permissionKey } });
+            if (deletedCount > 0) {
+                await PermissionGrantAudit.create({ role, permissionKey, action: 'revoked', performedByUserId: req.user.userId });
+            }
         }
 
         invalidatePermissionsCache();

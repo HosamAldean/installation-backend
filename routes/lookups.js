@@ -7,8 +7,25 @@ import { authenticateToken, authorizeRoles } from '../middleware/auth.js';
 import { requirePermission } from '../middleware/permissions.js';
 import { PERMISSIONS } from '../constants/permissions.js';
 import { LOOKUP_REGISTRY, LOOKUP_TYPES } from '../models/lookupModels.js';
+import { AdminActionAudit } from '../models/AdminActionAudit.js';
 
 const router = express.Router();
+
+// Fire-and-forget, same reasoning as routes/auth.js's recordLoginAudit --
+// a logging failure must never affect the actual write it's describing.
+function logLookupAction({ type, entityId, entityLabel, action, changes, req }) {
+    AdminActionAudit.create({
+        module: 'lookup',
+        entityType: type,
+        entityId: String(entityId),
+        entityLabel: entityLabel ?? null,
+        action,
+        changes: changes ? JSON.stringify(changes) : null,
+        performedByUserId: req.user?.userId ?? null,
+    }).catch((err) => {
+        console.error('❌ Failed to record admin action audit:', err);
+    });
+}
 
 // View is admin-editable via the PermissionGrant table (see
 // PERMISSIONS.LOOKUPS_VIEW) since Orders/Cash Flow (and any future Petra
@@ -76,6 +93,14 @@ router.post('/:type', requireEdit, async (req, res) => {
 
     try {
         const row = await model.create(values);
+        logLookupAction({
+            type: req.params.type,
+            entityId: row[pkField],
+            entityLabel: row[req.lookup.nameField] ?? null,
+            action: 'created',
+            changes: values,
+            req,
+        });
         res.status(201).json(row);
     } catch (err) {
         if (err.name === 'SequelizeUniqueConstraintError') {
@@ -98,6 +123,14 @@ router.patch('/:type/:id', requireEdit, async (req, res) => {
 
     try {
         await row.update(updates);
+        logLookupAction({
+            type: req.params.type,
+            entityId: req.params.id,
+            entityLabel: row[req.lookup.nameField] ?? null,
+            action: 'updated',
+            changes: updates,
+            req,
+        });
         res.json(row);
     } catch (err) {
         if (err.name === 'SequelizeUniqueConstraintError') {
@@ -113,7 +146,15 @@ router.delete('/:type/:id', requireEdit, async (req, res) => {
     const { model } = req.lookup;
     const row = await model.findByPk(req.params.id);
     if (!row) return res.status(404).json({ message: 'Not found' });
+    const entityLabel = row[req.lookup.nameField] ?? null;
     await row.destroy();
+    logLookupAction({
+        type: req.params.type,
+        entityId: req.params.id,
+        entityLabel,
+        action: 'deleted',
+        req,
+    });
     res.json({ message: 'deleted' });
 });
 

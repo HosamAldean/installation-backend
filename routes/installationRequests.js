@@ -3,7 +3,7 @@ import express from 'express';
 import { sequelize, sequelize2 } from '../config/db.js';
 import { QueryTypes } from 'sequelize';
 import { authenticateToken } from '../middleware/auth.js';
-import { requirePermission } from '../middleware/permissions.js';
+import { requirePermission, blockWritesForReadOnlyRoles } from '../middleware/permissions.js';
 import { PERMISSIONS } from '../constants/permissions.js';
 
 const router = express.Router();
@@ -14,6 +14,12 @@ const router = express.Router();
 // so it can't be bypassed by calling the API directly, matching instOrders.js.
 router.use(authenticateToken);
 router.use(requirePermission(PERMISSIONS.INSTALLATION_REQUESTS));
+// HR-tier roles hold this same key for view-only oversight (added
+// 2026-08-27) -- gm/installation_manager keep full read/write since they're
+// not in READ_ONLY_ROLES. Needed here specifically because, unlike
+// instOrders.js/teams.js, this router previously had no view-only role
+// among its grant holders at all.
+router.use(blockWritesForReadOnlyRoles);
 
 /** -------------------------------------------------------
  *  🔧 Arabic Auto-Recovery (Fix double-encoded UTF-8 text)

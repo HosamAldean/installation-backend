@@ -21,6 +21,8 @@ import { HrAttendanceCorrectionRequest } from "./HrAttendanceCorrectionRequest.j
 import { HrAttendanceCorrectionRow } from "./HrAttendanceCorrectionRow.js";
 import { HrTransportRequest } from "./HrTransportRequest.js";
 import { HrTransportAccompanier } from "./HrTransportAccompanier.js";
+import { HrOvertimeRequest } from "./HrOvertimeRequest.js";
+import { IttihadClockImportRow } from "./IttihadClockImportRow.js";
 
 
 // --------------------------------------
@@ -42,7 +44,9 @@ export {
     HrAttendanceCorrectionRequest,
     HrAttendanceCorrectionRow,
     HrTransportRequest,
-    HrTransportAccompanier
+    HrTransportAccompanier,
+    HrOvertimeRequest,
+    IttihadClockImportRow
 };
 
 
@@ -216,3 +220,8 @@ HrTransportAccompanier.belongsTo(HrTransportRequest, {
     foreignKey: "requestId",
     as: "request"
 });
+
+// HrOvertimeRequest no longer has a per-employee sub-table (self-service
+// only now, see that model's header comment) -- the old hasMany/belongsTo
+// association to HrOvertimeEmployee (still a real, unused table -- not
+// dropped) was removed here along with it.

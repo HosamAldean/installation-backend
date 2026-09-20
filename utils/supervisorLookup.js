@@ -145,6 +145,45 @@ export const ROLE_EXTRA_WORK_PLACES = {
     installation_manager: ['7200', '7310', '7320', '7400', '7500'],
 };
 
+// Live identification of "General Manager", for the overtime request GM
+// approval stage (see HrOvertimeRequest.js). The job code that means
+// "General Manager" is company-specific, NOT one number company-wide --
+// confirmed live against Pay_Job: Comp_num 1/2/3 all use Job_code=11 for
+// "المدير العام", but Comp_num 10 (Ittihad) reuses Job_code=11 for
+// "محاسب" (Accountant, held by 3 different people there) and instead uses
+// Job_code=2 for its own "المدير العام ". Comp_num=3 also has its own
+// separate GM (empNo 400001, Job_code=11) not covered here since this
+// app's HR self-service module only serves Comp_num 1 (Petra) and 10
+// (Ittihad). No PayEmp row currently has Comp_num=10 + Job_code=2 (Ittihad
+// hasn't assigned anyone to that job yet) -- getCurrentGmEmpNos simply
+// omits company 10 from its result until that changes, rather than
+// erroring. A live lookup rather than a stored empNo so a future change of
+// who holds either job (via Alpha HR/ERP, not this app) takes effect
+// immediately with no code change, mirroring Supervisor_No's own "always
+// live, never cached" reasoning above.
+const GENERAL_MANAGER_JOB_CODES = [
+    { compNum: 1, jobCode: 11 },
+    { compNum: 10, jobCode: 2 },
+];
+
+export async function getCurrentGmEmpNos() {
+    const clauses = GENERAL_MANAGER_JOB_CODES
+        .map(({ compNum, jobCode }) => `(Comp_num = ${compNum} AND Job_code = ${jobCode})`)
+        .join(" OR ");
+    const result = await withSqlRetry("erp", (pool) => pool.request()
+        .query(`
+            SELECT Emp_num FROM [DB].[dbo].[PayEmp]
+            WHERE Work_status = '1' AND (${clauses})
+        `));
+    return result.recordset.map((r) => r.Emp_num);
+}
+
+export async function isGeneralManager(empNo) {
+    if (!empNo) return false;
+    const gmEmpNos = await getCurrentGmEmpNos();
+    return gmEmpNos.includes(empNo);
+}
+
 export async function getWorkPlaceEmpNos(workPlaces) {
     if (!workPlaces || !workPlaces.length) return [];
     const result = await withSqlRetry("erp", (pool) => pool.request()

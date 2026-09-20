@@ -8,6 +8,7 @@ import { withSqlRetry } from "../config/db.js";
 import { User } from "../models/User.js";
 import { PermissionGrant } from "../models/PermissionGrant.js";
 import { PERMISSIONS } from "../constants/permissions.js";
+import { getCurrentGmEmpNos } from "./supervisorLookup.js";
 
 const SQL_DB = process.env.MSSQL1_DB;
 
@@ -104,6 +105,19 @@ export async function getFinanceReviewerUserIds() {
     if (roles.length === 0) return [];
     const reviewers = await User.findAll({
         where: { role: roles, active: true },
+        attributes: ["userId"],
+    });
+    return reviewers.map((u) => u.userId);
+}
+
+// Which InsUser accounts to notify when an overtime request reaches
+// pending_gm. Resolved live via getCurrentGmEmpNos (Job_code=11,
+// Comp_num=1), not role or a stored empNo -- see that function's comment.
+export async function getGmReviewerUserIds() {
+    const gmEmpNos = await getCurrentGmEmpNos();
+    if (gmEmpNos.length === 0) return [];
+    const reviewers = await User.findAll({
+        where: { assignedEmpNo: gmEmpNos, active: true },
         attributes: ["userId"],
     });
     return reviewers.map((u) => u.userId);

@@ -102,6 +102,37 @@ export const User = sequelize2.define(
             allowNull: true,
             field: 'pushToken',
         },
+
+        // Single-active-session enforcement: bumped on every successful
+        // login (routes/auth.js) and embedded in that login's JWT.
+        // middleware/auth.js rejects any request whose token carries an
+        // older sessionVersion than what's currently on this row, so
+        // logging in on a second device silently invalidates every
+        // previously-issued token for this user -- only the most recent
+        // login stays usable.
+        sessionVersion: {
+            type: DataTypes.INTEGER,
+            allowNull: false,
+            defaultValue: 0,
+            field: 'sessionVersion',
+        },
+
+        // Recorded on every mobile login attempt (routes/auth.js), null for
+        // an account that's never logged in from mobile (or only from web,
+        // which never sends this). Backs both the login-time force-update
+        // block (constants/mobileAppVersion.js's MIN_SUPPORTED_VERSION_CODE)
+        // and the "which devices are still stale" report for re-notifying
+        // people directly instead of waiting on push delivery alone.
+        lastMobileAppVersionCode: {
+            type: DataTypes.INTEGER,
+            allowNull: true,
+            field: 'lastMobileAppVersionCode',
+        },
+        lastMobileAppVersionCheckedAt: {
+            type: DataTypes.DATE,
+            allowNull: true,
+            field: 'lastMobileAppVersionCheckedAt',
+        },
     },
     {
         tableName: 'InsUser',

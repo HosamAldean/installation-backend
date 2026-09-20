@@ -201,6 +201,13 @@ const sqlServers = {
     },
 };
 
+// Just the key list (no credentials) -- for the admin system-health check
+// (routes/audit.js) to iterate every configured SQL Server without this
+// file handing out the sqlServers config object itself.
+export function getSqlServerKeys() {
+    return Object.keys(sqlServers);
+}
+
 // ======================
 // Utility function to connect to the right SQL Server
 // ======================

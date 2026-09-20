@@ -27,6 +27,8 @@ import { authenticateToken } from "../middleware/auth.js";
 import { requirePermission } from "../middleware/permissions.js";
 import { PERMISSIONS } from "../constants/permissions.js";
 import { User } from "../models/User.js";
+import { AdminActionAudit } from "../models/AdminActionAudit.js";
+import { recordUnauthorizedAccess } from "../utils/unauthorizedAccessLog.js";
 
 const router = express.Router();
 
@@ -2657,10 +2659,34 @@ router.get("/stock-levels", async (req, res) => {
 // catalog maintenance day to day.
 function requireAdmin(req, res) {
     if (req.user.role !== "admin") {
+        recordUnauthorizedAccess({
+            userId: req.user?.userId,
+            role: req.user?.role,
+            method: req.method,
+            path: req.originalUrl,
+            requiredAccess: "role: admin",
+            ip: req.ip,
+        });
         res.status(403).json({ success: false, message: "Admin access required" });
         return false;
     }
     return true;
+}
+
+// Fire-and-forget, same reasoning as recordLoginAudit -- a logging failure
+// must never affect the actual write it's describing.
+function logAdminAction({ module, entityType, entityId, entityLabel, action, changes, req }) {
+    AdminActionAudit.create({
+        module,
+        entityType: entityType ?? null,
+        entityId: String(entityId),
+        entityLabel: entityLabel ?? null,
+        action,
+        changes: changes ? JSON.stringify(changes) : null,
+        performedByUserId: req.user?.userId ?? null,
+    }).catch((err) => {
+        console.error("❌ Failed to record admin action audit:", err);
+    });
 }
 
 // GET /api/stock-house/profile-assemblies?search=&page=&pageSize=
@@ -2728,7 +2754,16 @@ router.post("/profile-assemblies", async (req, res) => {
                 VALUES (@profileNOA, @profileP1, @profileP2, @profileP3, @profileP4, @profileP5, @sUser, GETDATE())
             `));
 
-        res.status(201).json({ success: true, id: result.recordset[0].ID });
+        const newId = result.recordset[0].ID;
+        logAdminAction({
+            module: "profile_assembly",
+            entityId: newId,
+            entityLabel: String(profileNOA).trim(),
+            action: "created",
+            changes: { profileNOA, profileP1, profileP2, profileP3, profileP4, profileP5 },
+            req,
+        });
+        res.status(201).json({ success: true, id: newId });
     } catch (err) {
         console.error("❌ PROFILE ASSEMBLY CREATE ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to create profile assembly" });
@@ -2769,6 +2804,14 @@ router.put("/profile-assemblies/:id", async (req, res) => {
         if (!result.rowsAffected[0]) {
             return res.status(404).json({ success: false, message: "Profile assembly not found" });
         }
+        logAdminAction({
+            module: "profile_assembly",
+            entityId: id,
+            entityLabel: String(profileNOA).trim(),
+            action: "updated",
+            changes: { profileNOA, profileP1, profileP2, profileP3, profileP4, profileP5 },
+            req,
+        });
         res.json({ success: true });
     } catch (err) {
         console.error("❌ PROFILE ASSEMBLY UPDATE ERROR:", err);
@@ -2785,11 +2828,22 @@ router.delete("/profile-assemblies/:id", async (req, res) => {
             return res.status(400).json({ success: false, message: "Invalid id" });
         }
 
-        const result = await withSqlRetry("stockhouse", (pool) => pool.request().input("id", id).query(`DELETE FROM guest.ProfileNOA WHERE ID = @id`));
+        const { deleted, profileNOA } = await withSqlRetry("stockhouse", async (pool) => {
+            const existing = await pool.request().input("id", id).query(`SELECT ProfileNOA FROM guest.ProfileNOA WHERE ID = @id`);
+            const result = await pool.request().input("id", id).query(`DELETE FROM guest.ProfileNOA WHERE ID = @id`);
+            return { deleted: !!result.rowsAffected[0], profileNOA: existing.recordset[0]?.ProfileNOA };
+        });
 
-        if (!result.rowsAffected[0]) {
+        if (!deleted) {
             return res.status(404).json({ success: false, message: "Profile assembly not found" });
         }
+        logAdminAction({
+            module: "profile_assembly",
+            entityId: id,
+            entityLabel: profileNOA ?? null,
+            action: "deleted",
+            req,
+        });
         res.json({ success: true });
     } catch (err) {
         console.error("❌ PROFILE ASSEMBLY DELETE ERROR:", err);
@@ -2893,7 +2947,16 @@ router.post("/item-profiles", async (req, res) => {
                 VALUES (@profileNO, @profileName, @details, @sUser, GETDATE())
             `));
 
-        res.status(201).json({ success: true, id: result.recordset[0].ID });
+        const newId = result.recordset[0].ID;
+        logAdminAction({
+            module: "item_profile",
+            entityId: newId,
+            entityLabel: String(profileName).trim(),
+            action: "created",
+            changes: { profileNO, profileName, details },
+            req,
+        });
+        res.status(201).json({ success: true, id: newId });
     } catch (err) {
         console.error("❌ ITEM PROFILE CREATE ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to create item profile" });
@@ -2933,6 +2996,14 @@ router.put("/item-profiles/:id", async (req, res) => {
         if (!result.rowsAffected[0]) {
             return res.status(404).json({ success: false, message: "Item profile not found" });
         }
+        logAdminAction({
+            module: "item_profile",
+            entityId: id,
+            entityLabel: String(profileName).trim(),
+            action: "updated",
+            changes: { profileNO, profileName, details },
+            req,
+        });
         res.json({ success: true });
     } catch (err) {
         console.error("❌ ITEM PROFILE UPDATE ERROR:", err);
@@ -2951,12 +3022,13 @@ router.delete("/item-profiles/:id", async (req, res) => {
             return res.status(400).json({ success: false, message: "Invalid id" });
         }
 
-        const { photoUrl, deleted } = await withSqlRetry("stockhouse", async (pool) => {
-            const existing = await pool.request().input("id", id).query(`SELECT PhotoUrl FROM guest.ItemProfile WHERE ID = @id`);
+        const { photoUrl, deleted, profileName } = await withSqlRetry("stockhouse", async (pool) => {
+            const existing = await pool.request().input("id", id).query(`SELECT PhotoUrl, ProfileName FROM guest.ItemProfile WHERE ID = @id`);
             const photoUrl = existing.recordset[0]?.PhotoUrl;
+            const profileName = existing.recordset[0]?.ProfileName;
 
             const result = await pool.request().input("id", id).query(`DELETE FROM guest.ItemProfile WHERE ID = @id`);
-            return { photoUrl, deleted: !!result.rowsAffected[0] };
+            return { photoUrl, deleted: !!result.rowsAffected[0], profileName };
         });
 
         if (!deleted) {
@@ -2968,6 +3040,13 @@ router.delete("/item-profiles/:id", async (req, res) => {
             if (fs.existsSync(photoPath)) fs.unlinkSync(photoPath);
         }
 
+        logAdminAction({
+            module: "item_profile",
+            entityId: id,
+            entityLabel: profileName ?? null,
+            action: "deleted",
+            req,
+        });
         res.json({ success: true });
     } catch (err) {
         console.error("❌ ITEM PROFILE DELETE ERROR:", err);

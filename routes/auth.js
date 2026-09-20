@@ -4,27 +4,66 @@ import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import dotenv from 'dotenv';
 import { User } from '../models/User.js';
-import { authenticateToken, authorizeRoles } from '../middleware/auth.js';
+import { LoginAudit } from '../models/LoginAudit.js';
+import { authenticateToken, authorizeRoles, setCachedSessionVersion } from '../middleware/auth.js';
 import { getPermissionsForRole } from '../middleware/permissions.js';
+import { MIN_SUPPORTED_VERSION_CODE, UPDATE_PAGE_URL } from '../constants/mobileAppVersion.js';
+
+// Best-effort write to LoginAudits -- a logging failure should never block
+// or fail the actual login flow, same reasoning as sendPushToUser's own
+// try/catch elsewhere in this app.
+async function recordLoginAudit({ username, userId, ip, appVersionCode, success, failureReason }) {
+    try {
+        await LoginAudit.create({
+            username: username || '',
+            userId: userId ?? null,
+            ip: ip ?? null,
+            platform: appVersionCode != null ? 'mobile' : 'web',
+            success,
+            failureReason: failureReason ?? null,
+            appVersionCode: appVersionCode ?? null,
+        });
+    } catch (err) {
+        console.error('❌ Failed to record login audit:', err);
+    }
+}
 
 dotenv.config();
 const router = express.Router();
 
-// Rate limiting for auth endpoints. Keyed by IP + path — on a small
-// internal network (or local dev testing), multiple people/processes behind
-// the same gateway or machine share one bucket, so one person's failed
-// attempts can lock out someone else on the same IP. Confirmed live: the
-// frontend was also silently swallowing this message (see apiRequest.ts's
-// fix) — a locked-out user previously just saw a generic "Failed" instead
-// of "Too many attempts," making this look like a broken login rather than
-// a rate limit. That's fixed now, so this is at least visible when it
-// happens.
+// Rate limiting for auth endpoints. checkRateLimit() (no args, used for
+// /signup and /change-password, where the caller isn't a bare username/
+// password pair) keys by IP + path, same as before.
+//
+// /login instead keys by the *submitted username* (+ path) -- CORRECTED:
+// this used to be IP-only everywhere, which meant multiple people/devices
+// behind the same gateway (a small office network, or one real user's
+// device seen at a LAN IP) shared a single bucket, so one person mistyping
+// their password a couple times could lock every other real employee on
+// that network out of login entirely for the rest of the window. Confirmed
+// live during the Employee Gate rollout: a single device's 2 failed logins
+// tripped the shared IP bucket and then kept re-tripping it on retry.
+// Keying login by username instead means a lockout only ever affects the
+// one account actually being guessed at, not everyone nearby -- the
+// standard account-lockout brute-force defense, not a network-location one.
+// Falls back to IP if the request has no usable username (e.g. malformed
+// body) so it's never left completely unkeyed/unlimited.
+//
+// Confirmed live: the frontend was also silently swallowing this message
+// (see apiRequest.ts's fix) — a locked-out user previously just saw a
+// generic "Failed" instead of "Too many attempts," making this look like a
+// broken login rather than a rate limit. That's fixed now, so this is at
+// least visible when it happens.
 const authAttempts = new Map();
 const RATE_LIMIT_WINDOW = 15 * 60 * 1000; // 15 minutes
 const MAX_ATTEMPTS = 5;
 
-const checkRateLimit = (req, res, next) => {
-    const key = req.ip + req.path;
+// onRejected -- optional, called (not awaited) when a request is blocked,
+// so callers like /login can still get an audit trail entry for attempts
+// that never reach the route handler at all.
+const checkRateLimit = (keyFn, onRejected) => (req, res, next) => {
+    const keyPrefix = keyFn ? keyFn(req) : req.ip;
+    const key = `${keyPrefix}:${req.path}`;
     const now = Date.now();
     const attempts = authAttempts.get(key) || [];
 
@@ -32,6 +71,7 @@ const checkRateLimit = (req, res, next) => {
     const recentAttempts = attempts.filter(time => now - time < RATE_LIMIT_WINDOW);
 
     if (recentAttempts.length >= MAX_ATTEMPTS) {
+        onRejected?.(req);
         return res.status(429).json({
             success: false,
             message: 'Too many attempts. Please try again later.'
@@ -41,6 +81,13 @@ const checkRateLimit = (req, res, next) => {
     recentAttempts.push(now);
     authAttempts.set(key, recentAttempts);
     next();
+};
+
+const loginRateLimitKey = (req) => {
+    const username = req.body?.username;
+    return typeof username === 'string' && username.trim()
+        ? `user:${username.trim().toLowerCase()}`
+        : `ip:${req.ip}`;
 };
 
 // The filter above only prunes stale timestamps out of each key's array —
@@ -56,6 +103,57 @@ setInterval(() => {
     }
 }, RATE_LIMIT_WINDOW).unref();
 
+// Admin-facing view into (and control over) the in-memory rate limit
+// above -- see backend/routes/audit.js's /rate-limits endpoints. Every
+// key is `${keyPrefix}:${path}`, where path always starts with "/" and
+// keyPrefix never contains "/", so splitting on the first ":/" cleanly
+// separates the two regardless of what keyPrefix itself contains.
+function parseRateLimitKey(key) {
+    const splitAt = key.indexOf(':/');
+    if (splitAt === -1) return { keyPrefix: key, path: null };
+    return { keyPrefix: key.slice(0, splitAt), path: key.slice(splitAt + 1) };
+}
+
+// keyPrefix is "user:<username>" (loginRateLimitKey, when a username was
+// submitted), "ip:<ip>" (loginRateLimitKey's own IP fallback), or a bare
+// IP (every other route's default keyFn -- see checkRateLimit above).
+function describeRateLimitIdentity(keyPrefix) {
+    if (keyPrefix.startsWith('user:')) return { type: 'username', value: keyPrefix.slice(5) };
+    if (keyPrefix.startsWith('ip:')) return { type: 'ip', value: keyPrefix.slice(3) };
+    return { type: 'ip', value: keyPrefix };
+}
+
+// Only entries CURRENTLY blocking a request (>= MAX_ATTEMPTS within the
+// window) -- an entry with fewer recent attempts is informational noise
+// for this view, not something an admin needs to act on.
+export function getRateLimitedIdentities() {
+    const now = Date.now();
+    const items = [];
+    for (const [key, attempts] of authAttempts) {
+        const recent = attempts.filter((t) => now - t < RATE_LIMIT_WINDOW);
+        if (recent.length < MAX_ATTEMPTS) continue;
+        const { keyPrefix, path } = parseRateLimitKey(key);
+        const identity = describeRateLimitIdentity(keyPrefix);
+        const oldestAttempt = Math.min(...recent);
+        items.push({
+            key,
+            identityType: identity.type,
+            identityValue: identity.value,
+            path,
+            attemptCount: recent.length,
+            blockedUntil: new Date(oldestAttempt + RATE_LIMIT_WINDOW),
+        });
+    }
+    return items;
+}
+
+// Deletes one key's attempt history outright -- the next request from
+// that identity/path starts a fresh count, immediately lifting the block
+// (rather than just trimming it down to just-under-the-limit).
+export function clearRateLimitKey(key) {
+    return authAttempts.delete(key);
+}
+
 // ======================
 // Signup
 // ======================
@@ -64,7 +162,7 @@ setInterval(() => {
 // account. Not called from the frontend or mobile app (they use users.js's
 // admin-gated POST / instead); require admin auth here too so trusting the
 // body's role is safe the same way it already is there.
-router.post('/signup', checkRateLimit, authenticateToken, authorizeRoles('admin'), async (req, res) => {
+router.post('/signup', checkRateLimit(), authenticateToken, authorizeRoles('admin'), async (req, res) => {
     try {
         const { username, password, email, role, firstName, lastName, assignedEmpNo, assignedStore } = req.body;
 
@@ -116,9 +214,18 @@ router.post('/signup', checkRateLimit, authenticateToken, authorizeRoles('admin'
 // ======================
 // Login
 // ======================
-router.post('/login', checkRateLimit, async (req, res) => {
+router.post('/login', checkRateLimit(loginRateLimitKey, (req) => {
+    recordLoginAudit({
+        username: req.body?.username,
+        userId: null,
+        ip: req.ip,
+        appVersionCode: req.body?.appVersionCode,
+        success: false,
+        failureReason: 'rate_limited',
+    });
+}), async (req, res) => {
     try {
-        const { username, password } = req.body;
+        const { username, password, appVersionCode } = req.body;
 
         // Input validation
         if (!username || !password)
@@ -128,13 +235,60 @@ router.post('/login', checkRateLimit, async (req, res) => {
             return res.status(400).json({ message: 'Invalid input format' });
 
         const user = await User.findOne({ where: { username } });
-        if (!user) return res.status(401).json({ message: 'Invalid username or password' });
-        if (!user.active) return res.status(403).json({ message: 'User is inactive' });
+        if (!user) {
+            recordLoginAudit({ username, userId: null, ip: req.ip, appVersionCode, success: false, failureReason: 'invalid_credentials' });
+            return res.status(401).json({ message: 'Invalid username or password' });
+        }
+        if (!user.active) {
+            recordLoginAudit({ username, userId: user.userId, ip: req.ip, appVersionCode, success: false, failureReason: 'inactive' });
+            return res.status(403).json({ message: 'User is inactive' });
+        }
 
         const valid = await bcrypt.compare(password, user.password);
-        if (!valid) return res.status(401).json({ message: 'Invalid username or password' });
+        if (!valid) {
+            recordLoginAudit({ username, userId: user.userId, ip: req.ip, appVersionCode, success: false, failureReason: 'invalid_credentials' });
+            return res.status(401).json({ message: 'Invalid username or password' });
+        }
 
-        await user.update({ isOnline: true, lastSeenAt: new Date() });
+        // Mobile-only (web's login form never sends appVersionCode, so it's
+        // never affected by this): every build from the one that introduced
+        // this field onward reports its own versionCode on every login
+        // attempt, so a build that's fallen below MIN_SUPPORTED_VERSION_CODE
+        // gets force-blocked before a token is ever issued -- "logged in but
+        // then shown a mandatory update screen" (the HomeScreen gate) still
+        // means the account looks online/active, this instead refuses the
+        // session outright. Recorded regardless of pass/fail, so IT can see
+        // which accounts are still attempting logins from a stale build.
+        // Genuinely old builds that predate this field entirely can't be
+        // caught here at all (they have no code to send it) -- those can
+        // only be reached by directly notifying the person, e.g. via
+        // scripts/notify-all-users-update.js's OS-level push broadcast.
+        if (appVersionCode != null) {
+            await user.update({
+                lastMobileAppVersionCode: appVersionCode,
+                lastMobileAppVersionCheckedAt: new Date(),
+            });
+            if (appVersionCode < MIN_SUPPORTED_VERSION_CODE) {
+                recordLoginAudit({ username, userId: user.userId, ip: req.ip, appVersionCode, success: false, failureReason: 'update_required' });
+                return res.status(426).json({
+                    success: false,
+                    code: 'UPDATE_REQUIRED',
+                    message: 'Your app is out of date. Please update to continue.',
+                    downloadUrl: UPDATE_PAGE_URL,
+                });
+            }
+        }
+
+        // Single-active-session enforcement: bump sessionVersion on every
+        // login and embed it in this token, so any token issued by an
+        // earlier login (still on some other device/tab) stops passing
+        // middleware/auth.js's check as soon as this write lands. Update the
+        // cache immediately -- otherwise the old session would stay valid
+        // until that cache entry's TTL naturally expires.
+        const newSessionVersion = user.sessionVersion + 1;
+        await user.update({ isOnline: true, lastSeenAt: new Date(), sessionVersion: newSessionVersion });
+        setCachedSessionVersion(user.userId, newSessionVersion);
+        recordLoginAudit({ username, userId: user.userId, ip: req.ip, appVersionCode, success: true });
 
         const token = jwt.sign(
             {
@@ -143,6 +297,7 @@ router.post('/login', checkRateLimit, async (req, res) => {
              //   teamId: user.teamId || null,
                 assignedEmpNo: user.assignedEmpNo || null,
                 assignedStore: user.assignedStore ?? null,
+                sessionVersion: newSessionVersion,
             },
             process.env.JWT_SECRET,
             { expiresIn: process.env.JWT_EXPIRES_IN || '8h' }
@@ -207,7 +362,7 @@ router.post('/logout', authenticateToken, async (req, res) => {
 // ======================
 // Change own password
 // ======================
-router.post('/change-password', checkRateLimit, authenticateToken, async (req, res) => {
+router.post('/change-password', checkRateLimit(), authenticateToken, async (req, res) => {
     try {
         const { currentPassword, newPassword } = req.body;
 
