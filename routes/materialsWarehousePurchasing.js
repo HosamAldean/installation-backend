@@ -402,6 +402,94 @@ router.get('/goods-receipts/:id', requireReceive, async (req, res) => {
     res.json({ ...gr.toJSON(), items });
 });
 
+// Sums this PO item's already-received quantity across every prior goods
+// receipt (regardless of QC outcome -- loss/rejected material still
+// physically arrived and counts against what the vendor owes, it just
+// wasn't usable stock). Used both to offer only genuinely outstanding
+// lines below and to stop a fresh receipt from over-receiving one.
+async function getReceivedSoFar(poItemId, transaction) {
+    const rows = await MatWhGoodsReceiptItem.findAll({
+        where: { poItemId },
+        attributes: ['qtyReceived'],
+        transaction,
+    });
+    return rows.reduce((sum, r) => sum + Number(r.qtyReceived), 0);
+}
+
+// GET /goods-receipt-candidates?itemId=X -- the item-first entry point into
+// receiving: a real shipment/cargo from a vendor often bundles several
+// purchase orders together (purchasing routinely combines orders to the
+// same vendor into one delivery), and not every order in it arrives in
+// full. The old flow only let a storekeeper open ONE already-chosen PO and
+// receive against its lines -- there was no way to scan/type an item and
+// see every order it's still owed on. Returns every still-open PO line for
+// this item, across ALL vendors/orders, each annotated with how much has
+// already been received against it so the frontend (and the validation in
+// POST /goods-receipts below) can work off the real outstanding quantity,
+// not the original order qty.
+router.get('/goods-receipt-candidates', requireReceive, async (req, res) => {
+    const itemId = Number(req.query.itemId);
+    if (!itemId) return res.status(400).json({ message: 'itemId is required' });
+
+    const poItems = await MatWhPurchaseOrderItem.findAll({ where: { itemId } });
+    if (poItems.length === 0) return res.json({ items: [] });
+
+    // 'draft' hasn't been sent to the vendor yet (nothing to receive against
+    // it) and 'closed' means this PO is fully done -- everything else
+    // (sent/confirmed/received/invoiced) can still have outstanding qty,
+    // since received/invoiced only mean SOME receipt has happened, not that
+    // every line is fully received (received/invoiced can happen in either
+    // order and repeat, per this module's own status design).
+    const pos = await MatWhPurchaseOrder.findAll({
+        where: { id: poItems.map((i) => i.purchaseOrderId), status: { [Op.notIn]: ['draft', 'closed'] } },
+    });
+    const poById = new Map(pos.map((p) => [p.id, p]));
+
+    const vendorIds = [...new Set(pos.map((p) => p.vendorId).filter(Boolean))];
+    const vendors = vendorIds.length > 0 ? await Vendor.findAll({ where: { vendorId: vendorIds } }) : [];
+    const vendorById = new Map(vendors.map((v) => [v.vendorId, v]));
+
+    const storeIds = [...new Set(pos.map((p) => p.destinationStoreId).filter(Boolean))];
+    const stores = storeIds.length > 0 ? await MatWhStore.findAll({ where: { id: storeIds } }) : [];
+    const storeById = new Map(stores.map((s) => [s.id, s]));
+
+    const receivedRows = await MatWhGoodsReceiptItem.findAll({
+        where: { poItemId: poItems.map((i) => i.id) },
+        attributes: ['poItemId', 'qtyReceived'],
+    });
+    const receivedByPoItem = new Map();
+    for (const r of receivedRows) {
+        receivedByPoItem.set(r.poItemId, (receivedByPoItem.get(r.poItemId) || 0) + Number(r.qtyReceived));
+    }
+
+    const candidates = [];
+    for (const poItem of poItems) {
+        const po = poById.get(poItem.purchaseOrderId);
+        if (!po) continue; // its PO is still draft, or already closed
+        const receivedSoFar = receivedByPoItem.get(poItem.id) || 0;
+        const qtyOutstanding = Number(poItem.qtyOrdered) - receivedSoFar;
+        if (qtyOutstanding <= 0.0001) continue; // fully received already, nothing left to offer
+        candidates.push({
+            poItemId: poItem.id,
+            purchaseOrderId: po.id,
+            poNo: po.poNo,
+            poStatus: po.status,
+            vendorId: po.vendorId,
+            vendorName: vendorById.get(po.vendorId)?.vendorName ?? null,
+            destinationStoreId: po.destinationStoreId,
+            storeName: storeById.get(po.destinationStoreId)?.storeName ?? null,
+            qtyOrdered: poItem.qtyOrdered,
+            receivedSoFar,
+            qtyOutstanding,
+            unitPrice: poItem.unitPrice,
+            color: poItem.color,
+            lengthMm: poItem.lengthMm,
+            neededByDate: poItem.neededByDate,
+        });
+    }
+    res.json({ items: candidates });
+});
+
 // Creates the receipt header + QC'd line items in one call. Cost starts
 // provisional (PO item's unitPrice unless a receipt-time override is
 // given) and stock is considered usable from this moment regardless of
@@ -442,6 +530,26 @@ router.post('/goods-receipts', requireReceive, async (req, res) => {
             const qtyLoss = Number(line.qtyLoss) || 0;
             const qtyRejected = Number(line.qtyRejected) || 0;
             const provisionalUnitCost = line.provisionalUnitCost ?? poItem?.unitPrice ?? null;
+
+            // Never let a fresh receipt push a PO line's total received
+            // quantity past what was actually ordered -- there was no such
+            // check before, so a storekeeper receiving the same PO a second
+            // time (a real, common case: purchasing merges several orders
+            // into one shipment that only partially covers each) had no
+            // guard against silently double-counting an already-received
+            // line back to its full original qtyOrdered.
+            if (poItem) {
+                const receivedSoFar = await getReceivedSoFar(poItem.id, t);
+                const qtyReceivedThis = Number(line.qtyReceived) || 0;
+                if (receivedSoFar + qtyReceivedThis > Number(poItem.qtyOrdered) + 0.0001) {
+                    const err = new Error(
+                        `Item ${line.itemId}: received quantity would exceed the ordered quantity `
+                        + `(ordered ${poItem.qtyOrdered}, already received ${receivedSoFar}, this receipt adds ${qtyReceivedThis})`,
+                    );
+                    err.status = 400;
+                    throw err;
+                }
+            }
 
             const grItem = await MatWhGoodsReceiptItem.create({
                 goodsReceiptId: gr.id,
@@ -486,6 +594,7 @@ router.post('/goods-receipts', requireReceive, async (req, res) => {
         res.status(201).json({ id: gr.id });
     } catch (err) {
         await t.rollback();
+        if (err.status) return res.status(err.status).json({ message: err.message });
         console.error('Error creating goods receipt:', err);
         res.status(500).json({ message: 'Failed to create goods receipt' });
     }
