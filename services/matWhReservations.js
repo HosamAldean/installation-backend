@@ -125,6 +125,7 @@ async function confirmOneLine(line, header, confirmedBy, t) {
         const poItem = await MatWhPurchaseOrderItem.create({
             purchaseOrderId: po.id, itemId: line.itemId,
             qtyOrdered: qtyShortfall, unitPrice: 0, lineAmt: 0,
+            color: line.color, lengthMm: line.lengthMm,
             reservationItemId: line.id, neededByDate: line.itemNeededByDate,
         }, { transaction: t });
         await line.update({ purchaseOrderId: po.id, purchaseOrderItemId: poItem.id }, { transaction: t });
@@ -281,6 +282,7 @@ export async function confirmReservation(headerId, confirmedBy) {
                 const poItem = await MatWhPurchaseOrderItem.create({
                     purchaseOrderId: po.id, itemId: reservationItem.itemId,
                     qtyOrdered: qty, unitPrice: 0, lineAmt: 0,
+                    color: reservationItem.color, lengthMm: reservationItem.lengthMm,
                     reservationItemId: reservationItem.id,
                     neededByDate: reservationItem.itemNeededByDate,
                 }, { transaction: t });
