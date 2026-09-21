@@ -114,6 +114,49 @@ router.get('/purchase-orders/:id', requirePurchaseOrdersReadAccess, async (req, 
     res.json({ ...po.toJSON(), items });
 });
 
+// Shared per-line shape validation -- same rule set the create route and
+// the add-item route below both need (qty positive, price zero-or-
+// positive, length positive-if-given, itemId present). Returns an error
+// message string, or null if the line is well-formed; doesn't check
+// itemId/color against the DB since those need a batched query the
+// caller is better positioned to do once for however many lines it has.
+function validatePoLineShape(line, label) {
+    const qty = Number(line.qtyOrdered);
+    const price = Number(line.unitPrice);
+    if (!line.itemId) return `${label}: itemId is required`;
+    if (!Number.isFinite(qty) || qty <= 0) return `${label}: qtyOrdered must be a positive number`;
+    // unitPrice may legitimately be 0 -- an auto-generated shortfall line
+    // doesn't know a price yet (see the model comment), filled in by hand
+    // later same as any other draft PO line. Only a negative price is
+    // nonsensical.
+    if (!Number.isFinite(price) || price < 0) return `${label}: unitPrice must be zero or a positive number`;
+    if (line.lengthMm != null && line.lengthMm !== '') {
+        const length = Number(line.lengthMm);
+        if (!Number.isFinite(length) || length <= 0) return `${label}: lengthMm must be a positive number`;
+    }
+    return null;
+}
+
+// Same real AL color master the reservation bulk-add endpoint validates
+// against -- a manually-typed/hand-crafted request could otherwise store
+// a color that resolves to nothing on display. Returns true if valid (or
+// not provided at all).
+async function isValidPoLineColor(color) {
+    if (!color) return true;
+    const colorRows = await sequelize2PetraErp.query(
+        `SELECT ci.mixCode, ci.code FROM colorInfo ci
+         JOIN colorType ct ON ct.colorTypeId = ci.colorTypeId
+         WHERE ct.colorTypeName = 'AL'`,
+        { type: sequelize2PetraErp.QueryTypes.SELECT },
+    );
+    const validColorKeys = new Set();
+    for (const c of colorRows) {
+        if (c.mixCode) validColorKeys.add(c.mixCode.trim().toUpperCase());
+        if (c.code) validColorKeys.add(c.code.trim().toUpperCase());
+    }
+    return validColorKeys.has(String(color).trim().toUpperCase());
+}
+
 router.post('/purchase-orders', requirePurchaseOrders, async (req, res) => {
     const {
         poNo, vendorId, destinationStoreId, isLC, eta, port, shipTerms, freightExpense, items,
@@ -137,27 +180,8 @@ router.post('/purchase-orders', requirePurchaseOrders, async (req, res) => {
     // the reservation grid's own "-1" case) or a bogus itemId shouldn't
     // silently create a PO line pointing at nothing / worth nothing.
     for (const [idx, line] of lineItems.entries()) {
-        const qty = Number(line.qtyOrdered);
-        const price = Number(line.unitPrice);
-        if (!line.itemId) {
-            return res.status(400).json({ message: `Line ${idx + 1}: itemId is required` });
-        }
-        if (!Number.isFinite(qty) || qty <= 0) {
-            return res.status(400).json({ message: `Line ${idx + 1}: qtyOrdered must be a positive number` });
-        }
-        // unitPrice may legitimately be 0 -- an auto-generated shortfall
-        // line doesn't know a price yet (see the model comment), filled
-        // in by hand later same as any other draft PO line. Only a
-        // negative price is nonsensical.
-        if (!Number.isFinite(price) || price < 0) {
-            return res.status(400).json({ message: `Line ${idx + 1}: unitPrice must be zero or a positive number` });
-        }
-        if (line.lengthMm != null && line.lengthMm !== '') {
-            const length = Number(line.lengthMm);
-            if (!Number.isFinite(length) || length <= 0) {
-                return res.status(400).json({ message: `Line ${idx + 1}: lengthMm must be a positive number` });
-            }
-        }
+        const err = validatePoLineShape(line, `Line ${idx + 1}`);
+        if (err) return res.status(400).json({ message: err });
     }
 
     const vendor = await Vendor.findByPk(vendorId);
@@ -173,26 +197,9 @@ router.post('/purchase-orders', requirePurchaseOrders, async (req, res) => {
         return res.status(400).json({ message: `Unknown item id(s): ${missing.join(', ')}` });
     }
 
-    // Same real AL color master the reservation bulk-add endpoint
-    // validates against -- a manually-typed/hand-crafted request could
-    // otherwise store a color that resolves to nothing on display.
-    const colorLines = lineItems.filter((l) => l.color);
-    if (colorLines.length > 0) {
-        const colorRows = await sequelize2PetraErp.query(
-            `SELECT ci.mixCode, ci.code FROM colorInfo ci
-             JOIN colorType ct ON ct.colorTypeId = ci.colorTypeId
-             WHERE ct.colorTypeName = 'AL'`,
-            { type: sequelize2PetraErp.QueryTypes.SELECT },
-        );
-        const validColorKeys = new Set();
-        for (const c of colorRows) {
-            if (c.mixCode) validColorKeys.add(c.mixCode.trim().toUpperCase());
-            if (c.code) validColorKeys.add(c.code.trim().toUpperCase());
-        }
-        for (const line of colorLines) {
-            if (!validColorKeys.has(String(line.color).trim().toUpperCase())) {
-                return res.status(400).json({ message: `Unrecognized color: ${line.color}` });
-            }
+    for (const line of lineItems) {
+        if (line.color && !(await isValidPoLineColor(line.color))) {
+            return res.status(400).json({ message: `Unrecognized color: ${line.color}` });
         }
     }
 
@@ -229,6 +236,53 @@ router.post('/purchase-orders', requirePurchaseOrders, async (req, res) => {
         }
         console.error('Error creating purchase order:', err);
         res.status(500).json({ message: 'Failed to create purchase order' });
+    }
+});
+
+// Adds one line item to an EXISTING purchase order -- the one gap this
+// module had against Reservations, which already support adding a line to
+// an existing draft header. Only ever allowed while the PO is still
+// 'draft' (once sent/confirmed/etc, its lines are what a vendor has
+// already acknowledged against); same permission and per-line validation
+// as the create route above (factored into validatePoLineShape/
+// isValidPoLineColor so the two stay in lockstep rather than drifting).
+router.post('/purchase-orders/:id/items', requirePurchaseOrders, async (req, res) => {
+    const po = await MatWhPurchaseOrder.findByPk(req.params.id);
+    if (!po) return res.status(404).json({ message: 'Not found' });
+    if (po.status !== 'draft') {
+        return res.status(409).json({ message: `Cannot add items to a PO in status '${po.status}'` });
+    }
+
+    const { itemId, qtyOrdered, unitPrice, color, lengthMm } = req.body;
+    const shapeErr = validatePoLineShape(req.body, 'Item');
+    if (shapeErr) return res.status(400).json({ message: shapeErr });
+
+    const item = await MatWhItem.findByPk(itemId);
+    if (!item) return res.status(400).json({ message: `Unknown item id: ${itemId}` });
+
+    if (color && !(await isValidPoLineColor(color))) {
+        return res.status(400).json({ message: `Unrecognized color: ${color}` });
+    }
+
+    const t = await sequelizeUtf8.transaction();
+    try {
+        const lineAmt = Number(qtyOrdered) * Number(unitPrice);
+        const line = await MatWhPurchaseOrderItem.create({
+            purchaseOrderId: po.id,
+            itemId,
+            qtyOrdered,
+            unitPrice,
+            lineAmt,
+            color: color || null,
+            lengthMm: lengthMm ?? null,
+        }, { transaction: t });
+        await po.update({ netAmt: Number(po.netAmt || 0) + lineAmt }, { transaction: t });
+        await t.commit();
+        res.status(201).json(line);
+    } catch (err) {
+        await t.rollback();
+        console.error('Error adding purchase order item:', err);
+        res.status(500).json({ message: 'Failed to add item' });
     }
 });
 
