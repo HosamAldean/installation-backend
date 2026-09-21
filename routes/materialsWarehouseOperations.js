@@ -601,6 +601,69 @@ router.post('/reservations/:id/items/:lineId/issue', requireIssue, async (req, r
     }
 });
 
+// GET /issue-candidates?itemId=X -- the item-first entry point into
+// issuing, mirroring goods-receipt-candidates' reasoning on the receiving
+// side (materialsWarehousePurchasing.js): a storekeeper who knows the item
+// shouldn't have to open every reservation individually to find which ones
+// are waiting on it. Returns every confirmed/partially-confirmed line for
+// this item, across ALL reservations, still awaiting its physical hand-
+// over (WM 10-22) -- an item can easily have more than one, e.g. two
+// different projects both confirmed against the same item.
+router.get('/issue-candidates', requireIssue, async (req, res) => {
+    const itemId = Number(req.query.itemId);
+    if (!itemId) return res.status(400).json({ message: 'itemId is required' });
+
+    const lines = await MatWhReservationItem.findAll({
+        where: {
+            itemId,
+            status: { [Op.in]: ['confirmed', 'partially_confirmed'] },
+            qtyReserved: { [Op.gt]: 0 },
+        },
+    });
+    if (lines.length === 0) return res.json({ items: [] });
+
+    const headerIds = [...new Set(lines.map((l) => l.reservationHeaderId))];
+    const headers = await MatWhReservationHeader.findAll({ where: { id: headerIds } });
+    const headerById = new Map(headers.map((h) => [h.id, h]));
+
+    const storeIds = [...new Set(lines.map((l) => l.storeId))];
+    const stores = storeIds.length > 0 ? await MatWhStore.findAll({ where: { id: storeIds } }) : [];
+    const storeById = new Map(stores.map((s) => [s.id, s]));
+
+    const candidates = lines.map((l) => {
+        const header = headerById.get(l.reservationHeaderId);
+        return {
+            lineId: l.id,
+            reservationHeaderId: l.reservationHeaderId,
+            reservationNo: header?.reservationNo ?? null,
+            projectName: header?.projectName ?? null,
+            requestedByName: header?.requestedByName ?? null,
+            storeId: l.storeId,
+            storeName: storeById.get(l.storeId)?.storeName ?? null,
+            qtyReserved: l.qtyReserved,
+            status: l.status,
+            color: l.color,
+            lengthMm: l.lengthMm,
+        };
+    });
+    res.json({ items: candidates });
+});
+
+// Same action as the route above, reachable directly by line id -- the
+// item-first Issue by Item page doesn't know (and shouldn't need to look
+// up) which reservation a candidate line belongs to just to issue it;
+// issueReservationLine itself only ever needed the line id anyway.
+router.post('/reservation-items/:lineId/issue', requireIssue, async (req, res) => {
+    try {
+        const result = await issueReservationLine(
+            Number(req.params.lineId), req.user.userId, req.body?.issuedBarcode,
+        );
+        res.json(result);
+    } catch (err) {
+        res.status(err.status || 500).json({ message: err.message || 'Failed to issue line' });
+    }
+});
+
 // Releases every held line on a confirmed reservation -- e.g. the project
 // no longer needs the material. Lines already covered by an auto-PO keep
 // that PO (canceling a purchase already raised is a separate, explicit
