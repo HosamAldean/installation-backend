@@ -30,6 +30,7 @@ import { MatWhStockLedger } from '../models/MatWhStockLedger.js';
 import { MatWhItem } from '../models/MatWhItem.js';
 import { MatWhStore } from '../models/MatWhStore.js';
 import { Vendor } from '../models/Vendor.js';
+import { User } from '../models/User.js';
 import { postLedgerMovement, applyReceiptCost } from '../services/matWhLedger.js';
 
 const router = express.Router();
@@ -378,7 +379,23 @@ router.get('/goods-receipts', requireReceive, async (req, res) => {
     if (req.query.purchaseOrderId) where.purchaseOrderId = req.query.purchaseOrderId;
     if (req.query.invoiceStatus) where.invoiceStatus = req.query.invoiceStatus;
     const rows = await MatWhGoodsReceipt.findAll({ where, order: [['id', 'DESC']] });
-    res.json({ items: rows });
+
+    // receivedBy/qcCheckedBy are plain userIds -- resolved to a display name
+    // here so no page has to do its own separate user lookup just to show
+    // who actually received a shipment (the Receive-by-Item page's own
+    // per-order history section needs this; the existing PurchaseOrderDetail
+    // receipts list gets it for free too).
+    const userIds = [...new Set([...rows.map((r) => r.receivedBy), ...rows.map((r) => r.qcCheckedBy)].filter(Boolean))];
+    const users = userIds.length > 0 ? await User.findAll({ where: { userId: userIds }, attributes: ['userId', 'firstName', 'lastName'] }) : [];
+    const nameById = new Map(users.map((u) => [u.userId, `${u.firstName || ''} ${u.lastName || ''}`.trim() || null]));
+
+    res.json({
+        items: rows.map((r) => ({
+            ...r.toJSON(),
+            receivedByName: nameById.get(r.receivedBy) ?? null,
+            qcCheckedByName: nameById.get(r.qcCheckedBy) ?? null,
+        })),
+    });
 });
 
 // Every receipt still 'pending' more than 7 days after receivedDate --
@@ -416,23 +433,40 @@ async function getReceivedSoFar(poItemId, transaction) {
     return rows.reduce((sum, r) => sum + Number(r.qtyReceived), 0);
 }
 
-// GET /goods-receipt-candidates?itemId=X -- the item-first entry point into
-// receiving: a real shipment/cargo from a vendor often bundles several
-// purchase orders together (purchasing routinely combines orders to the
-// same vendor into one delivery), and not every order in it arrives in
-// full. The old flow only let a storekeeper open ONE already-chosen PO and
-// receive against its lines -- there was no way to scan/type an item and
-// see every order it's still owed on. Returns every still-open PO line for
-// this item, across ALL vendors/orders, each annotated with how much has
-// already been received against it so the frontend (and the validation in
+// GET /goods-receipt-candidates?itemId=X or ?poNo=Y -- two entry points into
+// the same receiving flow. itemId (item-first): a real shipment/cargo from
+// a vendor often bundles several purchase orders together (purchasing
+// routinely combines orders to the same vendor into one delivery), and not
+// every order in it arrives in full -- returns every still-open PO line for
+// ONE item, across ALL vendors/orders. poNo (order-first): a storekeeper who
+// already knows the order number instead wants every item on THAT one order
+// at once, to receive several of them together in one pass rather than
+// looking each one up by item code separately -- returns every still-open
+// line on that one PO, across all its (possibly several different) items.
+// Either way, each line is annotated with how much has already been
+// received against it so the frontend (and the validation in
 // POST /goods-receipts below) can work off the real outstanding quantity,
 // not the original order qty.
 router.get('/goods-receipt-candidates', requireReceive, async (req, res) => {
-    const itemId = Number(req.query.itemId);
-    if (!itemId) return res.status(400).json({ message: 'itemId is required' });
+    const itemId = req.query.itemId ? Number(req.query.itemId) : null;
+    const poNo = req.query.poNo ? String(req.query.poNo).trim() : null;
+    if (!itemId && !poNo) {
+        return res.status(400).json({ message: 'itemId or poNo is required' });
+    }
 
-    const poItems = await MatWhPurchaseOrderItem.findAll({ where: { itemId } });
-    if (poItems.length === 0) return res.json({ items: [] });
+    let poItems;
+    let matchedPo = null;
+    if (poNo) {
+        matchedPo = await MatWhPurchaseOrder.findOne({ where: { poNo } });
+        if (!matchedPo) return res.json({ items: [], poFound: false });
+        poItems = await MatWhPurchaseOrderItem.findAll({ where: { purchaseOrderId: matchedPo.id } });
+    } else {
+        poItems = await MatWhPurchaseOrderItem.findAll({ where: { itemId } });
+    }
+    // matchedPo is only ever set in poNo mode -- lets the frontend show that
+    // one order's info/history even when it has nothing left outstanding.
+    const matchedPoInfo = matchedPo ? { id: matchedPo.id, poNo: matchedPo.poNo, status: matchedPo.status } : null;
+    if (poItems.length === 0) return res.json({ items: [], poFound: true, po: matchedPoInfo });
 
     // 'draft' hasn't been sent to the vendor yet (nothing to receive against
     // it) and 'closed' means this PO is fully done -- everything else
@@ -453,6 +487,12 @@ router.get('/goods-receipt-candidates', requireReceive, async (req, res) => {
     const stores = storeIds.length > 0 ? await MatWhStore.findAll({ where: { id: storeIds } }) : [];
     const storeById = new Map(stores.map((s) => [s.id, s]));
 
+    // Only needed in poNo mode -- itemId mode already has the one item this
+    // whole result set is about, resolved by the caller.
+    const itemIds = [...new Set(poItems.map((i) => i.itemId))];
+    const items = await MatWhItem.findAll({ where: { id: itemIds } });
+    const itemById = new Map(items.map((i) => [i.id, i]));
+
     const receivedRows = await MatWhGoodsReceiptItem.findAll({
         where: { poItemId: poItems.map((i) => i.id) },
         attributes: ['poItemId', 'qtyReceived'],
@@ -469,6 +509,7 @@ router.get('/goods-receipt-candidates', requireReceive, async (req, res) => {
         const receivedSoFar = receivedByPoItem.get(poItem.id) || 0;
         const qtyOutstanding = Number(poItem.qtyOrdered) - receivedSoFar;
         if (qtyOutstanding <= 0.0001) continue; // fully received already, nothing left to offer
+        const item = itemById.get(poItem.itemId);
         candidates.push({
             poItemId: poItem.id,
             purchaseOrderId: po.id,
@@ -478,6 +519,9 @@ router.get('/goods-receipt-candidates', requireReceive, async (req, res) => {
             vendorName: vendorById.get(po.vendorId)?.vendorName ?? null,
             destinationStoreId: po.destinationStoreId,
             storeName: storeById.get(po.destinationStoreId)?.storeName ?? null,
+            itemId: poItem.itemId,
+            itemCode: item?.itemCode ?? null,
+            itemName: item?.itemName ?? null,
             qtyOrdered: poItem.qtyOrdered,
             receivedSoFar,
             qtyOutstanding,
@@ -487,7 +531,7 @@ router.get('/goods-receipt-candidates', requireReceive, async (req, res) => {
             neededByDate: poItem.neededByDate,
         });
     }
-    res.json({ items: candidates });
+    res.json({ items: candidates, poFound: true, po: matchedPoInfo });
 });
 
 // Creates the receipt header + QC'd line items in one call. Cost starts
