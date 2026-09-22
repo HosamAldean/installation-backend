@@ -242,18 +242,65 @@ router.get('/items/:id/stores', async (req, res) => {
     const item = await MatWhItem.findByPk(req.params.id);
     if (!item) return res.status(404).json({ message: 'Item not found' });
     const rows = await MatWhItemStore.findAll({ where: { itemId: item.id } });
-    res.json({ storeIds: rows.map((r) => r.storeId) });
+    res.json({
+        storeIds: rows.map((r) => r.storeId),
+        // Per-store general location (WH gap #9) -- keyed by storeId so the
+        // frontend can seed its per-row inputs without a second round trip.
+        stores: rows.map((r) => ({
+            storeId: r.storeId, zone: r.zone, locationColumn: r.locationColumn, locationRow: r.locationRow,
+        })),
+    });
 });
 
+// Replace-the-whole-set semantics for MEMBERSHIP (which stores this item is
+// in), but a real diff underneath -- NOT the old destroy-then-recreate.
+// That would have silently wiped every store's zone/locationColumn/
+// locationRow on every save, even a single unrelated checkbox toggle,
+// once this route started carrying location data too. Only rows for
+// deselected stores are destroyed (their location goes with them, by
+// direct decision -- unchecking a store means "not kept there" and its
+// location note stops meaning anything); only rows for newly-selected
+// stores are created; a store that stays checked is updated in place
+// (picks up any location edit) rather than being touched at all.
 router.put('/items/:id/stores', async (req, res) => {
     const item = await MatWhItem.findByPk(req.params.id);
     if (!item) return res.status(404).json({ message: 'Item not found' });
-    const storeIds = Array.isArray(req.body?.storeIds) ? req.body.storeIds.map(Number).filter(Boolean) : [];
-    await MatWhItemStore.destroy({ where: { itemId: item.id } });
-    for (const storeId of storeIds) {
-        await MatWhItemStore.create({ itemId: item.id, storeId });
+    const incoming = Array.isArray(req.body?.stores) ? req.body.stores : [];
+    const submitted = new Map(
+        incoming
+            .map((s) => ({
+                storeId: Number(s?.storeId),
+                zone: s?.zone ? String(s.zone).trim() || null : null,
+                locationColumn: s?.locationColumn ? String(s.locationColumn).trim() || null : null,
+                locationRow: s?.locationRow ? String(s.locationRow).trim() || null : null,
+            }))
+            .filter((s) => s.storeId)
+            .map((s) => [s.storeId, s]),
+    );
+
+    const existing = await MatWhItemStore.findAll({ where: { itemId: item.id } });
+    const existingByStoreId = new Map(existing.map((r) => [r.storeId, r]));
+
+    const toRemove = existing.filter((r) => !submitted.has(r.storeId));
+    if (toRemove.length > 0) {
+        await MatWhItemStore.destroy({ where: { itemId: item.id, storeId: toRemove.map((r) => r.storeId) } });
     }
-    res.json({ storeIds });
+    for (const [storeId, s] of submitted) {
+        const row = existingByStoreId.get(storeId);
+        if (row) {
+            await row.update({ zone: s.zone, locationColumn: s.locationColumn, locationRow: s.locationRow });
+        } else {
+            await MatWhItemStore.create({ itemId: item.id, storeId, zone: s.zone, locationColumn: s.locationColumn, locationRow: s.locationRow });
+        }
+    }
+
+    const rows = await MatWhItemStore.findAll({ where: { itemId: item.id } });
+    res.json({
+        storeIds: rows.map((r) => r.storeId),
+        stores: rows.map((r) => ({
+            storeId: r.storeId, zone: r.zone, locationColumn: r.locationColumn, locationRow: r.locationRow,
+        })),
+    });
 });
 
 export default router;

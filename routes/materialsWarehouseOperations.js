@@ -18,6 +18,7 @@ import { MatWhStore } from '../models/MatWhStore.js';
 import { MatWhItemStore } from '../models/MatWhItemStore.js';
 import { MatWhFeasibilityCheck } from '../models/MatWhFeasibilityCheck.js';
 import { MatWhExternalProcessing } from '../models/MatWhExternalProcessing.js';
+import { MatWhPurchaseOrder } from '../models/MatWhPurchaseOrder.js';
 import { MatWhPurchaseOrderItem } from '../models/MatWhPurchaseOrderItem.js';
 import { MatWhStockLedger } from '../models/MatWhStockLedger.js';
 import { postLedgerMovement, getAvailableToReserve, getAlreadyReserved, getPendingQty, getPhysicalBalance } from '../services/matWhLedger.js';
@@ -79,14 +80,21 @@ router.get('/stock-balance', requireAnyOf(
     // actually knows the color (ReservationDetail.tsx's ALM line entry)
     // passes one.
     const color = req.query.color || undefined;
-    const [physicalBalance, alreadyReserved, pendingQty] = await Promise.all([
+    const [physicalBalance, alreadyReserved, pendingQty, itemStore] = await Promise.all([
         getPhysicalBalance(storeId, itemId, color),
         getAlreadyReserved(storeId, itemId, excludeLineId, color),
         getPendingQty(storeId, itemId, excludeLineId, color),
+        MatWhItemStore.findOne({ where: { storeId, itemId } }),
     ]);
     res.json({
         storeId, itemId, color: color ?? null, physicalBalance, alreadyReserved, pendingQty,
         availableToReserve: physicalBalance - alreadyReserved,
+        // General location of this item's pooled stock in this store (WH
+        // gap #9) -- null when never recorded, same as no location data
+        // existing at all.
+        zone: itemStore?.zone ?? null,
+        locationColumn: itemStore?.locationColumn ?? null,
+        locationRow: itemStore?.locationRow ?? null,
     });
 });
 
@@ -715,7 +723,7 @@ router.post('/reservations/:id/items/:lineId/issue', requireIssue, async (req, r
     });
     if (!line) return res.status(404).json({ message: 'Line not found' });
     try {
-        const result = await issueReservationLine(line.id, req.user.userId, req.body?.issuedBarcode);
+        const result = await issueReservationLine(line.id, req.user.userId, req.body?.issuedBarcode, req.body?.issuePurpose);
         res.json(result);
     } catch (err) {
         res.status(err.status || 500).json({ message: err.message || 'Failed to issue line' });
@@ -751,8 +759,26 @@ router.get('/issue-candidates', requireIssue, async (req, res) => {
     const stores = storeIds.length > 0 ? await MatWhStore.findAll({ where: { id: storeIds } }) : [];
     const storeById = new Map(stores.map((s) => [s.id, s]));
 
+    // Where this item's pooled stock is generally kept in each candidate
+    // store (WH gap #9) -- lets the storekeeper see where to go before
+    // committing to issue.
+    const itemStores = storeIds.length > 0
+        ? await MatWhItemStore.findAll({ where: { itemId, storeId: storeIds } })
+        : [];
+    const itemStoreByStoreId = new Map(itemStores.map((s) => [s.storeId, s]));
+
+    // A line's own shortfall auto-PO (WH gap #4b) -- can't be a real
+    // physical trace (the ledger is pooled, not lot-tracked -- see
+    // services/matWhLedger.js), so this is surfaced as informational
+    // context only: "this line's shortfall was covered by PO #X", not a
+    // claim that the exact units being issued came from it.
+    const poIds = [...new Set(lines.map((l) => l.purchaseOrderId).filter(Boolean))];
+    const pos = poIds.length > 0 ? await MatWhPurchaseOrder.findAll({ where: { id: poIds } }) : [];
+    const poById = new Map(pos.map((p) => [p.id, p]));
+
     const candidates = lines.map((l) => {
         const header = headerById.get(l.reservationHeaderId);
+        const itemStore = itemStoreByStoreId.get(l.storeId);
         return {
             lineId: l.id,
             reservationHeaderId: l.reservationHeaderId,
@@ -761,10 +787,15 @@ router.get('/issue-candidates', requireIssue, async (req, res) => {
             requestedByName: header?.requestedByName ?? null,
             storeId: l.storeId,
             storeName: storeById.get(l.storeId)?.storeName ?? null,
+            zone: itemStore?.zone ?? null,
+            locationColumn: itemStore?.locationColumn ?? null,
+            locationRow: itemStore?.locationRow ?? null,
             qtyReserved: l.qtyReserved,
             status: l.status,
             color: l.color,
             lengthMm: l.lengthMm,
+            purchaseOrderId: l.purchaseOrderId,
+            purchaseOrderNo: l.purchaseOrderId ? (poById.get(l.purchaseOrderId)?.poNo ?? null) : null,
         };
     });
     res.json({ items: candidates });
@@ -777,7 +808,7 @@ router.get('/issue-candidates', requireIssue, async (req, res) => {
 router.post('/reservation-items/:lineId/issue', requireIssue, async (req, res) => {
     try {
         const result = await issueReservationLine(
-            Number(req.params.lineId), req.user.userId, req.body?.issuedBarcode,
+            Number(req.params.lineId), req.user.userId, req.body?.issuedBarcode, req.body?.issuePurpose,
         );
         res.json(result);
     } catch (err) {

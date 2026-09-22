@@ -376,7 +376,9 @@ export async function rejectReservation(headerId, rejectedBy, reason) {
 // qtyReserved amount ever leaves; a line's own shortfall (covered by its
 // auto-PO, if any) is a separate goods-receipt event later, not part of
 // this line's issue.
-export async function issueReservationLine(lineId, issuedBy, issuedBarcode) {
+const ISSUE_PURPOSES = ['factory_production', 'general_purpose'];
+
+export async function issueReservationLine(lineId, issuedBy, issuedBarcode, issuePurpose) {
     const line = await MatWhReservationItem.findByPk(lineId);
     if (!line) {
         const err = new Error('Reservation line not found');
@@ -393,6 +395,11 @@ export async function issueReservationLine(lineId, issuedBy, issuedBarcode) {
         err.status = 409;
         throw err;
     }
+    if (!ISSUE_PURPOSES.includes(issuePurpose)) {
+        const err = new Error(`issuePurpose is required and must be one of: ${ISSUE_PURPOSES.join(', ')}`);
+        err.status = 400;
+        throw err;
+    }
 
     const header = await MatWhReservationHeader.findByPk(line.reservationHeaderId);
 
@@ -407,7 +414,7 @@ export async function issueReservationLine(lineId, issuedBy, issuedBarcode) {
 
         await line.update({
             status: 'issued', issuedBy, issuedDate: new Date(),
-            issuedBarcode: issuedBarcode || null,
+            issuedBarcode: issuedBarcode || null, issuePurpose,
         }, { transaction: t });
 
         const siblingLines = await MatWhReservationItem.findAll({

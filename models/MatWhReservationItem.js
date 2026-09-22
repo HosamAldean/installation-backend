@@ -64,6 +64,13 @@ export const MatWhReservationItem = sequelizeUtf8.define('MatWhReservationItem',
     // abandoned -- see MatWhItem.js), so this is a factual record of what
     // was handed over, not a checked reference.
     issuedBarcode: { type: DataTypes.STRING(50), allowNull: true },
+    // Why the material is being handed over -- 'factory_production' or
+    // 'general_purpose', the two values named in the audit this field
+    // closes (WH gap #4a). Not a DB enum, same convention as status/
+    // docType elsewhere in this module -- required at the route level
+    // (issueReservationLine), not just optional metadata, same treatment
+    // as rejectionReason below.
+    issuePurpose: { type: DataTypes.STRING(20), allowNull: true },
     releasedDate: { type: DataTypes.DATE, allowNull: true },
     // Set only when this line's store rejects it (WM 10-21) -- reason is
     // required at the route level, not just optional metadata.
