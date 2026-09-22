@@ -24,20 +24,20 @@
 // orderNo 322633 serialNo 33 -> barcode 26263333.
 import express from "express";
 import { getSqlPool, withSqlRetry } from "../config/db.js";
-import { authenticateToken, authorizeReadWrite } from "../middleware/auth.js";
+import { authenticateToken } from "../middleware/auth.js";
+import { requirePermission } from "../middleware/permissions.js";
+import { PERMISSIONS } from "../constants/permissions.js";
 import { User } from "../models/User.js";
 
 const router = express.Router();
 
-// Production order intake sits upstream of installation tracking. Now
-// owned by the dedicated "production" role (added once the taxonomy gap
-// noted below was actually revisited) -- installation_manager keeps
-// view-only access since they still need visibility into it, but edit
-// actions (POST/PUT) are production/admin only.
-router.use(authenticateToken, authorizeReadWrite(
-    ["installation_manager", "production", "admin"],
-    ["production", "admin"],
-));
+// Production order intake sits upstream of installation tracking. Grain
+// matches the old authorizeReadWrite split's superset (view roles already
+// included everyone who could edit) -- one key covers both tiers, per
+// this codebase's "one key per page" convention. installation_manager/
+// production/admin were the only roles with any access before; seeded to
+// match exactly.
+router.use(authenticateToken, requirePermission(PERMISSIONS.INSTALLATION_PRODUCTION_ORDERS));
 
 function buildBarcode(orderNo, serialNo) {
     const yy = String(new Date().getFullYear()).slice(-2);
@@ -1155,7 +1155,27 @@ router.post("/:orderNo/units/:serialNo/progress/:stage", async (req, res) => {
 // unaffected by that lock): Cuting="القص" (cutting), Colcting="الجمع"
 // (collecting/assembly — a different word from Iron's own ProcessI.Colcting,
 // which is "التجهيز"/preparation; don't assume the two modules mean the same
-// thing despite the shared column name). note="ملاحظات خلال عملية الانتاج"
+// thing despite the shared column name).
+//
+// CORRECTED: Cuting and Colcting are NOT both booleans. Design-view COM
+// inspection of the two controls' actual properties (not just captions)
+// shows Cuting is bound to a real checkbox (ControlType 106, "Check34") —
+// genuinely boolean, correctly kept as one — but Colcting is bound to a
+// plain textbox (ControlType 109) with Format=Percent, DefaultValue=0,
+// DecimalPlaces=0: a free-entry percent value, same idea as OrderCH's
+// cuttingPct/collectingPct fields elsewhere in this file. Live schema
+// confirms it: dbo.Process.Colcting is `float`, not the `int` Cuting is,
+// and 468 of 57,549 live rows already hold genuine fractional values
+// (0.14, 0.6, 0.8333..., etc.) — a prior version of this endpoint coerced
+// every save to a hard 0/1, silently flattening any partial-completion
+// value the instant a web user touched that unit's status, and skewing
+// OrderCH.Expr1 (=AVG(Process.Colcting), the "Collecting %" column the
+// Order Check tab already shows) toward "fraction of units fully done"
+// instead of a true completion average. colcting is stored and returned
+// here as the same raw 0-1 fraction the DB and OrderCH.Expr1 use — the
+// frontend converts to/from a 0-100 percent input, matching how
+// cuttingPct/collectingPct are already displayed on the Order Check tab.
+// note="ملاحظات خلال عملية الانتاج"
 // (notes during the production process). DateFinsh/finaldate map to two
 // distinct captions — "تارخ الانجاز" (completion date) and "موعد الانتهاء"
 // (finish appointment/target date) respectively — inferred pairing (not
@@ -1183,7 +1203,7 @@ router.get("/:orderNo/units/:serialNo/process", async (req, res) => {
             success: true,
             status: {
                 cuting: row ? !!row.Cuting : false,
-                colcting: row ? !!row.Colcting : false,
+                colcting: row && row.Colcting != null ? row.Colcting : 0,
                 date: row ? row.Date : null,
                 note: row ? row.note : null,
                 completionDate: row ? row.DateFinsh : null,
@@ -1204,9 +1224,13 @@ router.post("/:orderNo/units/:serialNo/process", async (req, res) => {
     }
     const { cuting, colcting, note, completionDate, targetDate } = req.body;
 
+    const colctingVal = colcting === undefined || colcting === null || colcting === "" ? 0 : parseFloat(colcting);
+    if (!Number.isFinite(colctingVal) || colctingVal < 0) {
+        return res.status(400).json({ success: false, message: "colcting must be a non-negative number" });
+    }
+
     try {
         const cutingVal = cuting ? 1 : 0;
-        const colctingVal = colcting ? 1 : 0;
 
         // Fully idempotent (sets absolute values, no increment) so safe to
         // retry the whole existing-check + update-or-insert as one block.
@@ -1446,33 +1470,57 @@ router.post("/:orderNo/department-log/:dept", async (req, res) => {
 // (oderDate and dateFinsh printed side by side for a human to eyeball),
 // not from a real computed field. This is the first time it's actually
 // been calculated.
+// dateFrom/dateTo/onlyFinished cover the legacy "ReportFinsh" completion
+// report (COM-inspected: a print report over orderNo/oderDate/projNo/
+// projName/ProdctionDate/ProdctionNO/dateFinsh, RecordSource blank in the
+// current file copy and Proj has zero VBA anywhere to set it dynamically —
+// confirmed via VBComponents.Count === 0). Rather than stand up a second,
+// parallel endpoint that duplicates this one field-for-field, this is the
+// same data: dbo.OrderCH already exposes every one of those fields (plus
+// cutting/collecting % and turnaround) and already covers all 13,535 live
+// orders 1:1 (confirmed: OrderCH row count === dbo.orders row count). The
+// actual gap was just that this endpoint had no way to scope to "finished,
+// within a date range" — exactly what the legacy report's whole purpose was.
 router.get("/order-check", async (req, res) => {
     try {
         const search = String(req.query.search || "").trim();
+        const dateFrom = String(req.query.dateFrom || "").trim();
+        const dateTo = String(req.query.dateTo || "").trim();
+        const onlyFinished = req.query.onlyFinished === "true" || Boolean(dateFrom) || Boolean(dateTo);
         const page = Math.max(1, parseInt(req.query.page, 10) || 1);
         const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 25));
         const offset = (page - 1) * pageSize;
 
         const pool = await getSqlPool("proj");
-        const whereClause = search ? "WHERE projNo LIKE @search OR projName LIKE @search" : "";
+        const conditions = [];
+        if (search) conditions.push("(projNo LIKE @search OR projName LIKE @search)");
+        if (onlyFinished) conditions.push("dateFinsh IS NOT NULL");
+        if (dateFrom) conditions.push("dateFinsh >= @dateFrom");
+        if (dateTo) conditions.push("dateFinsh <= @dateTo");
+        const whereClause = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
 
-        const countRequest = pool.request();
-        if (search) countRequest.input("search", `%${search}%`);
-        const countResult = await countRequest.query(`SELECT COUNT(*) AS total FROM dbo.OrderCH ${whereClause}`);
+        const bindParams = (request) => {
+            if (search) request.input("search", `%${search}%`);
+            if (dateFrom) request.input("dateFrom", dateFrom);
+            if (dateTo) request.input("dateTo", dateTo);
+            return request;
+        };
+
+        const countResult = await bindParams(pool.request()).query(`SELECT COUNT(*) AS total FROM dbo.OrderCH ${whereClause}`);
         const total = countResult.recordset[0].total;
 
-        const avgRequest = pool.request();
-        if (search) avgRequest.input("search", `%${search}%`);
-        const avgResult = await avgRequest.query(`
+        const avgWhereClause = conditions.length
+            ? `${whereClause} AND dateFinsh IS NOT NULL AND dateFinsh >= oderDate`
+            : "WHERE dateFinsh IS NOT NULL AND dateFinsh >= oderDate";
+        const avgResult = await bindParams(pool.request()).query(`
             SELECT AVG(CAST(DATEDIFF(day, oderDate, dateFinsh) AS float)) AS avgTurnaroundDays
             FROM dbo.OrderCH
-            ${whereClause ? `${whereClause} AND` : "WHERE"} dateFinsh IS NOT NULL AND dateFinsh >= oderDate
+            ${avgWhereClause}
         `);
         const avgTurnaroundDays = avgResult.recordset[0].avgTurnaroundDays;
 
-        const listRequest = pool.request();
+        const listRequest = bindParams(pool.request());
         listRequest.input("offset", offset).input("pageSize", pageSize);
-        if (search) listRequest.input("search", `%${search}%`);
         // LEFT JOIN dbo.x1 pulls in the Place/Note fields the legacy
         // QSendOrdersCR/CR2 dispatch-slip report showed alongside cutting/
         // collecting % — x1.Note/OrederPlace/Place1/Place2 already exist and
@@ -1621,6 +1669,65 @@ router.put("/appointments-schedule/:projNo/:productionNo", async (req, res) => {
     } catch (err) {
         console.error("❌ PROJ APPOINTMENTS SCHEDULE UPDATE ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to update appointment schedule entry" });
+    }
+});
+
+// GET /api/proj-orders/stock?search=&page=&pageSize= — Proj's current
+// stock/remaining-quantity position, the legacy Access "QSTOCK" form's live
+// equivalent. COM-inspected QSTOCK has a blank RecordSource (Proj has zero
+// VBA anywhere — VBComponents.Count === 0 — to set it dynamically) but its
+// controls (projNo/ProdctionNO/Prodc/UNO/QTY/Note plus computed
+// Expr1=QTYOUT and Expr4=SQTY-remaining) are an exact field-for-field match
+// for guest.QL2, a view in the MinStock SQL Server database (pool key
+// "minstock", not "proj") — same view family as Iron's already-implemented
+// GET /iron/stock (guest.QL2IRon, a sibling view: same Q1/OUTSUM join,
+// different WHERE filter). guest.QL2's own WHERE clause already excludes
+// fully-shipped rows with a known-zero remainder (Stock.X<>1 AND
+// (remaining<>0 OR remaining IS NULL)) — no extra remaining>0 filter is
+// applied here (unlike Iron's endpoint) since that would incorrectly drop
+// the NULL-remainder rows the view intentionally keeps.
+router.get("/stock", async (req, res) => {
+    try {
+        const search = String(req.query.search || "").trim();
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 25));
+        const offset = (page - 1) * pageSize;
+
+        const whereClause = search ? "WHERE (projNo LIKE @search OR projName LIKE @search OR Prodc LIKE @search)" : "";
+
+        // A separate COUNT(*) query followed by the paginated SELECT (the
+        // pattern used elsewhere in this codebase, e.g. iron.js's /stock)
+        // reproducibly timed out here (confirmed live, 30s+ hangs, multiple
+        // times) even though either query alone runs in <500ms — guest.QL2
+        // is a live, actively-written view (RIGHT OUTER JOIN across
+        // guest.Q1/guest.OUTSUM/dbo.Stock) and two back-to-back reads
+        // against it appear to hit real lock contention from the legacy
+        // Access app's own concurrent writers. COUNT(*) OVER() folds both
+        // into one round trip/one query plan and was confirmed live to be
+        // consistently fast (~200-500ms across repeated runs).
+        const rows = await withSqlRetry("minstock", async (pool) => {
+            const request = pool.request();
+            request.input("offset", offset).input("pageSize", pageSize);
+            if (search) request.input("search", `%${search}%`);
+            const result = await request.query(`
+                SELECT orderNo, serialNo, projNo, projName, Worker, Prodc, ProdctionNO, UNO, QTY,
+                       Expr1 AS shipped, Expr4 AS remaining, Date, Note,
+                       COUNT(*) OVER() AS totalCount
+                FROM guest.QL2
+                ${whereClause}
+                ORDER BY Date DESC
+                OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY
+            `);
+            return result.recordset;
+        });
+
+        const total = rows[0]?.totalCount ?? 0;
+        const items = rows.map(({ totalCount, ...item }) => item);
+
+        res.json({ success: true, items, total, page, pageSize });
+    } catch (err) {
+        console.error("❌ PROJ STOCK ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to fetch stock" });
     }
 });
 

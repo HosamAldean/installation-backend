@@ -15,7 +15,10 @@ export const InstOrderItems = sequelize2.define("InstOrderItems", {
     orderId: DataTypes.INTEGER,
     orderNumber: DataTypes.INTEGER,
     priceUnit: DataTypes.DECIMAL,
-    status: DataTypes.STRING
+    status: DataTypes.STRING,
+    sourceBarcode: DataTypes.STRING,
+    taskStartedAt: DataTypes.DATE,
+    taskCompletedAt: DataTypes.DATE
 }, {
     tableName: "instOrderItems",
     timestamps: false

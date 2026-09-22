@@ -1,13 +1,19 @@
 ﻿//backend/routes/followUp.js
 import express from "express";
-import { sequelize, sequelize2, withSqlRetry } from "../config/db.js";
+import { sequelize, sequelize2, sequelizeUtf8, withSqlRetry } from "../config/db.js";
 import { QueryTypes } from "sequelize";
-import { authenticateToken, authorizeRoles } from "../middleware/auth.js";
+import { authenticateToken } from "../middleware/auth.js";
+import { requirePermission } from "../middleware/permissions.js";
+import { PERMISSIONS } from "../constants/permissions.js";
 import multer from "multer";
 import path from "path";
 import fs from "fs";
 import { InstOrderStepUpdates, User, FollowUpNotes } from '../models/index.js';
 import { notifyOrderUpdate } from './instOrders.js';
+import { recordComponentAction, getUnitCompletionStats, markUnitComplete, normalizeUnitNo, registerMaterialScan, pauseMaterialScan, resumeMaterialScan } from '../services/instOrderComponents.js';
+import { selfAssignUnit } from '../services/selfAssignUnit.js';
+import { ProjectMapCache } from '../models/ProjectMapCache.js';
+import { isShortMapLink, extractCoords } from '../services/resolveMapLink.js';
 
 const router = express.Router();
 /* ===============================================================
@@ -89,7 +95,7 @@ const safeArabic = (text) => {
 ================================================================ */
 // GET /api/follow-up/my-orders
 // GET /api/follow-up/my-orders
-router.get('/my-orders', authenticateToken, authorizeRoles('user', 'admin'), async (req, res) => {
+router.get('/my-orders', authenticateToken, requirePermission(PERMISSIONS.FIELD_TRACKING), async (req, res) => {
     try {
         const assignedEmpNo = req.user.assignedEmpNo; // make sure this exists on req.user
 
@@ -105,7 +111,7 @@ router.get('/my-orders', authenticateToken, authorizeRoles('user', 'admin'), asy
        iod.rowId,
        iod.itemName,
        ms.unitIdContract,
-       ms.unitIdDetail As unitNo,
+       COALESCE(ms.unitIdDetail, iod.unitNo) As unitNo,
        iod.height,
        iod.width,
        ira.teamId
@@ -251,6 +257,186 @@ router.get('/my-orders', authenticateToken, authorizeRoles('user', 'admin'), asy
     }
 });
 
+// GET /api/follow-up/my-projects
+// Distinct projects the worker's team currently has assignments in, each
+// with a representative orderId -- feeds the Home screen's project
+// check-in picker. Project-level check-in reuses the existing per-order
+// instTeamCheckpoints table/endpoint underneath (no schema change): the
+// worker only ever sees/picks a project, and one of their real orders in
+// it is carried along as the checkpoint's order_id.
+router.get('/my-projects', authenticateToken, requirePermission(PERMISSIONS.FIELD_CHECKIN), async (req, res) => {
+    try {
+        const assignedEmpNo = req.user.assignedEmpNo;
+        const rows = await sequelize.query(
+            `
+            SELECT DISTINCT p.projectNo, p.projectName, io.id AS orderId
+            FROM IIT_Petra.instOrderItems iod
+            LEFT JOIN IIT_Petra.masterControl ms ON ms.rowId = iod.rowId
+            LEFT JOIN IIT_Petra.instOrders io ON iod.instOrderId = io.id
+            LEFT JOIN IIT_Petra.instReqMaster m ON io.instReqMasterId = m.instReqMasterId
+            LEFT JOIN IIT_Petra.project p ON m.projectId = p.projectId
+            LEFT JOIN IIT_Petra.instReqAssignments ira
+                ON ira.instReqDetId = iod.instReqDetId AND ira.instOrderId = io.id
+            WHERE ira.assignedEmpNo = :assignedEmpNo AND p.projectNo IS NOT NULL
+            ORDER BY p.projectNo
+            `,
+            { replacements: { assignedEmpNo }, type: sequelize.QueryTypes.SELECT }
+        );
+        const seen = new Map();
+        rows.forEach((r) => {
+            if (!seen.has(r.projectNo)) {
+                seen.set(r.projectNo, { projectNo: r.projectNo, projectName: fixArabic(r.projectName), orderId: r.orderId });
+            }
+        });
+        res.json({ success: true, data: Array.from(seen.values()) });
+    } catch (err) {
+        console.error("❌ MY PROJECTS ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to fetch your projects" });
+    }
+});
+
+// GET /api/follow-up/team/checkin-status
+// Resolves the worker's team's current project check-in state from the
+// most recent inProject/outProject row in instTeamCheckpoints -- "in" iff
+// that most recent event was an inProject with no later outProject.
+router.get('/team/checkin-status', authenticateToken, requirePermission(PERMISSIONS.FIELD_TRACKING), async (req, res) => {
+    try {
+        const team_id = await resolveTeamIdForUser(req.user);
+        if (!team_id) {
+            return res.json({ success: true, data: { checkedIn: false } });
+        }
+        // Ordered by id, not createdAt -- two checkpoints (e.g. a quick
+        // check-in immediately followed by check-out) can land in the same
+        // wall-clock second since this column has no fractional-second
+        // precision, and ORDER BY createdAt DESC alone breaks that tie
+        // arbitrarily (confirmed live: it picked the OLDER row). id is the
+        // auto-increment PK, so it's always correctly monotonic.
+        const rows = await sequelize2.query(
+            `
+            SELECT checkpoint_type, order_id, createdAt
+            FROM IIT_Petra.instTeamCheckpoints
+            WHERE team_id = :team_id AND checkpoint_type IN ('inProject', 'outProject')
+            ORDER BY id DESC
+            LIMIT 1
+            `,
+            { replacements: { team_id }, type: QueryTypes.SELECT }
+        );
+        const last = rows[0];
+        if (!last || last.checkpoint_type !== 'inProject') {
+            return res.json({ success: true, data: { checkedIn: false } });
+        }
+        let project = null;
+        if (last.order_id) {
+            const projRows = await sequelize.query(
+                `
+                SELECT p.projectNo, p.projectName
+                FROM IIT_Petra.instOrders io
+                LEFT JOIN IIT_Petra.instReqMaster m ON io.instReqMasterId = m.instReqMasterId
+                LEFT JOIN IIT_Petra.project p ON m.projectId = p.projectId
+                WHERE io.id = :orderId
+                LIMIT 1
+                `,
+                { replacements: { orderId: last.order_id }, type: QueryTypes.SELECT }
+            );
+            if (projRows[0]) {
+                project = { projectNo: projRows[0].projectNo, projectName: fixArabic(projRows[0].projectName) };
+            }
+        }
+        res.json({
+            success: true,
+            data: { checkedIn: true, orderId: last.order_id, project, since: last.createdAt },
+        });
+    } catch (err) {
+        console.error("❌ CHECKIN STATUS ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to fetch check-in status" });
+    }
+});
+
+// GET /api/follow-up/my-order-components
+// Component-based counterpart to /my-orders above -- same
+// ira.assignedEmpNo scoping, same orders/items grouping shape, but each
+// item carries component completion stats (from Stock, via
+// getUnitCompletionStats) instead of a fixed instOrderSteps checklist.
+router.get('/my-order-components', authenticateToken, requirePermission(PERMISSIONS.FIELD_MY_ORDER_COMPONENTS), async (req, res) => {
+    try {
+        const assignedEmpNo = req.user.assignedEmpNo;
+
+        const itemsRaw = await sequelize.query(
+            `
+    SELECT
+       io.id AS instOrderId,
+       io.order_number,
+       p.projectNo,
+       p.projectName,
+       iod.id AS instOrderItemId,
+       iod.instReqDetId,
+       iod.rowId,
+       iod.itemName,
+       ms.unitIdContract,
+       COALESCE(ms.unitIdDetail, iod.unitNo) As unitNo,
+       iod.height,
+       iod.width,
+       ira.teamId
+   FROM IIT_Petra.instOrderItems iod
+   LEFT JOIN IIT_Petra.masterControl ms ON ms.rowId = iod.rowId
+   LEFT JOIN IIT_Petra.instOrders io ON iod.instOrderId = io.id
+   LEFT JOIN IIT_Petra.instReqMaster m ON io.instReqMasterId = m.instReqMasterId
+   LEFT JOIN IIT_Petra.project p ON m.projectId = p.projectId
+   LEFT JOIN IIT_Petra.instReqAssignments ira
+       ON ira.instReqDetId = iod.instReqDetId AND ira.instOrderId = io.id
+    WHERE ira.assignedEmpNo = :assignedEmpNo
+    ORDER BY io.id DESC, iod.id ASC
+    `,
+            { replacements: { assignedEmpNo }, type: sequelize.QueryTypes.SELECT }
+        );
+
+        if (!itemsRaw.length) {
+            return res.json({ success: true, data: { orders: {} } });
+        }
+
+        const items = itemsRaw.map(r => ({
+            ...r,
+            itemName: fixArabic(r.itemName),
+            projectName: fixArabic(r.projectName),
+        }));
+
+        const statsByItem = new Map(
+            await Promise.all(
+                items.map(async (row) => [row.instOrderItemId, await getUnitCompletionStats(row.instOrderItemId)])
+            )
+        );
+
+        const orders = {};
+        items.forEach(row => {
+            if (!orders[row.instOrderId]) {
+                orders[row.instOrderId] = {
+                    orderNumber: row.order_number,
+                    projectNo: row.projectNo,
+                    projectName: row.projectName,
+                    items: [],
+                };
+            }
+            orders[row.instOrderId].items.push({
+                instOrderItemId: row.instOrderItemId,
+                instReqDetId: row.instReqDetId,
+                rowId: row.rowId,
+                itemName: row.itemName,
+                unitIdContract: row.unitIdContract,
+                unitNo: row.unitNo,
+                height: row.height,
+                width: row.width,
+                teamId: row.teamId,
+                stats: statsByItem.get(row.instOrderItemId),
+            });
+        });
+
+        res.json({ success: true, data: { orders } });
+    } catch (err) {
+        console.error("❌ FETCH MY ORDER COMPONENTS ERROR:", err);
+        res.status(500).json({ success: false, message: "Error fetching order components" });
+    }
+});
+
 // ------------------------ HELPERS ------------------------
 async function resolveTeamId(stepId) {
     const rows = await sequelize2.query(
@@ -275,6 +461,15 @@ async function resolveTeamId(stepId) {
 // comment in auth.js login), so the real team is looked up via
 // instTeams.leader_emp_no = assignedEmpNo, same as every write path that
 // needs a team_id (checkpoints, step updates, etc.).
+//
+// Deliberately leader-only, not "any member of instTeamMembers" — per
+// explicit direction (2026-09-09) this stays restricted to the team
+// leader for now; broader per-employee site-access/tracking is a future
+// task, not this fix. A regular (non-leader) team member's calls into
+// this always resolve null, and the routes that depend on it correctly
+// reject them -- see POST /location's NO_TEAM_ASSIGNED code, which exists
+// specifically so the mobile client can stop retrying that permanent
+// condition instead of hammering this endpoint.
 async function resolveTeamIdForUser(reqUser) {
     if (reqUser.teamId) return reqUser.teamId;
     if (!reqUser.assignedEmpNo) return null;
@@ -299,6 +494,35 @@ async function assertOwnsStep(reqUser, stepId) {
         resolveTeamIdForUser(reqUser),
     ]);
     return !!userTeamId && userTeamId === stepTeamId;
+}
+
+// Same guard as assertOwnsStep, one level up: the component-confirm route
+// takes a client-supplied instOrderItemId directly (no stepId in the
+// path), so it needs its own team-ownership check rather than reusing
+// resolveTeamId (which joins through instOrderSteps).
+async function resolveTeamIdForItem(instOrderItemId) {
+    const rows = await sequelize2.query(
+        `
+        SELECT ira.teamId
+        FROM IIT_Petra.instOrderItems i
+        JOIN IIT_Petra.instReqAssignments ira
+          ON ira.instReqDetId = i.instReqDetId
+         AND ira.instOrderId = i.instOrderId
+        WHERE i.id = :instOrderItemId
+        LIMIT 1
+        `,
+        { replacements: { instOrderItemId }, type: QueryTypes.SELECT }
+    );
+    return rows[0]?.teamId || null;
+}
+
+async function assertOwnsItem(reqUser, instOrderItemId) {
+    if (reqUser.role === 'installation_manager' || reqUser.role === 'admin') return true;
+    const [itemTeamId, userTeamId] = await Promise.all([
+        resolveTeamIdForItem(instOrderItemId),
+        resolveTeamIdForUser(reqUser),
+    ]);
+    return !!userTeamId && userTeamId === itemTeamId;
 }
 
 // Upserts a team's live location, silently skipping if teamId doesn't
@@ -343,7 +567,7 @@ async function upsertTeamLocation(teamId, lat, lng) {
 // ("media") is generic on purpose, since it may be either an image or a
 // video; multer/storage don't care about content type, and image_after is
 // just a URL string column regardless of what kind of file it points to.
-router.post("/order-step/update", authenticateToken, authorizeRoles('user', 'admin'), upload.single("media"), async (req, res) => {
+router.post("/order-step/update", authenticateToken, requirePermission(PERMISSIONS.FIELD_TRACKING), upload.single("media"), async (req, res) => {
     try {
         const { stepId, status, lat, lng } = req.body;
         const userId = req.user.userId;
@@ -504,7 +728,7 @@ router.post("/order-step/photo", authenticateToken, upload.single("photo"), asyn
 });
 
 // ------------------------ POST Step Issue ------------------------
-router.post("/order-step/issue", authenticateToken, authorizeRoles('user', 'admin'), upload.single("photo"), async (req, res) => {
+router.post("/order-step/issue", authenticateToken, requirePermission(PERMISSIONS.FIELD_TRACKING), upload.single("photo"), async (req, res) => {
     try {
         const { stepId, note, lat, lng } = req.body;
         const userId = req.user.userId;
@@ -556,7 +780,7 @@ router.post("/order-step/issue", authenticateToken, authorizeRoles('user', 'admi
 /** ------------------------
  * POST Team Checkpoint
  * ------------------------ */
-router.post("/team/checkpoint", authenticateToken, authorizeRoles('user', 'admin'), async (req, res) => {
+router.post("/team/checkpoint", authenticateToken, requirePermission(PERMISSIONS.FIELD_CHECKIN), async (req, res) => {
     try {
         const { lat, lng, checkpointType, orderId, notes } = req.body;
         if (typeof lat !== 'number' || typeof lng !== 'number') {
@@ -620,8 +844,16 @@ router.post("/team/checkpoint", authenticateToken, authorizeRoles('user', 'admin
 /** ------------------------
  * GET Live Team Locations
  * ------------------------ */
-router.get('/team/locations', authenticateToken, authorizeRoles('installation_manager', 'admin'), async (req, res) => {
+router.get('/team/locations', authenticateToken, requirePermission(PERMISSIONS.INSTALLATION_REPORTS), async (req, res) => {
     try {
+        // installation_supervisor only sees teams they supervise
+        // (instTeams.supervisor_emp_no) -- same gap as GET /teams,
+        // /instOrders/schedule, /instOrders/team-roster, and
+        // /instOrders/assigned-components. Previously unscoped here too --
+        // only looked correctly scoped by coincidence (few teams in the
+        // test data actually have location pings).
+        const isScoped = req.user.role === 'installation_supervisor';
+        const empNo = req.user.assignedEmpNo ? parseInt(req.user.assignedEmpNo) : null;
         // Return latest row per team with team info (optimized for MySQL/MariaDB)
         const rows = await sequelize2.query(
             `
@@ -633,9 +865,10 @@ router.get('/team/locations', authenticateToken, authorizeRoles('installation_ma
         FROM IIT_Petra.instTeamLocations
         GROUP BY team_id
       ) latest ON latest.team_id = l.team_id AND latest.max_ping = l.ping_time
+      ${isScoped ? 'WHERE t.supervisor_emp_no = :empNo' : ''}
       ORDER BY t.name
       `,
-            { type: QueryTypes.SELECT }
+            { replacements: { empNo }, type: QueryTypes.SELECT }
         );
 
         res.json({ success: true, data: rows });
@@ -650,8 +883,12 @@ router.get('/team/locations', authenticateToken, authorizeRoles('installation_ma
  * indicator — a team is online if any of its logged-in members currently
  * has isOnline=true (set on login, cleared on explicit logout).
  */
-router.get('/team/online-status', authenticateToken, authorizeRoles('installation_manager', 'admin'), async (req, res) => {
+router.get('/team/online-status', authenticateToken, requirePermission(PERMISSIONS.INSTALLATION_REPORTS), async (req, res) => {
     try {
+        // installation_supervisor only sees teams they supervise -- same
+        // gap/fix as GET /team/locations above.
+        const isScoped = req.user.role === 'installation_supervisor';
+        const empNo = req.user.assignedEmpNo ? parseInt(req.user.assignedEmpNo) : null;
         // InsUser.teamId is stale/unreliable (the JWT deliberately omits it —
         // see auth.js login) — the real team is resolved the same way every
         // other endpoint does it: instTeams.leader_emp_no = assignedEmpNo.
@@ -660,9 +897,10 @@ router.get('/team/online-status', authenticateToken, authorizeRoles('installatio
             SELECT t.id AS team_id, MAX(u.isOnline) AS isOnline, MAX(u.lastSeenAt) AS lastSeenAt
             FROM IIT_Petra.InsUser u
             JOIN IIT_Petra.instTeams t ON t.leader_emp_no = u.assignedEmpNo
+            ${isScoped ? 'WHERE t.supervisor_emp_no = :empNo' : ''}
             GROUP BY t.id
             `,
-            { type: QueryTypes.SELECT }
+            { replacements: { empNo }, type: QueryTypes.SELECT }
         );
         res.json({
             success: true,
@@ -682,7 +920,7 @@ router.get('/team/online-status', authenticateToken, authorizeRoles('installatio
  * GET history for a team
  * Returns last N pings for team_id ordered by ping_time asc (for proper path drawing)
  */
-router.get('/team/history/:teamId', authenticateToken, authorizeRoles('installation_manager', 'admin'), async (req, res) => {
+router.get('/team/history/:teamId', authenticateToken, requirePermission(PERMISSIONS.INSTALLATION_REPORTS), async (req, res) => {
     try {
         const teamId = parseInt(req.params.teamId, 10);
         if (!teamId) return res.status(400).json({ success: false, message: 'teamId required' });
@@ -752,7 +990,7 @@ router.get("/my-orders/:orderId/last-checkpoint", authenticateToken, async (req,
 // ===============================
 // STEP 1: GET STOCK + STOCKO
 // ===============================
-router.get("/scan-basic/:barcode", authenticateToken, authorizeRoles('user', 'admin'), async (req, res) => {
+router.get("/scan-basic/:barcode", authenticateToken, requirePermission(PERMISSIONS.FIELD_TRACKING), async (req, res) => {
     try {
         const { barcode } = req.params;
 
@@ -879,8 +1117,387 @@ router.get("/scan-basic/:barcode", authenticateToken, authorizeRoles('user', 'ad
     }
 });
 
+// GET /api/follow-up/scan-task/:barcode
+// Dedicated resolver for the scan-first task screen: unlike scan-basic
+// (which only confirms the scanned unit's *project* is one of the
+// employee's assigned projects), this resolves the barcode all the way
+// down to a specific instOrderItem the employee is actually assigned —
+// the same instReqAssignments.assignedEmpNo join /my-orders uses — and
+// returns that item's next pending step, so the scan screen has a real
+// stepId to act against instead of the client having to cross-reference
+// a separately-loaded /my-orders list by unit number itself.
+router.get("/scan-task/:barcode", authenticateToken, requirePermission(PERMISSIONS.FIELD_SCAN_TASK), async (req, res) => {
+    try {
+        const { barcode } = req.params;
+        const assignedEmpNo = req.user.assignedEmpNo;
+
+        const cleanBarcode = parseInt(barcode, 10);
+        if (!Number.isInteger(cleanBarcode)) {
+            return res.json({ success: true, status: "NOT_FOUND", message: "Item not found in warehouse" });
+        }
+
+        const stockResult = await withSqlRetry("minstock", (pool) => pool.request()
+            .input("barcode", cleanBarcode)
+            .query(`SELECT TOP 1 * FROM out WHERE barcode = @barcode`));
+
+        if (!stockResult.recordset.length) {
+            return res.json({ success: true, status: "NOT_FOUND", message: "Item not found in warehouse" });
+        }
+        const stock = stockResult.recordset[0];
+
+        // A unit's materials must be confirmed physically delivered to site
+        // (see Check Delivery / InsDelivered) before any scan-task action --
+        // assigning to yourself, or acting on an already-yours item -- makes
+        // sense. Applies to every outcome below (OK and NOT_ASSIGNED alike),
+        // not just self-assign, since scanning a not-yet-delivered barcode
+        // is premature either way.
+        const deliveryRows = await sequelize2.query(
+            `SELECT InsStatus FROM IIT_Petra.InsDelivered WHERE Insbarcode = :barcode ORDER BY InsDeliverdDate DESC LIMIT 1`,
+            { replacements: { barcode: cleanBarcode }, type: QueryTypes.SELECT }
+        );
+        if (deliveryRows[0]?.InsStatus !== 'DELIVERED') {
+            return res.json({
+                success: true,
+                status: "NOT_DELIVERED",
+                message: "This item hasn't been confirmed delivered yet -- confirm delivery first",
+            });
+        }
+
+        // Same assignment join as /my-orders, scoped to this one employee —
+        // deliberately not filtered by unit number in SQL, since
+        // masterControl.unitIdDetail and out.UNO aren't guaranteed to be
+        // the same type/format; matched numerically in JS below the same
+        // way the mobile client already does it (parseInt comparison).
+        const assignedItems = await sequelize.query(
+            `
+            SELECT
+               io.id AS instOrderId,
+               io.order_number,
+               p.projectNo,
+               p.projectName,
+               iod.id AS instOrderItemId,
+               iod.itemName,
+               COALESCE(ms.unitIdDetail, iod.unitNo) AS unitNo,
+               iod.height,
+               iod.width,
+               iod.sourceBarcode
+            FROM IIT_Petra.instOrderItems iod
+            LEFT JOIN IIT_Petra.masterControl ms ON ms.rowId = iod.rowId
+            LEFT JOIN IIT_Petra.instOrders io ON iod.instOrderId = io.id
+            LEFT JOIN IIT_Petra.instReqMaster m ON io.instReqMasterId = m.instReqMasterId
+            LEFT JOIN IIT_Petra.project p ON m.projectId = p.projectId
+            LEFT JOIN IIT_Petra.instReqAssignments ira
+                ON ira.instReqDetId = iod.instReqDetId AND ira.instOrderId = io.id
+            WHERE ira.assignedEmpNo = :assignedEmpNo
+            `,
+            { replacements: { assignedEmpNo }, type: QueryTypes.SELECT }
+        );
+
+        // unitIdDetail commonly holds '0' as an unset/placeholder value on
+        // masterControl rows that were never assigned a real unit number —
+        // shared across many items/employees, so it must never itself be
+        // treated as a valid match key (confirmed live: two different
+        // employees' item sets both "matched" on unitNo '0' before this
+        // guard was added).
+        //
+        // normalizeUnitNo, not a plain parseInt -- unit numbers are often
+        // alphanumeric ("CW-7", stored as "CW07" in masterControl but
+        // "CW-7"/"CW10" in Stock), and a bare parseInt returns NaN for all
+        // of those, which silently made every alphanumeric-labeled unit
+        // report NOT_ASSIGNED even when it genuinely was (confirmed live).
+        const scannedUnitNo = normalizeUnitNo(stock.UNO);
+        const matched = (scannedUnitNo && scannedUnitNo !== '0'
+            ? assignedItems.find((row) => normalizeUnitNo(row.unitNo) === scannedUnitNo)
+            : undefined)
+            // Falls back to a sourceBarcode match for "Unassigned"-bucket
+            // items (see selfAssignUnit.js/services/instOrderComponents.js's
+            // UNASSIGNED_UNIT_NO) -- these are scoped to one specific
+            // barcode, not a real unit label, so unitNo never matches
+            // Stock.UNO even when the item genuinely is this worker's own.
+            // Covers both a true no-UNO item AND the numbering-mismatch
+            // stopgap (a real UNO that just can't be mapped to a
+            // masterControl unit) -- both land in the same bucket.
+            ?? assignedItems.find((row) => row.sourceBarcode && String(row.sourceBarcode) === String(cleanBarcode));
+
+        if (!matched) {
+            return res.json({
+                success: true,
+                status: "NOT_ASSIGNED",
+                message: `Item ${stock.UNO ?? ''} is not part of a project or order assigned to you`,
+            });
+        }
+
+        // First scan of THIS barcode defines ITS OWN start time -- per
+        // material, not per unit. A unit with several materials (e.g. unit
+        // "07 B" with 3 barcodes) previously shared one instOrderItems-level
+        // start time, so scanning the 2nd or 3rd material for the first
+        // time showed elapsed time already accumulated from the 1st
+        // material's scan (confirmed live). registerMaterialScan creates a
+        // 'Pending' InstOrderComponent row on first scan only -- its
+        // createdAt is this barcode's own start time, read back via
+        // getUnitCompletionStats' per-material startedAt/completedAt.
+        await registerMaterialScan({
+            instOrderItemId: matched.instOrderItemId,
+            barcode: cleanBarcode,
+            productName: stock.Prodc,
+            productionNo: stock.ProdctionNO,
+        });
+
+        const steps = await sequelize2.query(
+            `
+            SELECT
+                s.id AS stepId,
+                s.instOrderItemId,
+                s.instStepId,
+                s.status,
+                i.stepName,
+                i.standardTime,
+                i.stepNumber AS stepOrder
+            FROM IIT_Petra.instOrderSteps s
+            JOIN IIT_Petra.instSteps i ON i.instStepId = s.instStepId
+            WHERE s.instOrderItemId = :instOrderItemId
+            ORDER BY stepOrder
+            `,
+            { replacements: { instOrderItemId: matched.instOrderItemId }, type: QueryTypes.SELECT }
+        );
+
+        const stepsFixed = steps.map((s) => ({ ...s, stepName: fixArabic(s.stepName) }));
+        const nextStep = stepsFixed.find((s) => (s.status || '').toLowerCase() !== 'completed') || null;
+
+        // Completion stats for this unit (the real warehouse-allocation
+        // model, see services/instOrderComponents.js) -- shown alongside
+        // the step checklist so a worker sees the materials list and
+        // completion percentage without leaving this screen.
+        const stats = await getUnitCompletionStats(matched.instOrderItemId);
+
+        return res.json({
+            success: true,
+            status: "OK",
+            item: {
+                instOrderId: matched.instOrderId,
+                orderNumber: matched.order_number,
+                projectNo: matched.projectNo,
+                projectName: fixArabic(matched.projectName),
+                instOrderItemId: matched.instOrderItemId,
+                itemName: fixArabic(matched.itemName),
+                unitNo: matched.unitNo,
+                height: matched.height,
+                width: matched.width,
+            },
+            steps: stepsFixed,
+            nextStep,
+            allStepsCompleted: stepsFixed.length > 0 && !nextStep,
+            stats,
+        });
+    } catch (err) {
+        console.error("❌ SCAN TASK ERROR:", err);
+        res.status(500).json({ success: false, status: "ERROR", message: "Failed to fetch task" });
+    }
+});
+
+// POST /api/follow-up/order-component/confirm
+// Field-worker counterpart to instOrders.js's manager-facing
+// POST /instOrders/component/confirm — same underlying validation
+// (recordComponentAction), but gated on FIELD_TRACKING instead of
+// INSTALLATION_MANAGE_ORDERS, with its own team-ownership check so a
+// worker can't confirm components against a unit outside their own team
+// (mirrors assertOwnsStep's rationale for /order-step/*).
+// Accepts an optional photo/video (multipart) alongside the plain-JSON
+// body ManageOrders' web page and MyOrderComponentsScreen's manual-entry
+// flow already send -- multer's single() no-ops on a non-multipart
+// request (express.json() above it already parsed req.body by then), so
+// this stays backward compatible with every existing caller.
+router.post("/order-component/confirm", authenticateToken, requirePermission(PERMISSIONS.FIELD_TRACKING), upload.single("media"), async (req, res) => {
+    try {
+        const { instOrderItemId, barcode, note } = req.body;
+        if (!instOrderItemId || !barcode) {
+            return res.status(400).json({ success: false, message: "instOrderItemId and barcode are required" });
+        }
+
+        if (!(await assertOwnsItem(req.user, instOrderItemId))) {
+            return res.status(403).json({ success: false, message: "Not authorized for this unit" });
+        }
+
+        const mediaUrl = req.file ? `/uploads/steps/photos/${req.file.filename}` : null;
+        const mediaType = req.file?.mimetype?.startsWith("video") ? "video" : (req.file ? "image" : null);
+
+        const result = await recordComponentAction({
+            instOrderItemId,
+            barcode,
+            action: 'install',
+            note,
+            mediaUrl,
+            mediaType,
+            userId: req.user.userId,
+            empNo: req.user.assignedEmpNo,
+        });
+        if (result.status === 'OK') notifyOrderUpdate();
+        const { httpStatus, ...body } = result;
+        res.status(httpStatus).json(body);
+    } catch (err) {
+        console.error("❌ CONFIRM COMPONENT (FIELD) ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to confirm component" });
+    }
+});
+
+// POST /api/follow-up/order-component/report-issue
+// Field-worker issue report on one scanned material -- requires both a
+// note and a photo/video (mirrors /order-step/issue's media requirement,
+// applied here at the component level instead of the step level). An
+// already-Installed material can be re-flagged here; recordComponentAction
+// updates its status in place rather than rejecting the second scan.
+router.post("/order-component/report-issue", authenticateToken, requirePermission(PERMISSIONS.FIELD_TRACKING), upload.single("media"), async (req, res) => {
+    try {
+        const { instOrderItemId, barcode, note } = req.body;
+        if (!instOrderItemId || !barcode || !note?.trim()) {
+            return res.status(400).json({ success: false, message: "instOrderItemId, barcode, and note are required" });
+        }
+
+        if (!(await assertOwnsItem(req.user, instOrderItemId))) {
+            return res.status(403).json({ success: false, message: "Not authorized for this unit" });
+        }
+
+        const mediaUrl = req.file ? `/uploads/steps/issues/${req.file.filename}` : null;
+        const mediaType = req.file?.mimetype?.startsWith("video") ? "video" : (req.file ? "image" : null);
+
+        const result = await recordComponentAction({
+            instOrderItemId,
+            barcode,
+            action: 'issue',
+            note,
+            mediaUrl,
+            mediaType,
+            userId: req.user.userId,
+            empNo: req.user.assignedEmpNo,
+        });
+        if (result.status === 'OK') notifyOrderUpdate();
+        const { httpStatus, ...body } = result;
+        res.status(httpStatus).json(body);
+    } catch (err) {
+        console.error("❌ REPORT COMPONENT ISSUE (FIELD) ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to report issue" });
+    }
+});
+
+// POST /api/follow-up/order-component/mark-complete
+// Field-worker counterpart to instOrders.js's manager-facing
+// POST /instOrders/component/mark-complete — same team-ownership gate as
+// the confirm/report-issue routes above.
+router.post("/order-component/mark-complete", authenticateToken, requirePermission(PERMISSIONS.FIELD_TRACKING), async (req, res) => {
+    try {
+        const { instOrderItemId } = req.body;
+        if (!instOrderItemId) {
+            return res.status(400).json({ success: false, message: "instOrderItemId is required" });
+        }
+
+        if (!(await assertOwnsItem(req.user, instOrderItemId))) {
+            return res.status(403).json({ success: false, message: "Not authorized for this unit" });
+        }
+
+        const result = await markUnitComplete(instOrderItemId);
+        if (result.status === 'OK') notifyOrderUpdate();
+        const { httpStatus, ...body } = result;
+        res.status(httpStatus).json(body);
+    } catch (err) {
+        console.error("❌ MARK UNIT COMPLETE (FIELD) ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to mark unit complete" });
+    }
+});
+
+// POST /api/follow-up/order-component/pause
+// Pauses the timer on one scanned-but-unconfirmed material with a required
+// reason -- the paused interval is excluded from its duration once resumed
+// (see pauseMaterialScan/resumeMaterialScan in services/instOrderComponents.js).
+router.post("/order-component/pause", authenticateToken, requirePermission(PERMISSIONS.FIELD_SCAN_TASK), async (req, res) => {
+    try {
+        const { instOrderItemId, barcode, reason } = req.body;
+        if (!instOrderItemId || !barcode) {
+            return res.status(400).json({ success: false, message: "instOrderItemId and barcode are required" });
+        }
+
+        if (!(await assertOwnsItem(req.user, instOrderItemId))) {
+            return res.status(403).json({ success: false, message: "Not authorized for this unit" });
+        }
+
+        const result = await pauseMaterialScan({ instOrderItemId, barcode, reason });
+        const { httpStatus, ...body } = result;
+        res.status(httpStatus).json(body);
+    } catch (err) {
+        console.error("❌ PAUSE COMPONENT ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to pause item" });
+    }
+});
+
+// POST /api/follow-up/order-component/resume
+router.post("/order-component/resume", authenticateToken, requirePermission(PERMISSIONS.FIELD_SCAN_TASK), async (req, res) => {
+    try {
+        const { instOrderItemId, barcode } = req.body;
+        if (!instOrderItemId || !barcode) {
+            return res.status(400).json({ success: false, message: "instOrderItemId and barcode are required" });
+        }
+
+        if (!(await assertOwnsItem(req.user, instOrderItemId))) {
+            return res.status(403).json({ success: false, message: "Not authorized for this unit" });
+        }
+
+        const result = await resumeMaterialScan({ instOrderItemId, barcode });
+        const { httpStatus, ...body } = result;
+        res.status(httpStatus).json(body);
+    } catch (err) {
+        console.error("❌ RESUME COMPONENT ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to resume item" });
+    }
+});
+
+// POST /api/follow-up/order-item/self-assign
+// Body: { barcode }. Lets a team leader claim a scanned unit that scan-task
+// just reported as NOT_ASSIGNED, provided their team already has at least
+// one other assignment in that unit's project -- see
+// services/selfAssignUnit.js for the full chain this creates/reassigns.
+router.post("/order-item/self-assign", authenticateToken, requirePermission(PERMISSIONS.FIELD_SCAN_TASK), async (req, res) => {
+    try {
+        const { barcode } = req.body;
+        if (!barcode) {
+            return res.status(400).json({ success: false, message: "barcode is required" });
+        }
+        const result = await selfAssignUnit({ barcode, reqUser: req.user });
+        if (result.status === 'OK') notifyOrderUpdate();
+        const { httpStatus, ...body } = result;
+        res.status(httpStatus).json(body);
+    } catch (err) {
+        console.error("❌ SELF ASSIGN UNIT ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to self-assign unit" });
+    }
+});
+
+// POST /api/follow-up/scan-task/confirm-delivery
+// Lets a worker confirm delivery inline from the Scan & Complete Task
+// screen when GET /scan-task/:barcode reports NOT_DELIVERED -- reuses the
+// same InsDelivered write/project-ownership check as
+// POST /delivery-status (Check Delivery's own confirm action), but gated
+// on FIELD_SCAN_TASK (this screen's own key) instead of
+// FIELD_CHECK_DELIVERY, since this is a same-screen convenience action
+// for a role that may not hold the separate Check Delivery permission.
+router.post("/scan-task/confirm-delivery", authenticateToken, requirePermission(PERMISSIONS.FIELD_SCAN_TASK), async (req, res) => {
+    try {
+        const { barcode } = req.body;
+        if (!barcode) {
+            return res.status(400).json({ success: false, message: "Barcode required" });
+        }
+        await confirmDeliveryLogic(barcode, null, req.user.assignedEmpNo, 'DELIVERED', null);
+        res.json({ success: true, message: "Delivery confirmed" });
+    } catch (err) {
+        console.error("❌ SCAN TASK CONFIRM DELIVERY ERROR:", err);
+        res.status(err.statusCode || 500).json({
+            success: false,
+            message: err.message,
+            hireNote: err.hireNote || null,
+        });
+    }
+});
+
 // GET /api/follow-up/delivered-items
-router.get('/delivered-items', authenticateToken, authorizeRoles('user', 'admin'), async (req, res) => {
+router.get('/delivered-items', authenticateToken, requirePermission(PERMISSIONS.FIELD_CHECK_DELIVERY), async (req, res) => {
     try {
         const assignedEmpNo = req.user.assignedEmpNo;
 
@@ -892,44 +1509,53 @@ router.get('/delivered-items', authenticateToken, authorizeRoles('user', 'admin'
         }
 
         // ===============================
-        // PROJECTS
+        // CHECKED-IN PROJECT (scope restricted to this one project, not
+        // every project this employee is ever assigned to -- same
+        // checked-in-project resolution as GET /team/checkin-status, so
+        // Check Delivery only ever shows the site the team is actually
+        // standing at right now, not their whole project history).
         // ===============================
-        const projRows = await sequelize.query(
-            `
-            SELECT DISTINCT
-                SUBSTRING_INDEX(j.projectNo, '-', 1) AS projectNo,
-                j.projectName
-            FROM IIT_Petra.instOrderItems iod
-            LEFT JOIN IIT_Petra.instOrders io
-                ON iod.instOrderId = io.id
-            LEFT JOIN IIT_Petra.instReqAssignments ira
-                ON ira.instReqDetId = iod.instReqDetId
-                AND ira.instOrderId = io.id
-            LEFT JOIN IIT_Petra.masterControl m
-                ON m.rowId = iod.rowId
-            LEFT JOIN IIT_Petra.project j
-                ON m.projectId = j.projectId
-            WHERE ira.assignedEmpNo = :assignedEmpNo
-            `,
-            {
-                replacements: { assignedEmpNo },
-                type: QueryTypes.SELECT,
+        const team_id = await resolveTeamIdForUser(req.user);
+        let checkedInOrderId = null;
+        if (team_id) {
+            const checkpointRows = await sequelize2.query(
+                `
+                SELECT checkpoint_type, order_id
+                FROM IIT_Petra.instTeamCheckpoints
+                WHERE team_id = :team_id AND checkpoint_type IN ('inProject', 'outProject')
+                ORDER BY id DESC
+                LIMIT 1
+                `,
+                { replacements: { team_id }, type: QueryTypes.SELECT }
+            );
+            const lastCheckpoint = checkpointRows[0];
+            if (lastCheckpoint?.checkpoint_type === 'inProject') {
+                checkedInOrderId = lastCheckpoint.order_id;
             }
+        }
+        if (!checkedInOrderId) {
+            return res.json({ success: true, data: [], checkedIn: false });
+        }
+        const checkedInProjRows = await sequelize.query(
+            `
+            SELECT p.projectNo, p.projectName
+            FROM IIT_Petra.instOrders io
+            LEFT JOIN IIT_Petra.instReqMaster m ON io.instReqMasterId = m.instReqMasterId
+            LEFT JOIN IIT_Petra.project p ON m.projectId = p.projectId
+            WHERE io.id = :orderId
+            LIMIT 1
+            `,
+            { replacements: { orderId: checkedInOrderId }, type: QueryTypes.SELECT }
         );
-
-        if (!projRows.length) {
-            return res.json({ success: true, data: [] });
+        if (!checkedInProjRows[0]?.projectNo) {
+            return res.json({ success: true, data: [], checkedIn: false });
         }
 
         const projectMap = new Map();
-
-        projRows.forEach((p) => {
-            const key = normalizeProjectNo(p.projectNo);
-
-            projectMap.set(key, {
-                projectNo: key,
-                projectName: safeArabic(p.projectName),
-            });
+        const checkedInProjectNo = normalizeProjectNo(checkedInProjRows[0].projectNo);
+        projectMap.set(checkedInProjectNo, {
+            projectNo: checkedInProjectNo,
+            projectName: safeArabic(checkedInProjRows[0].projectName),
         });
 
         const projectNos = [...projectMap.keys()].slice(0, 200);
@@ -1039,7 +1665,12 @@ router.get('/delivered-items', authenticateToken, authorizeRoles('user', 'admin'
             };
         });
 
-        res.json({ success: true, data: merged });
+        res.json({
+            success: true,
+            data: merged,
+            checkedIn: true,
+            project: { projectNo: checkedInProjectNo, projectName: fixArabic(checkedInProjRows[0].projectName) },
+        });
 
     } catch (err) {
         console.error('❌ DELIVERED ITEMS ERROR:', err);
@@ -1146,7 +1777,7 @@ router.post("/confirm-delivery-batch", authenticateToken, async (req, res) => {
 
 // POST /api/follow-up/delivery-status
 // Confirms a delivery as DELIVERED or MISSING, with an optional photo (mobile).
-router.post("/delivery-status", authenticateToken, authorizeRoles('user', 'admin'), uploadDeliveryPhoto.single("photo"), async (req, res) => {
+router.post("/delivery-status", authenticateToken, requirePermission(PERMISSIONS.FIELD_CHECK_DELIVERY), uploadDeliveryPhoto.single("photo"), async (req, res) => {
     try {
         const { barcode, note } = req.body;
         const status = (req.body.status || "DELIVERED").toUpperCase();
@@ -1187,7 +1818,18 @@ router.post("/location", authenticateToken, async (req, res) => {
 
         const teamId = await resolveTeamIdForUser(req.user);
         if (!teamId) {
-            return res.status(400).json({ success: false, message: "No team assigned to this user" });
+            // Distinct `code` (not just the message) so the mobile client can
+            // reliably tell "this account will never resolve a team" (a
+            // regular, non-leader team member -- resolveTeamIdForUser only
+            // matches instTeams.leader_emp_no, a deliberate restriction, see
+            // that function's own comment) apart from a transient failure
+            // worth a normal retry. Without this, mobile/tasks/locationTask.ts
+            // has no way to distinguish the two and keeps retrying a call
+            // that can never succeed for that account -- confirmed live
+            // (2026-09-09) as a tight ~3s repeat loop for a non-leader
+            // employee, likely an expo-location/Android quirk not honoring
+            // the configured 30-minute interval.
+            return res.status(400).json({ success: false, code: "NO_TEAM_ASSIGNED", message: "No team assigned to this user" });
         }
 
         // upsertTeamLocation silently no-ops if teamId doesn't reference a
@@ -1207,7 +1849,7 @@ router.post("/location", authenticateToken, async (req, res) => {
  * the same team+order, and counts installation steps completed by that
  * team's members while on-site during that visit.
  * ------------------------ */
-router.get('/reports/checkin-checkout', authenticateToken, authorizeRoles('installation_manager', 'admin'), async (req, res) => {
+router.get('/reports/checkin-checkout', authenticateToken, requirePermission(PERMISSIONS.INSTALLATION_REPORTS), async (req, res) => {
     try {
         // Team names read correctly via sequelize2, but the `project` table's
         // Arabic text needs the primary `sequelize` connection's latin1->UTF-8
@@ -1253,20 +1895,19 @@ router.get('/reports/checkin-checkout', authenticateToken, authorizeRoles('insta
             { type: QueryTypes.SELECT, replacements }
         );
 
-        // `completedAt` exists on instOrderSteps but nothing in this codebase
-        // ever writes to it (step-status updates only set `updatedAt`), so it
-        // stays NULL forever — use `updatedAt` + status instead as the real
-        // completion signal.
+        // Materials confirmed installed per order, in the same window — the
+        // component-tracking equivalent of the old completed-steps query.
+        // InstOrderComponents lives on the utf8mb4 connection but joins fine
+        // against instOrderItems/instOrders (same physical schema, see
+        // config/db.js) since nothing selected here needs Arabic decoding.
         const orderIds = [...new Set(checkpoints.map(c => c.order_id))];
-        const completedSteps = orderIds.length
-            ? await sequelize.query(
+        const installedComponents = orderIds.length
+            ? await sequelizeUtf8.query(
                 `
-                SELECT iod.instOrderId AS orderId, s.updatedAt AS completedAt,
-                       COALESCE(st.standardTime, 0) AS standardTime
-                FROM IIT_Petra.instOrderSteps s
-                JOIN IIT_Petra.instOrderItems iod ON iod.id = s.instOrderItemId
-                LEFT JOIN IIT_Petra.instSteps st ON st.instStepId = s.instStepId
-                WHERE iod.instOrderId IN (:orderIds) AND LOWER(s.status) = 'completed'
+                SELECT iod.instOrderId AS orderId, c.updatedAt AS completedAt
+                FROM IIT_Petra.InstOrderComponents c
+                JOIN IIT_Petra.instOrderItems iod ON iod.id = c.instOrderItemId
+                WHERE iod.instOrderId IN (:orderIds) AND c.status = 'Installed'
                 `,
                 { replacements: { orderIds }, type: QueryTypes.SELECT }
             )
@@ -1296,21 +1937,20 @@ router.get('/reports/checkin-checkout', authenticateToken, authorizeRoles('insta
                         pendingIn = null;
                         continue;
                     }
-                    const stepsInWindow = completedSteps.filter(
-                        s => s.orderId === ev.order_id &&
-                            new Date(s.completedAt) >= checkIn &&
-                            new Date(s.completedAt) <= checkOut
+                    const itemsInWindow = installedComponents.filter(
+                        c => c.orderId === ev.order_id &&
+                            new Date(c.completedAt) >= checkIn &&
+                            new Date(c.completedAt) <= checkOut
                     );
-                    const itemsCompleted = stepsInWindow.length;
-                    const standardMinutes = Math.round(
-                        stepsInWindow.reduce((sum, s) => sum + Number(s.standardTime || 0), 0)
-                    );
+                    const itemsCompleted = itemsInWindow.length;
                     const durationMinutes = Math.round((checkOut - checkIn) / 60000);
-                    // Efficiency = standard (expected) time / actual time on-site.
-                    // >100% means faster than standard, <100% means slower. Null
-                    // when nothing was completed, since the ratio is meaningless.
-                    const efficiencyPercent = itemsCompleted > 0 && durationMinutes > 0
-                        ? Math.round((standardMinutes / durationMinutes) * 100)
+                    // Materials confirmed per hour on-site — a plain
+                    // productivity rate, not a comparison to a standard (no
+                    // per-material standard time exists in the component
+                    // model, unlike the old per-step one). Null when nothing
+                    // was completed, since the rate is meaningless.
+                    const itemsPerHour = itemsCompleted > 0 && durationMinutes > 0
+                        ? Math.round((itemsCompleted / (durationMinutes / 60)) * 10) / 10
                         : null;
 
                     visits.push({
@@ -1324,8 +1964,7 @@ router.get('/reports/checkin-checkout', authenticateToken, authorizeRoles('insta
                         checkOut: ev.createdAt,
                         durationMinutes,
                         itemsCompleted,
-                        standardMinutes,
-                        efficiencyPercent,
+                        itemsPerHour,
                     });
                     pendingIn = null;
                 }
@@ -1340,57 +1979,199 @@ router.get('/reports/checkin-checkout', authenticateToken, authorizeRoles('insta
     }
 });
 
+// Meters between two lat/lng points -- standard haversine, accurate enough
+// for a 500m threshold check (no need for a geodesy library here).
+function haversineMeters(lat1, lon1, lat2, lon2) {
+    const R = 6371000;
+    const toRad = (d) => (d * Math.PI) / 180;
+    const dLat = toRad(lat2 - lat1);
+    const dLon = toRad(lon2 - lon1);
+    const a =
+        Math.sin(dLat / 2) ** 2 +
+        Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return R * c;
+}
+
+const CHECKIN_LOCATION_THRESHOLD_METERS = 500;
+
 /** ------------------------
- * GET Issue/rework frequency report
- * Aggregates instOrderStepUpdates rows with status='Issue' by step type
- * (which step design/training tends to cause problems) and by team (which
- * teams report issues disproportionately).
+ * GET Check-in location verification report
+ * Flags 'inProject' checkpoints where the team's actual GPS location
+ * doesn't match the project's saved location within 500m -- catches wrong
+ * GPS, stale/missing project location data, or genuine attendance issues.
+ * Reuses the same project-location resolution as instOrders.js's
+ * GET /team-roster (direct @lat,lng in mapAddress, or ProjectMapCache for
+ * short Google Maps links) rather than re-resolving live here -- this is a
+ * read-only report, so a project whose short link hasn't been resolved yet
+ * is surfaced as 'noLocationData' rather than triggering a live fetch.
  * ------------------------ */
-router.get('/reports/issues', authenticateToken, authorizeRoles('installation_manager', 'admin'), async (req, res) => {
+router.get('/reports/checkin-location-check', authenticateToken, requirePermission(PERMISSIONS.INSTALLATION_REPORTS), async (req, res) => {
     try {
-        // sequelize2 (not the primary sequelize connection) reads Arabic
-        // text from instSteps correctly — same inconsistent per-table
-        // encoding as elsewhere in this legacy DB (see resolveTeamIdForUser
-        // and the checkin-checkout report for the same pattern).
-        // A single "report issue" submit from the mobile app has, at least
-        // historically, sometimes written several identical
-        // instOrderStepUpdates rows for the same step+moment (same
-        // problem_note/createdAt down to the second) — a client-side
-        // duplicate-submit bug, not several real reports. Group by
-        // step+timestamp so those collapse into one card, while genuinely
-        // separate issue reports on the same step at different times (a
-        // worker reports, it gets fixed, then a new problem shows up later)
-        // still show as distinct entries.
+        const teamRows = await sequelize2.query(
+            `SELECT id, name FROM IIT_Petra.instTeams`,
+            { type: QueryTypes.SELECT }
+        );
+        const teamNameById = new Map(teamRows.map(t => [t.id, t.name]));
+
         const { from, to } = req.query;
         const dateFilter = [];
         const replacements = {};
-        if (from) { dateFilter.push('u.createdAt >= :from'); replacements.from = `${from} 00:00:00`; }
-        if (to) { dateFilter.push('u.createdAt <= :to'); replacements.to = `${to} 23:59:59`; }
+        if (from) { dateFilter.push('cp.createdAt >= :from'); replacements.from = `${from} 00:00:00`; }
+        if (to) { dateFilter.push('cp.createdAt <= :to'); replacements.to = `${to} 23:59:59`; }
         const dateWhere = dateFilter.length ? ` AND ${dateFilter.join(' AND ')}` : '';
 
-        const rows = await sequelize2.query(
+        // Same project-join path as /reports/checkin-checkout above --
+        // instOrderItems -> masterControl -> project, not instReqMaster
+        // (that's the wrong path for this table's project link).
+        const checkpoints = await sequelize.query(
             `
             SELECT
-                MIN(u.id) AS id,
-                MIN(u.problem_note) AS problem_note,
-                u.createdAt,
-                MIN(st.stepName) AS stepName,
-                MIN(ira.teamId) AS teamId,
-                MIN(io.order_number) AS orderNumber,
-                MIN(m.unitIdDetail) AS unitNo,
-                MIN(s.status) AS currentStepStatus,
-                MIN(u.image_before) AS photo
-            FROM IIT_Petra.instOrderStepUpdates u
-            JOIN IIT_Petra.instOrderSteps s ON s.id = u.instOrderStepId
-            LEFT JOIN IIT_Petra.instSteps st ON st.instStepId = s.instStepId
-            JOIN IIT_Petra.instOrderItems iod ON iod.id = s.instOrderItemId
+                cp.id AS checkpointId,
+                cp.team_id,
+                cp.order_id,
+                cp.latitude,
+                cp.longitude,
+                cp.createdAt,
+                io.order_number AS orderNumber,
+                proj.projectId,
+                proj.projectName,
+                proj.projectNo,
+                proj.mapAddress
+            FROM IIT_Petra.instTeamCheckpoints cp
+            LEFT JOIN IIT_Petra.instOrders io ON io.id = cp.order_id
+            LEFT JOIN (
+                SELECT iod.instOrderId, MIN(j.projectId) AS projectId, MIN(j.projectName) AS projectName,
+                       MIN(j.projectNo) AS projectNo, MIN(j.mapAddress) AS mapAddress
+                FROM IIT_Petra.instOrderItems iod
+                LEFT JOIN IIT_Petra.masterControl m ON m.rowId = iod.rowId
+                LEFT JOIN IIT_Petra.project j ON m.projectId = j.projectId
+                GROUP BY iod.instOrderId
+            ) proj ON proj.instOrderId = io.id
+            WHERE cp.checkpoint_type = 'inProject'
+              AND cp.order_id IS NOT NULL${dateWhere}
+            ORDER BY cp.createdAt DESC
+            `,
+            { type: QueryTypes.SELECT, replacements }
+        );
+
+        // Resolve each distinct project's coordinates once -- same
+        // resolution rules as GET /team-roster: a direct @lat,lng in
+        // mapAddress is parsed inline; a short Google Maps link only
+        // resolves from ProjectMapCache (no live fetch here).
+        const projectIds = [...new Set(checkpoints.map(c => c.projectId).filter(Boolean))];
+        const mapCache = projectIds.length
+            ? await ProjectMapCache.findAll({ where: { projectId: projectIds } })
+            : [];
+        const mapCacheByProjectId = new Map(mapCache.map(c => [c.projectId, c]));
+
+        const coordsByProjectId = new Map();
+        for (const c of checkpoints) {
+            if (!c.projectId || coordsByProjectId.has(c.projectId)) continue;
+            let coordinates = extractCoords(c.mapAddress);
+            if (!coordinates && isShortMapLink(c.mapAddress)) {
+                const hit = mapCacheByProjectId.get(c.projectId);
+                if (hit && hit.mapAddress === c.mapAddress) coordinates = hit.coordinates;
+            }
+            coordsByProjectId.set(c.projectId, coordinates);
+        }
+
+        const data = checkpoints.map((cp) => {
+            const projectCoords = cp.projectId ? coordsByProjectId.get(cp.projectId) : null;
+            let projectLat = null;
+            let projectLng = null;
+            if (projectCoords) {
+                const [latStr, lngStr] = projectCoords.split(',').map((s) => s.trim());
+                projectLat = parseFloat(latStr);
+                projectLng = parseFloat(lngStr);
+            }
+
+            let status;
+            let distanceMeters = null;
+            if (!cp.projectId) {
+                status = 'noProjectLinked';
+            } else if (projectLat == null || Number.isNaN(projectLat) || projectLng == null || Number.isNaN(projectLng)) {
+                status = 'noLocationData';
+            } else {
+                distanceMeters = Math.round(
+                    haversineMeters(Number(cp.latitude), Number(cp.longitude), projectLat, projectLng)
+                );
+                status = distanceMeters > CHECKIN_LOCATION_THRESHOLD_METERS ? 'mismatch' : 'ok';
+            }
+
+            return {
+                checkpointId: cp.checkpointId,
+                teamId: cp.team_id,
+                teamName: teamNameById.get(cp.team_id) || `Team ${cp.team_id}`,
+                orderId: cp.order_id,
+                orderNumber: cp.orderNumber,
+                projectId: cp.projectId,
+                projectName: fixArabic(cp.projectName),
+                projectNo: cp.projectNo,
+                checkedAt: cp.createdAt,
+                checkpointLat: Number(cp.latitude),
+                checkpointLng: Number(cp.longitude),
+                projectLat,
+                projectLng,
+                distanceMeters,
+                status,
+            };
+        });
+
+        res.json({ success: true, data, thresholdMeters: CHECKIN_LOCATION_THRESHOLD_METERS });
+    } catch (err) {
+        console.error("CHECKIN LOCATION CHECK REPORT ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to build report" });
+    }
+});
+
+/** ------------------------
+ * GET Issue/rework frequency report
+ * Aggregates InstOrderComponents rows with status='Issue' by material
+ * (which product types disproportionately cause problems) and by team
+ * (which teams report issues disproportionately).
+ *
+ * Unlike the old instOrderStepUpdates-based version, there's no
+ * active/history split here: InstOrderComponents is a current-state row
+ * per (item, barcode), not an append-only log (see the model's own
+ * comment) -- once a flagged material is reconfirmed Installed, its
+ * Issue record is overwritten in place with no trace of the prior state,
+ * so "issues later fixed by the worker" genuinely can't be reconstructed
+ * from this schema. This only ever shows materials CURRENTLY flagged.
+ * ------------------------ */
+router.get('/reports/issues', authenticateToken, requirePermission(PERMISSIONS.INSTALLATION_REPORTS), async (req, res) => {
+    try {
+        const { from, to } = req.query;
+        const dateFilter = [];
+        const replacements = {};
+        if (from) { dateFilter.push('c.updatedAt >= :from'); replacements.from = `${from} 00:00:00`; }
+        if (to) { dateFilter.push('c.updatedAt <= :to'); replacements.to = `${to} 23:59:59`; }
+        const dateWhere = dateFilter.length ? ` AND ${dateFilter.join(' AND ')}` : '';
+
+        // InstOrderComponents (utf8mb4 connection) joined straight to
+        // instOrderItems/instReqAssignments/instOrders/masterControl (same
+        // physical schema, see config/db.js) -- none of the columns
+        // selected here need Arabic decoding except productName/unitNo,
+        // defensively passed through fixArabic() below same as elsewhere.
+        const rows = await sequelizeUtf8.query(
+            `
+            SELECT
+                c.id,
+                c.note,
+                c.updatedAt AS createdAt,
+                c.productName,
+                c.mediaUrl,
+                ira.teamId,
+                io.order_number AS orderNumber,
+                m.unitIdDetail AS unitNo
+            FROM IIT_Petra.InstOrderComponents c
+            JOIN IIT_Petra.instOrderItems iod ON iod.id = c.instOrderItemId
             LEFT JOIN IIT_Petra.instReqAssignments ira
                 ON ira.instReqDetId = iod.instReqDetId AND ira.instOrderId = iod.instOrderId
             LEFT JOIN IIT_Petra.instOrders io ON io.id = iod.instOrderId
             LEFT JOIN IIT_Petra.masterControl m ON m.rowId = iod.rowId
-            WHERE LOWER(u.status) = 'issue'${dateWhere}
-            GROUP BY s.id, u.createdAt
-            ORDER BY u.createdAt DESC
+            WHERE c.status = 'Issue'${dateWhere}
+            ORDER BY c.updatedAt DESC
             `,
             { type: QueryTypes.SELECT, replacements }
         );
@@ -1398,11 +2179,11 @@ router.get('/reports/issues', authenticateToken, authorizeRoles('installation_ma
         const teamRows = await sequelize2.query(`SELECT id, name FROM IIT_Petra.instTeams`, { type: QueryTypes.SELECT });
         const teamNameById = new Map(teamRows.map(t => [t.id, t.name]));
 
-        const byStep = new Map();
+        const byProduct = new Map();
         const byTeam = new Map();
         for (const r of rows) {
-            const stepName = fixArabic(r.stepName) || 'Unknown step';
-            byStep.set(stepName, (byStep.get(stepName) || 0) + 1);
+            const productName = fixArabic(r.productName) || 'Unknown material';
+            byProduct.set(productName, (byProduct.get(productName) || 0) + 1);
 
             if (r.teamId) {
                 const teamName = teamNameById.get(r.teamId) || `Team ${r.teamId}`;
@@ -1411,8 +2192,8 @@ router.get('/reports/issues', authenticateToken, authorizeRoles('installation_ma
             }
         }
 
-        const byStepType = Array.from(byStep.entries())
-            .map(([stepName, count]) => ({ stepName, count }))
+        const byProductType = Array.from(byProduct.entries())
+            .map(([productName, count]) => ({ productName, count }))
             .sort((a, b) => b.count - a.count);
 
         const byTeamArr = Array.from(byTeam.entries())
@@ -1424,7 +2205,11 @@ router.get('/reports/issues', authenticateToken, authorizeRoles('installation_ma
 
         // Follow-up notes managers have attached to these issues — merged in
         // here so the frontend can render each issue with its note (if any)
-        // in a single request.
+        // in a single request. issueId now references InstOrderComponents.id
+        // going forward (it's a plain, un-constrained BIGINT column — see
+        // models/FollowUpNotes.js — so no migration needed, but notes
+        // attached to pre-migration instOrderStepUpdates ids won't surface
+        // here any more).
         const issueIds = rows.map(r => r.id);
         const notes = issueIds.length
             ? await FollowUpNotes.findAll({ where: { issueId: issueIds } })
@@ -1438,25 +2223,18 @@ router.get('/reports/issues', authenticateToken, authorizeRoles('installation_ma
             !u ? null : ([fixArabic(u.firstName), fixArabic(u.lastName)].filter(Boolean).join(' ').trim() || u.username);
         const noteByIssueId = new Map(notes.map(n => [n.issueId, n]));
 
-        const allIssues = rows.map(r => {
+        const issues = rows.map(r => {
             const note = noteByIssueId.get(r.id);
-            // The step's CURRENT status (not this update's status, which is
-            // always 'issue' by the WHERE clause above) — if the worker has
-            // since redone the step and it's no longer 'issue', the problem
-            // has been fixed in the field and this moves to history instead
-            // of sitting in the active follow-up list forever.
-            const fixedByWorker = !!r.currentStepStatus && String(r.currentStepStatus).toLowerCase() !== 'issue';
             return {
                 issueId: r.id,
-                problemNote: fixArabic(r.problem_note),
+                problemNote: fixArabic(r.note),
                 createdAt: r.createdAt,
-                stepName: fixArabic(r.stepName) || 'Unknown step',
+                productName: fixArabic(r.productName) || 'Unknown material',
                 teamId: r.teamId,
                 teamName: r.teamId ? teamNameById.get(r.teamId) || `Team ${r.teamId}` : null,
                 orderNumber: r.orderNumber,
                 unitNo: r.unitNo,
-                photo: r.photo || null,
-                fixedByWorker,
+                photo: r.mediaUrl || null,
                 followUpNote: note
                     ? {
                         id: note.id,
@@ -1471,12 +2249,9 @@ router.get('/reports/issues', authenticateToken, authorizeRoles('installation_ma
             };
         });
 
-        const issues = allIssues.filter(i => !i.fixedByWorker);
-        const historyIssues = allIssues.filter(i => i.fixedByWorker);
-
         res.json({
             success: true,
-            data: { totalIssues: rows.length, byStepType, byTeam: byTeamArr, issues, historyIssues },
+            data: { totalIssues: rows.length, byProductType, byTeam: byTeamArr, issues },
         });
     } catch (err) {
         console.error("ISSUES REPORT ERROR:", err);
@@ -1512,7 +2287,7 @@ async function fetchUnoByBarcodeChunked(pool, barcodes, selectCols) {
  * SQL Server (barcode -> UNO), so this requires bridging two separate
  * database engines rather than a single SQL join.
  * ------------------------ */
-router.get('/reports/delivery-lag', authenticateToken, authorizeRoles('installation_manager', 'admin'), async (req, res) => {
+router.get('/reports/delivery-lag', authenticateToken, requirePermission(PERMISSIONS.INSTALLATION_REPORTS), async (req, res) => {
     try {
         const delivered = await sequelize2.query(
             `SELECT Insbarcode, InsDeliverdDate FROM IIT_Petra.InsDelivered WHERE Insbarcode IS NOT NULL`,
@@ -1538,18 +2313,18 @@ router.get('/reports/delivery-lag', authenticateToken, authorizeRoles('installat
             }
         }
 
-        // Earliest real activity (any step update) per item = when
-        // installation actually started for that unit.
-        const items = await sequelize2.query(
+        // Earliest real activity (any material first scanned -- see
+        // registerMaterialScan in services/instOrderComponents.js) per item
+        // = when installation actually started for that unit.
+        const items = await sequelizeUtf8.query(
             `
             SELECT
                 iod.id AS instOrderItemId,
                 m.unitIdDetail AS unitNo,
                 io.order_number AS orderNumber,
-                MIN(u.createdAt) AS firstActivity
+                MIN(c.createdAt) AS firstActivity
             FROM IIT_Petra.instOrderItems iod
-            JOIN IIT_Petra.instOrderSteps s ON s.instOrderItemId = iod.id
-            JOIN IIT_Petra.instOrderStepUpdates u ON u.instOrderStepId = s.id
+            JOIN IIT_Petra.InstOrderComponents c ON c.instOrderItemId = iod.id
             LEFT JOIN IIT_Petra.masterControl m ON m.rowId = iod.rowId
             LEFT JOIN IIT_Petra.instOrders io ON io.id = iod.instOrderId
             GROUP BY iod.id, m.unitIdDetail, io.order_number
@@ -1593,97 +2368,13 @@ router.get('/reports/delivery-lag', authenticateToken, authorizeRoles('installat
 });
 
 /** ------------------------
- * GET Standard-time calibration report
- * Flags step types where the real-world time chronically over/under-shoots
- * instSteps.standardTime, to help correct bad estimates.
- *
- * There's no reliable "work started" timestamp per step (assignedAt is
- * never populated, and most steps only ever get a single "completed"
- * update — no in_progress tracking in practice), so true per-step duration
- * isn't directly measurable. Instead this uses the time gap between
- * consecutive step completions within the same item (ordered by
- * stepOrder) as a defensible proxy for how long each step actually took.
- * ------------------------ */
-router.get('/reports/standard-time-calibration', authenticateToken, authorizeRoles('installation_manager', 'admin'), async (req, res) => {
-    try {
-        const { from, to } = req.query;
-        const dateFilter = [];
-        const replacements = {};
-        if (from) { dateFilter.push('s.updatedAt >= :from'); replacements.from = `${from} 00:00:00`; }
-        if (to) { dateFilter.push('s.updatedAt <= :to'); replacements.to = `${to} 23:59:59`; }
-        const dateWhere = dateFilter.length ? ` AND ${dateFilter.join(' AND ')}` : '';
-
-        const rows = await sequelize2.query(
-            `
-            SELECT
-                s.instOrderItemId,
-                s.stepOrder,
-                s.updatedAt,
-                st.stepName,
-                st.standardTime
-            FROM IIT_Petra.instOrderSteps s
-            LEFT JOIN IIT_Petra.instSteps st ON st.instStepId = s.instStepId
-            WHERE LOWER(s.status) IN ('completed', 'done')${dateWhere}
-            ORDER BY s.instOrderItemId, s.stepOrder ASC
-            `,
-            { type: QueryTypes.SELECT, replacements }
-        );
-
-        const byItem = new Map();
-        for (const r of rows) {
-            if (!byItem.has(r.instOrderItemId)) byItem.set(r.instOrderItemId, []);
-            byItem.get(r.instOrderItemId).push(r);
-        }
-
-        const samplesByStep = new Map(); // stepName -> { standardTime, actualMinutes: [] }
-        for (const steps of byItem.values()) {
-            for (let i = 1; i < steps.length; i++) {
-                const prev = steps[i - 1];
-                const cur = steps[i];
-                const gapMinutes = (new Date(cur.updatedAt) - new Date(prev.updatedAt)) / 60000;
-                // Skip non-positive/implausibly large gaps (batch imports,
-                // multiple steps closed in the same click, days-long gaps
-                // from a paused job) — keep this a sane same-session signal.
-                if (gapMinutes <= 0 || gapMinutes > 8 * 60) continue;
-
-                const stepName = fixArabic(cur.stepName) || 'Unknown step';
-                if (!samplesByStep.has(stepName)) {
-                    samplesByStep.set(stepName, { standardTime: Number(cur.standardTime) || 0, actualMinutes: [] });
-                }
-                samplesByStep.get(stepName).actualMinutes.push(gapMinutes);
-            }
-        }
-
-        const data = Array.from(samplesByStep.entries())
-            .map(([stepName, { standardTime, actualMinutes }]) => {
-                const avgActual = actualMinutes.reduce((s, v) => s + v, 0) / actualMinutes.length;
-                return {
-                    stepName,
-                    standardTime,
-                    avgActualMinutes: Math.round(avgActual),
-                    sampleSize: actualMinutes.length,
-                    ratioPercent: standardTime > 0 ? Math.round((avgActual / standardTime) * 100) : null,
-                };
-            })
-            // A single sample is too noisy to draw a calibration conclusion from.
-            .filter(d => d.sampleSize >= 3 && d.standardTime > 0)
-            .sort((a, b) => Math.abs((b.ratioPercent ?? 100) - 100) - Math.abs((a.ratioPercent ?? 100) - 100));
-
-        res.json({ success: true, data });
-    } catch (err) {
-        console.error("STANDARD TIME CALIBRATION ERROR:", err);
-        res.status(500).json({ success: false, message: "Failed to build calibration report" });
-    }
-});
-
-/** ------------------------
  * GET Delivery status report
  * For every item on an active installation order, shows whether it's been
  * delivered yet (matched via warehouse UNO -> InsDelivered barcode, same
  * matching approach as /reports/delivery-lag), aggregated per project and
  * per team so a manager can see delivery completion at a glance.
  * ------------------------ */
-router.get('/reports/delivery-status', authenticateToken, authorizeRoles('installation_manager', 'admin'), async (req, res) => {
+router.get('/reports/delivery-status', authenticateToken, requirePermission(PERMISSIONS.INSTALLATION_REPORTS), async (req, res) => {
     try {
         // Team names read correctly via sequelize2 but not through the
         // primary `sequelize` connection used below for `project` (same
@@ -1785,7 +2476,7 @@ router.get('/reports/delivery-status', authenticateToken, authorizeRoles('instal
  * issues reported today. Accepts an optional ?date=YYYY-MM-DD to look at a
  * past day instead of today.
  * ------------------------ */
-router.get('/reports/daily-activity', authenticateToken, authorizeRoles('installation_manager', 'admin'), async (req, res) => {
+router.get('/reports/daily-activity', authenticateToken, requirePermission(PERMISSIONS.INSTALLATION_REPORTS), async (req, res) => {
     try {
         const dateParam = /^\d{4}-\d{2}-\d{2}$/.test(req.query?.date || '') ? req.query.date : null;
 
@@ -1806,16 +2497,19 @@ router.get('/reports/daily-activity', authenticateToken, authorizeRoles('install
             { replacements: { date: dateParam }, type: QueryTypes.SELECT }
         );
 
-        const stepUpdatesToday = await sequelize2.query(
+        // Component confirm/issue actions today, the InstOrderComponents
+        // equivalent of the old instOrderStepUpdates-based query. Joined
+        // straight through to instReqAssignments (same physical schema, see
+        // config/db.js) since none of these columns need Arabic decoding.
+        const componentUpdatesToday = await sequelizeUtf8.query(
             `
-            SELECT u.status, ira.teamId
-            FROM IIT_Petra.instOrderStepUpdates u
-            JOIN IIT_Petra.instOrderSteps s ON s.id = u.instOrderStepId
-            JOIN IIT_Petra.instOrderItems iod ON iod.id = s.instOrderItemId
+            SELECT c.status, ira.teamId
+            FROM IIT_Petra.InstOrderComponents c
+            JOIN IIT_Petra.instOrderItems iod ON iod.id = c.instOrderItemId
             LEFT JOIN IIT_Petra.instReqAssignments ira
                 ON ira.instReqDetId = iod.instReqDetId AND ira.instOrderId = iod.instOrderId
-            WHERE DATE(u.createdAt) = COALESCE(:date, CURDATE())
-              AND LOWER(u.status) IN ('completed', 'done', 'issue')
+            WHERE DATE(c.updatedAt) = COALESCE(:date, CURDATE())
+              AND c.status IN ('Installed', 'Issue')
             `,
             { replacements: { date: dateParam }, type: QueryTypes.SELECT }
         );
@@ -1830,7 +2524,7 @@ router.get('/reports/daily-activity', authenticateToken, authorizeRoles('install
                     checkpointsToday: 0,
                     currentlyOnSite: false,
                     ordersVisitedToday: new Set(),
-                    stepsCompletedToday: 0,
+                    itemsCompletedToday: 0,
                     issuesReportedToday: 0,
                 });
             }
@@ -1848,11 +2542,10 @@ router.get('/reports/daily-activity', authenticateToken, authorizeRoles('install
             ensureTeam(teamId).currentlyOnSite = lastType === 'inProject';
         }
 
-        for (const u of stepUpdatesToday) {
+        for (const u of componentUpdatesToday) {
             const t = ensureTeam(u.teamId);
-            const status = String(u.status).toLowerCase();
-            if (status === 'issue') t.issuesReportedToday++;
-            else t.stepsCompletedToday++;
+            if (u.status === 'Issue') t.issuesReportedToday++;
+            else t.itemsCompletedToday++;
         }
 
         const data = [...byTeam.values()]

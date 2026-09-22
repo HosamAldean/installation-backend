@@ -1,11 +1,15 @@
 ﻿import express from 'express';
 import { User } from '../models/User.js';
+import { UserAccountAudit } from '../models/UserAccountAudit.js';
 import { getSqlPool } from '../config/db.js';
 import { Op } from 'sequelize'
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import { authenticateToken, authorizeRoles } from '../middleware/auth.js';
-import { isSupervisorOf, getSupervisedEmpNos } from '../utils/supervisorLookup.js';
+import { requirePermission, getPermissionsForRole } from '../middleware/permissions.js';
+import { PERMISSIONS } from '../constants/permissions.js';
+import { isSupervisorOf, getSupervisedEmpNos, ROLE_EXTRA_WORK_PLACES, getWorkPlaceEmpNos } from '../utils/supervisorLookup.js';
+import { isHrScopedRole, getHrScopedEmpNos, isInHrScope } from '../utils/hrScope.js';
 
 const router = express.Router();
 
@@ -18,6 +22,12 @@ const router = express.Router();
 ---------------------------------- */
 const requireAuth = authenticateToken;
 const requireAdmin = authorizeRoles('admin');
+// Gate on top of requireAuth for the account-management endpoints below
+// (list/create/update) -- this file's own data-driven Supervisor_No/
+// HR-tier scoping (see hasCompanyWideScope/getScopedEmpNos further down)
+// still decides *whose* accounts a manager can touch; this decides
+// whether they can reach these endpoints at all.
+const requireManageUsers = requirePermission(PERMISSIONS.USERS_MANAGE);
 
 // Privileged roles that only an actual admin account may grant, revoke, or
 // touch at all -- CORRECTED: this whole file used to gate every write
@@ -30,16 +40,71 @@ const requireAdmin = authorizeRoles('admin');
 // hr/admin account at all, stays admin-only. hr_manager is treated
 // identically to hr throughout this file (same company-wide scope, same
 // privilege) -- it's a senior HR role, not a differently-scoped one.
-const PRIVILEGED_ROLES = ['admin', 'hr', 'hr_manager'];
+// hr_factory/hr_ittihad are the 2 other HR-tier roles split out of the old
+// blanket 'hr' (see utils/hrScope.js) -- same admin-only grant/touch
+// restriction applies to both.
+const PRIVILEGED_ROLES = ['admin', 'hr', 'hr_manager', 'hr_factory', 'hr_ittihad'];
 
-// admin and hr(_manager) get company-wide scope (any employee, not just
-// their own reports) for listing/creating/managing user accounts -- HR
-// realistically onboards people across the whole company, not just people
-// who report to HR itself. Granting the admin/hr role to someone else is
-// still admin-only (see PRIVILEGED_ROLES above) -- this is about *whose*
-// accounts you can touch, not *what* you can turn them into.
+// Further restricts which roles specific manager roles may assign, on top
+// of the PRIVILEGED_ROLES block above -- e.g. installation_manager can
+// manage accounts for anyone in its scope (see getScopedEmpNos), but may
+// only ever set their role to one of these, not e.g. 'sales' or
+// 'shipping_manager' just because it happens to supervise someone with that
+// role today. installation_supervisor (view-only, see
+// blockWritesForReadOnlyRoles in middleware/permissions.js) is included --
+// installation_manager can hand out read-only access itself without
+// needing an admin. Roles with no entry here keep the old behavior
+// (anything not in PRIVILEGED_ROLES).
+const ROLE_ASSIGNABLE_ROLES = {
+    installation_manager: ['employee', 'installation_manager', 'installation_employee', 'installation_supervisor'],
+};
+
+function isRoleAssignable(actorRole, targetRole) {
+    const allowed = ROLE_ASSIGNABLE_ROLES[actorRole];
+    return !allowed || allowed.includes(targetRole);
+}
+
+// Only admin and hr_manager get company-wide scope (any employee, not just
+// their own reports) for listing/creating/managing user accounts -- hr_manager
+// stays the "senior HR, sees everything" tier. Plain hr is no longer
+// company-wide: it's one of the 3 scoped HR-tier roles (hr_factory,
+// hr_ittihad, hr -- see utils/hrScope.js), each limited to its own slice
+// of the company (hr's slice is the whole "everyone else" pool). Granting
+// any HR-tier role to someone else is still admin-only regardless (see
+// PRIVILEGED_ROLES above) -- this is about *whose* accounts you can touch,
+// not *what* you can turn them into.
 function hasCompanyWideScope(role) {
-    return role === 'admin' || role === 'hr' || role === 'hr_manager';
+    return role === 'admin' || role === 'hr_manager';
+}
+
+// Union of "employees this manager supervises per PayEmp.Supervisor_No",
+// "employees in this role's extra department scope" (see
+// ROLE_EXTRA_WORK_PLACES in supervisorLookup.js -- e.g. installation_manager
+// also covers Work_place 7500/7310 company-wide, regardless of who actually
+// supervises those employees in ERP), and "employees in this HR-tier role's
+// company/department/emp-number scope" (see utils/hrScope.js).
+async function getScopedEmpNos(req) {
+    const supervisorEmpNo = req.user.assignedEmpNo ? parseInt(req.user.assignedEmpNo) : null;
+    const supervised = await getSupervisedEmpNos(supervisorEmpNo);
+    const extraWorkPlaces = ROLE_EXTRA_WORK_PLACES[req.user.role];
+    const extra = extraWorkPlaces ? await getWorkPlaceEmpNos(extraWorkPlaces) : [];
+    const hrScoped = isHrScopedRole(req.user.role) ? await getHrScopedEmpNos(req.user.role) : [];
+    return [...new Set([...supervised, ...extra, ...hrScoped])];
+}
+
+// Single-target version of getScopedEmpNos, for create/update handlers that
+// only need to check one employee rather than list the whole scope.
+async function isInManagerScope(req, targetEmpNo) {
+    if (isNaN(targetEmpNo)) return false;
+    const supervisorEmpNo = req.user.assignedEmpNo ? parseInt(req.user.assignedEmpNo) : null;
+    if (await isSupervisorOf(supervisorEmpNo, targetEmpNo)) return true;
+    const extraWorkPlaces = ROLE_EXTRA_WORK_PLACES[req.user.role];
+    if (extraWorkPlaces) {
+        const deptEmpNos = await getWorkPlaceEmpNos(extraWorkPlaces);
+        if (deptEmpNos.includes(targetEmpNo)) return true;
+    }
+    if (isHrScopedRole(req.user.role) && await isInHrScope(req.user.role, targetEmpNo)) return true;
+    return false;
 }
 
 /* ----------------------------------
@@ -75,12 +140,11 @@ router.get('/me', requireAuth, async (req, res) => {
    LIST users (Admin sees everyone; any manager sees only the users
    under them, per PayEmp.Supervisor_No)
 ---------------------------------- */
-router.get('/', requireAuth, async (req, res) => {
+router.get('/', requireAuth, requireManageUsers, async (req, res) => {
     try {
         let supervisedUsernames = null; // null = no restriction (admin/hr)
         if (!hasCompanyWideScope(req.user.role)) {
-            const supervisorEmpNo = req.user.assignedEmpNo ? parseInt(req.user.assignedEmpNo) : null;
-            const supervisedEmpNos = await getSupervisedEmpNos(supervisorEmpNo);
+            const supervisedEmpNos = await getScopedEmpNos(req);
             if (supervisedEmpNos.length === 0) {
                 return res.json({ success: true, users: [], total: 0, page: 1, pageSize: 50 });
             }
@@ -144,13 +208,16 @@ router.get('/', requireAuth, async (req, res) => {
    own reports; only an actual admin may assign an hr/admin role --
    see PRIVILEGED_ROLES/hasCompanyWideScope above)
 ---------------------------------- */
-router.post('/', requireAuth, async (req, res) => {
+router.post('/', requireAuth, requireManageUsers, async (req, res) => {
     try {
-        const { empNo, role = 'user', teamId: bodyTeamId, password: bodyPassword, assignedStore } = req.body;
+        const { empNo, role = 'installation_employee', teamId: bodyTeamId, password: bodyPassword, assignedStore } = req.body;
         const isAdmin = req.user.role === 'admin';
 
         if (!isAdmin && PRIVILEGED_ROLES.includes(role)) {
             return res.status(403).json({ success: false, message: 'Only an admin can assign this role' });
+        }
+        if (!isAdmin && !isRoleAssignable(req.user.role, role)) {
+            return res.status(403).json({ success: false, message: 'You are not allowed to assign this role' });
         }
 
         if (!hasCompanyWideScope(req.user.role)) {
@@ -161,8 +228,7 @@ router.post('/', requireAuth, async (req, res) => {
             if (!empNo) {
                 return res.status(403).json({ success: false, message: 'Forbidden' });
             }
-            const supervisorEmpNo = req.user.assignedEmpNo ? parseInt(req.user.assignedEmpNo) : null;
-            const allowed = await isSupervisorOf(supervisorEmpNo, parseInt(empNo));
+            const allowed = await isInManagerScope(req, parseInt(empNo));
             if (!allowed) {
                 return res.status(403).json({ success: false, message: 'You can only create accounts for employees who report to you' });
             }
@@ -236,6 +302,14 @@ router.post('/', requireAuth, async (req, res) => {
             active: true,
         });
 
+        await UserAccountAudit.create({
+            targetUserId: user.userId,
+            targetUsername: user.username,
+            action: 'created',
+            newValue: role,
+            performedByUserId: req.user.userId,
+        });
+
         res.status(201).json({ success: true, user });
     } catch (err) {
         console.error(err);
@@ -258,6 +332,18 @@ router.patch('/:id', requireAuth, async (req, res) => {
         const isSelf = req.user.userId === Number(id);
         const hasScope = hasCompanyWideScope(req.user.role);
 
+        // Not applied as router-level middleware like the other endpoints
+        // here (see requireManageUsers above) -- profile.tsx calls this
+        // same endpoint for every account editing its OWN profile, so a
+        // blanket gate would lock ordinary employees out of that. Only
+        // touching *someone else's* account needs the permission.
+        if (!isSelf && !isAdmin) {
+            const granted = await getPermissionsForRole(req.user.role);
+            if (!granted.includes(PERMISSIONS.USERS_MANAGE)) {
+                return res.status(403).json({ success: false, message: 'Forbidden' });
+            }
+        }
+
         const user = await User.findByPk(id);
         if (!user)
             return res.status(404).json({ success: false, message: 'User not found' });
@@ -270,9 +356,8 @@ router.patch('/:id', requireAuth, async (req, res) => {
             if (PRIVILEGED_ROLES.includes(user.role)) {
                 return res.status(403).json({ success: false, message: 'Forbidden' });
             }
-            const supervisorEmpNo = req.user.assignedEmpNo ? parseInt(req.user.assignedEmpNo) : null;
             const targetEmpNo = Number(user.username);
-            isManagerOfTarget = !isNaN(targetEmpNo) && await isSupervisorOf(supervisorEmpNo, targetEmpNo);
+            isManagerOfTarget = !isNaN(targetEmpNo) && await isInManagerScope(req, targetEmpNo);
             if (!isManagerOfTarget) {
                 return res.status(403).json({ success: false, message: 'Forbidden' });
             }
@@ -294,6 +379,13 @@ router.patch('/:id', requireAuth, async (req, res) => {
             active
         } = req.body;
 
+        // Captured before mutation -- see the UserAccountAudit writes
+        // below (after save), only for the security/privilege-relevant
+        // fields (role, active). Not firstName/lastName/email/avatarUrl --
+        // self-service profile edits aren't audit-worthy.
+        const previousRole = user.role;
+        const previousActive = user.active;
+
         if (firstName !== undefined) user.firstName = firstName;
         if (lastName !== undefined) user.lastName = lastName;
         if (email !== undefined) user.email = email;
@@ -306,6 +398,9 @@ router.patch('/:id', requireAuth, async (req, res) => {
                 if (!isAdmin && PRIVILEGED_ROLES.includes(role)) {
                     return res.status(403).json({ success: false, message: 'Only an admin can assign this role' });
                 }
+                if (!isAdmin && !isRoleAssignable(req.user.role, role)) {
+                    return res.status(403).json({ success: false, message: 'You are not allowed to assign this role' });
+                }
                 user.role = role;
             }
             if (teamId !== undefined) user.teamId = teamId;
@@ -314,6 +409,25 @@ router.patch('/:id', requireAuth, async (req, res) => {
         }
 
         await user.save();
+
+        if (previousRole !== user.role) {
+            await UserAccountAudit.create({
+                targetUserId: user.userId,
+                targetUsername: user.username,
+                action: 'role_changed',
+                oldValue: previousRole,
+                newValue: user.role,
+                performedByUserId: req.user.userId,
+            });
+        }
+        if (previousActive !== user.active) {
+            await UserAccountAudit.create({
+                targetUserId: user.userId,
+                targetUsername: user.username,
+                action: user.active ? 'activated' : 'deactivated',
+                performedByUserId: req.user.userId,
+            });
+        }
 
         res.json({ success: true });
     } catch (err) {
@@ -338,10 +452,136 @@ router.post('/:id/reset-password', requireAuth, requireAdmin, async (req, res) =
         user.password = await bcrypt.hash(password, 10);
         await user.save();
 
+        await UserAccountAudit.create({
+            targetUserId: user.userId,
+            targetUsername: user.username,
+            action: 'password_reset',
+            performedByUserId: req.user.userId,
+        });
+
         res.json({ success: true });
     } catch (err) {
         console.error(err);
         res.status(500).json({ success: false, message: 'Failed to reset password' });
+    }
+});
+
+/* ----------------------------------
+   BULK actions (Admin only)
+   Deliberately admin-only rather than replicating PATCH /:id's nuanced
+   self/manager-scope/hr-scope authorization for a multi-target operation --
+   a bulk action is inherently higher blast-radius, and delete/reset-
+   password are already admin-only regardless of that single-row
+   flexibility. Every affected user still gets its own UserAccountAudit
+   row (not one combined "bulk" entry) so the audit trail reads exactly
+   like N individual admin actions that happened to run together.
+---------------------------------- */
+const MAX_BULK_USER_IDS = 200;
+
+function parseBulkUserIds(body, req) {
+    const ids = Array.isArray(body?.userIds)
+        ? [...new Set(body.userIds.map(Number).filter((n) => Number.isInteger(n)))]
+        : [];
+    if (ids.length === 0 || ids.length > MAX_BULK_USER_IDS) return null;
+    // Never let an admin bulk-deactivate/role-change/delete their own
+    // account via a batch selection -- easy to select accidentally, and
+    // unlike a single deliberate self-edit this has no confirmation step
+    // naming just that one account.
+    return ids.filter((id) => id !== req.user.userId);
+}
+
+router.patch('/bulk/active', requireAuth, requireAdmin, async (req, res) => {
+    try {
+        const ids = parseBulkUserIds(req.body, req);
+        if (ids === null) {
+            return res.status(400).json({ success: false, message: `userIds must be a non-empty array of up to ${MAX_BULK_USER_IDS} ids` });
+        }
+        const active = !!req.body.active;
+        const skippedSelf = Array.isArray(req.body.userIds) && req.body.userIds.map(Number).includes(req.user.userId);
+
+        const users = await User.findAll({ where: { userId: ids } });
+        let updated = 0;
+        for (const user of users) {
+            if (user.active === active) continue;
+            user.active = active;
+            await user.save();
+            await UserAccountAudit.create({
+                targetUserId: user.userId,
+                targetUsername: user.username,
+                action: active ? 'activated' : 'deactivated',
+                performedByUserId: req.user.userId,
+            });
+            updated++;
+        }
+        res.json({ success: true, updated, skippedSelf });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ success: false, message: 'Failed to update users' });
+    }
+});
+
+router.patch('/bulk/role', requireAuth, requireAdmin, async (req, res) => {
+    try {
+        const ids = parseBulkUserIds(req.body, req);
+        if (ids === null) {
+            return res.status(400).json({ success: false, message: `userIds must be a non-empty array of up to ${MAX_BULK_USER_IDS} ids` });
+        }
+        const { role } = req.body;
+        if (!role || typeof role !== 'string') {
+            return res.status(400).json({ success: false, message: 'role is required' });
+        }
+        const skippedSelf = Array.isArray(req.body.userIds) && req.body.userIds.map(Number).includes(req.user.userId);
+
+        const users = await User.findAll({ where: { userId: ids } });
+        let updated = 0;
+        for (const user of users) {
+            if (user.role === role) continue;
+            const previousRole = user.role;
+            user.role = role;
+            await user.save();
+            await UserAccountAudit.create({
+                targetUserId: user.userId,
+                targetUsername: user.username,
+                action: 'role_changed',
+                oldValue: previousRole,
+                newValue: role,
+                performedByUserId: req.user.userId,
+            });
+            updated++;
+        }
+        res.json({ success: true, updated, skippedSelf });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ success: false, message: 'Failed to update users' });
+    }
+});
+
+router.delete('/bulk', requireAuth, requireAdmin, async (req, res) => {
+    try {
+        const ids = parseBulkUserIds(req.body, req);
+        if (ids === null) {
+            return res.status(400).json({ success: false, message: `userIds must be a non-empty array of up to ${MAX_BULK_USER_IDS} ids` });
+        }
+        const skippedSelf = Array.isArray(req.body.userIds) && req.body.userIds.map(Number).includes(req.user.userId);
+
+        const users = await User.findAll({ where: { userId: ids } });
+        let deleted = 0;
+        for (const user of users) {
+            const { userId, username, role } = user;
+            await user.destroy();
+            await UserAccountAudit.create({
+                targetUserId: userId,
+                targetUsername: username,
+                action: 'deleted',
+                oldValue: role,
+                performedByUserId: req.user.userId,
+            });
+            deleted++;
+        }
+        res.json({ success: true, deleted, skippedSelf });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ success: false, message: 'Failed to delete users' });
     }
 });
 
@@ -354,7 +594,20 @@ router.delete('/:id', requireAuth, requireAdmin, async (req, res) => {
         if (!user)
             return res.status(404).json({ success: false, message: 'User not found' });
 
+        // Captured before destroy() -- targetUserId won't resolve to a
+        // real account anymore afterward, so targetUsername/oldValue (the
+        // role they held) are the only record left of who this was.
+        const { userId, username, role } = user;
         await user.destroy();
+
+        await UserAccountAudit.create({
+            targetUserId: userId,
+            targetUsername: username,
+            action: 'deleted',
+            oldValue: role,
+            performedByUserId: req.user.userId,
+        });
+
         res.json({ success: true });
     } catch (err) {
         console.error(err);
@@ -373,8 +626,7 @@ router.get('/employees', requireAuth, async (req, res) => {
 
         let supervisedEmpNos = null;
         if (!hasCompanyWideScope(req.user.role)) {
-            const supervisorEmpNo = req.user.assignedEmpNo ? parseInt(req.user.assignedEmpNo) : null;
-            supervisedEmpNos = await getSupervisedEmpNos(supervisorEmpNo);
+            supervisedEmpNos = await getScopedEmpNos(req);
             if (supervisedEmpNos.length === 0) {
                 return res.json({ success: true, employees: [] });
             }

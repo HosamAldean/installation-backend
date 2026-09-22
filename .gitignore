@@ -27,6 +27,11 @@ tmp_post_test.js
 uploads/
 
 # ────────────────
+# Served build artifacts (mobile APK for OTA update downloads, etc.)
+# ────────────────
+public/downloads/
+
+# ────────────────
 # OS / IDE
 # ────────────────
 .DS_Store

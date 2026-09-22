@@ -29,11 +29,13 @@
 // quotations/project data -- not a port of the legacy report pages.
 import express from 'express';
 import { QueryTypes } from 'sequelize';
-import { authenticateToken, authorizeRoles } from '../middleware/auth.js';
+import { authenticateToken } from '../middleware/auth.js';
+import { requirePermission } from '../middleware/permissions.js';
+import { PERMISSIONS } from '../constants/permissions.js';
 import { sequelize2PetraErp } from '../config/db.js';
 
 const router = express.Router();
-router.use(authenticateToken, authorizeRoles('sales_manager', 'admin'));
+router.use(authenticateToken, requirePermission(PERMISSIONS.PETRA_ERP_REPORTING));
 
 // Per-offer effective value: best (max) quotation choice, price net of
 // its line discount. See file header -- verified against three legacy

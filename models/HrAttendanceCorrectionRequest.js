@@ -11,7 +11,7 @@ export const HrAttendanceCorrectionRequest = sequelizeUtf8.define('HrAttendanceC
     requesterUserId: { type: DataTypes.INTEGER, allowNull: false },
     requesterEmpNo: { type: DataTypes.INTEGER, allowNull: false },
     status: {
-        type: DataTypes.ENUM('pending_manager', 'pending_hr', 'approved', 'rejected'),
+        type: DataTypes.ENUM('pending_manager', 'pending_hr', 'approved', 'rejected', 'canceled'),
         allowNull: false,
         defaultValue: 'pending_manager',
     },
@@ -25,6 +25,8 @@ export const HrAttendanceCorrectionRequest = sequelizeUtf8.define('HrAttendanceC
     hrNote: { type: DataTypes.TEXT, allowNull: true },
     // See HrLeaveRequest.js's exportedAt for the rationale.
     exportedAt: { type: DataTypes.DATE, allowNull: true },
+    // See HrLeaveRequest.js's canceledAt for the rationale.
+    canceledAt: { type: DataTypes.DATE, allowNull: true },
 }, {
     tableName: 'HrAttendanceCorrectionRequests',
     timestamps: true,

@@ -25,12 +25,21 @@ export const HrLeaveRequest = sequelizeUtf8.define('HrLeaveRequest', {
             'maternity_paternity',
             'hajj',
             'study',
+            'sick',
+            'work_injury',
         ),
         allowNull: true,
     },
     reason: { type: DataTypes.TEXT, allowNull: true },
+    // Required (enforced in routes/hrRequests.js) for leaveType 'sick' and
+    // 'condolence_occasional' (sick note / death certificate) -- optional
+    // for every other type. Single file, mirrors the avatar-upload pattern
+    // in routes/upload.js (image or PDF, not a photo/video capture pair
+    // like the installation-order attachments).
+    attachmentUrl: { type: DataTypes.STRING, allowNull: true },
+    attachmentMimeType: { type: DataTypes.STRING, allowNull: true },
     status: {
-        type: DataTypes.ENUM('pending_manager', 'pending_hr', 'approved', 'rejected'),
+        type: DataTypes.ENUM('pending_manager', 'pending_hr', 'approved', 'rejected', 'canceled'),
         allowNull: false,
         defaultValue: 'pending_manager',
     },
@@ -47,6 +56,11 @@ export const HrLeaveRequest = sequelizeUtf8.define('HrLeaveRequest', {
     // export naturally only grabs new records instead of re-exporting
     // everything every time. See scripts/add-hr-export-tracking.js.
     exportedAt: { type: DataTypes.DATE, allowNull: true },
+    // Set when the requester withdraws their own request via the
+    // self-service cancel button -- see PUT.../:id cancel handling in
+    // routes/hrRequests.js. Kept as a status change rather than a DELETE
+    // so a canceled request stays on record instead of disappearing.
+    canceledAt: { type: DataTypes.DATE, allowNull: true },
 }, {
     tableName: 'HrLeaveRequests',
     timestamps: true,

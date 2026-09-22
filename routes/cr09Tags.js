@@ -20,11 +20,13 @@
 // installation_manager, admin.
 import express from 'express';
 import { QueryTypes } from 'sequelize';
-import { authenticateToken, authorizeRoles } from '../middleware/auth.js';
+import { authenticateToken } from '../middleware/auth.js';
+import { requirePermission } from '../middleware/permissions.js';
+import { PERMISSIONS } from '../constants/permissions.js';
 import { sequelize2PetraErp } from '../config/db.js';
 
 const router = express.Router();
-router.use(authenticateToken, authorizeRoles('project_manager', 'installation_manager', 'admin'));
+router.use(authenticateToken, requirePermission(PERMISSIONS.PETRA_ERP_CR09));
 
 const TAG_VIEWS = {
     motor: { view: 'motorUnitCR09', prefix: 'motor' },

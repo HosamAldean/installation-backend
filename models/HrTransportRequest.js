@@ -25,6 +25,7 @@ export const HrTransportRequest = sequelizeUtf8.define('HrTransportRequest', {
             'pending_finance',
             'approved',
             'rejected',
+            'canceled',
         ),
         allowNull: false,
         defaultValue: 'pending_manager',
@@ -56,6 +57,8 @@ export const HrTransportRequest = sequelizeUtf8.define('HrTransportRequest', {
     paidByUserId: { type: DataTypes.INTEGER, allowNull: true },
     // See HrLeaveRequest.js's exportedAt for the rationale.
     exportedAt: { type: DataTypes.DATE, allowNull: true },
+    // See HrLeaveRequest.js's canceledAt for the rationale.
+    canceledAt: { type: DataTypes.DATE, allowNull: true },
 }, {
     tableName: 'HrTransportRequests',
     timestamps: true,

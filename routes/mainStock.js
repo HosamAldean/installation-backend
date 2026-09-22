@@ -7,10 +7,12 @@
 // order, with QTY/QTYOUT/SQTY tracking what's shipped vs. remaining.
 import express from "express";
 import { getSqlPool, sequelize, withSqlRetry } from "../config/db.js";
-import { authenticateToken, authorizeRoles } from "../middleware/auth.js";
+import { authenticateToken } from "../middleware/auth.js";
+import { requirePermission } from "../middleware/permissions.js";
+import { PERMISSIONS } from "../constants/permissions.js";
 
 const router = express.Router();
-router.use(authenticateToken, authorizeRoles("shipping_manager", "admin"));
+router.use(authenticateToken, requirePermission(PERMISSIONS.SHIPPING_MAIN_STOCK));
 
 // Same latin1-passthrough workaround as followUp.js — only applies the
 // re-decoded value if it actually looks like Arabic, so it can't corrupt
@@ -295,6 +297,77 @@ router.get("/stock-summary", async (req, res) => {
     }
 });
 
+// GET /api/main-stock/stock-summary/:projNo/detail?category= — drill-down
+// behind a /stock-summary row, the legacy Access "QL2" report's live
+// equivalent. COM-inspected QL2 (Report_Open calls a "QL2" sub in the "MIN"
+// standard module) sets its RecordSource to guest.QL2Report filtered to a
+// single project, prompted via an Access parameter (WHERE projNo=[...]) —
+// confirmed by direct Design-view inspection, its actual structure is a
+// SINGLE group level on projName (project header showing projName/projNo)
+// with Detail rows (Prodc/UNO/QTY/Expr1=shipped/Expr4=remaining/Note) and a
+// GroupFooter/ReportFooter subtotal (Sum of QTY/Expr1/Expr4) — there is no
+// second ProdctionNO-level group/subtotal tier in the actual report despite
+// a prior audit pass describing one; ProdctionNO is present in the
+// RecordSource's SELECT list but bound to no visible control or group
+// level. guest.QL2Report (not guest.QL2 — that sibling view additionally
+// joins dbo.Stock, which QL2Report's own X<>1 filter makes unnecessary) is
+// queried directly, same as Proj's GET /proj-orders/stock reuses guest.QL2.
+// Rows are naturally bounded (one project's items, not the full warehouse)
+// so this returns everything in one shot with no pagination, and computes
+// the subtotal in JS from the same result set rather than a second SQL
+// round trip against the underlying live tables — the earlier GET /stock
+// endpoint (routes/projOrders.js) demonstrated that pattern can hit real
+// lock contention on this same view family.
+//
+// Filtered by ?category= in addition to projNo (the legacy Access parameter
+// only filtered by projNo) so the drill-down matches the specific
+// project+category row the user clicked in /stock-summary — that page
+// already splits a project into separate rows per category, and showing an
+// unfiltered blend here would contradict the row it was opened from.
+router.get("/stock-summary/:projNo/detail", async (req, res) => {
+    try {
+        const projNo = req.params.projNo;
+        const category = req.query.category !== undefined && req.query.category !== "" ? parseInt(req.query.category, 10) : null;
+
+        const rows = await withSqlRetry("minstock", async (pool) => {
+            const request = pool.request().input("projNo", projNo);
+            let categoryClause = "";
+            if (Number.isInteger(category)) {
+                request.input("category", category);
+                categoryClause = "AND C = @category";
+            }
+            const result = await request.query(`
+                SELECT orderNo, serialNo, projNo, projName, Worker, C AS category, Prodc, ProdctionNO, UNO, QTY,
+                       Expr1 AS shipped, Expr4 AS remaining, Date, Note
+                FROM guest.QL2Report
+                WHERE projNo = @projNo ${categoryClause}
+                ORDER BY Prodc, UNO
+            `);
+            return result.recordset;
+        });
+
+        const subtotal = rows.reduce(
+            (acc, r) => ({
+                qty: acc.qty + (r.QTY || 0),
+                shipped: acc.shipped + (r.shipped || 0),
+                remaining: acc.remaining + (r.remaining || 0),
+            }),
+            { qty: 0, shipped: 0, remaining: 0 }
+        );
+
+        res.json({
+            success: true,
+            projNo,
+            projName: rows[0]?.projName ?? null,
+            items: rows,
+            subtotal,
+        });
+    } catch (err) {
+        console.error("❌ MAIN STOCK QL2 DETAIL ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to fetch project detail" });
+    }
+});
+
 // GET /api/main-stock/shipments/projects?search=&category=
 // Project-level shipment totals from the permanent `out` log — level 1 of
 // the Access app's XOUT -> X1OUT -> OUT shipment-history drill-down.
@@ -385,7 +458,7 @@ router.get("/shipments/projects/:projNo/:productionNo/log", async (req, res) => 
             categoryClause = "AND s.C = @category";
         }
         const result = await request.query(`
-            SELECT o.A, o.orderNo, o.serialNo, o.Prodc, o.UNO, o.OUTQTY, o.Note, o.DATEO, o.BNO, o.FNO, o.DRIVER, o.barcode
+            SELECT o.A, o.orderNo, o.serialNo, o.Prodc, o.UNO, o.OUTQTY, o.Note, o.DATEO, o.BNO, o.FNO, o.DRIVER, o.FORML, o.barcode
             FROM [out] o
             LEFT JOIN STOCKO s ON s.orderNo = o.orderNo
             WHERE o.projNo = @projNo AND o.ProdctionNO = @productionNo ${categoryClause}
@@ -471,7 +544,7 @@ router.get("/barcode/:barcode", async (req, res) => {
 // of staging items from wherever you were browsing before confirming one
 // shipment for all of them together.
 router.post("/checkout", async (req, res) => {
-    const { items, driver, formNo, batchNo, note } = req.body;
+    const { items, driver, formNo, batchNo, note, forml } = req.body;
     if (!driver || !Array.isArray(items) || !items.length) {
         return res.status(400).json({ success: false, message: "driver and at least one item are required" });
     }
@@ -545,10 +618,11 @@ router.post("/checkout", async (req, res) => {
                 .input("BNO", batchNo ? parseInt(batchNo) : null)
                 .input("FNO", formNo ? parseInt(formNo) : null)
                 .input("DRIVER", driver)
+                .input("FORML", forml || null)
                 .input("barcode", item.barcode)
                 .query(`
-                    INSERT INTO [out] (A, orderNo, serialNo, projNo, ProdctionNO, C, Prodc, UNO, OUTQTY, Note, DATEO, BNO, FNO, DRIVER, barcode)
-                    VALUES (@A, @orderNo, @serialNo, @projNo, @ProdctionNO, @C, @Prodc, @UNO, @OUTQTY, @Note, GETDATE(), @BNO, @FNO, @DRIVER, @barcode)
+                    INSERT INTO [out] (A, orderNo, serialNo, projNo, ProdctionNO, C, Prodc, UNO, OUTQTY, Note, DATEO, BNO, FNO, DRIVER, FORML, barcode)
+                    VALUES (@A, @orderNo, @serialNo, @projNo, @ProdctionNO, @C, @Prodc, @UNO, @OUTQTY, @Note, GETDATE(), @BNO, @FNO, @DRIVER, @FORML, @barcode)
                 `);
 
             const newShipped = item.alreadyShipped + shipQty;
@@ -585,7 +659,7 @@ router.post("/checkout", async (req, res) => {
 // they're not the source of truth here.
 router.post("/orders/:orderNo/checkout", async (req, res) => {
     const orderNo = parseInt(req.params.orderNo);
-    const { items, driver, formNo, batchNo, note } = req.body;
+    const { items, driver, formNo, batchNo, note, forml } = req.body;
     if (!Number.isInteger(orderNo)) {
         return res.status(400).json({ success: false, message: "Invalid orderNo" });
     }
@@ -664,10 +738,11 @@ router.post("/orders/:orderNo/checkout", async (req, res) => {
                 .input("BNO", batchNo ? parseInt(batchNo) : null)
                 .input("FNO", formNo ? parseInt(formNo) : null)
                 .input("DRIVER", driver)
+                .input("FORML", forml || null)
                 .input("barcode", item.barcode)
                 .query(`
-                    INSERT INTO [out] (A, orderNo, serialNo, projNo, ProdctionNO, C, Prodc, UNO, OUTQTY, Note, DATEO, BNO, FNO, DRIVER, barcode)
-                    VALUES (@A, @orderNo, @serialNo, @projNo, @ProdctionNO, @C, @Prodc, @UNO, @OUTQTY, @Note, GETDATE(), @BNO, @FNO, @DRIVER, @barcode)
+                    INSERT INTO [out] (A, orderNo, serialNo, projNo, ProdctionNO, C, Prodc, UNO, OUTQTY, Note, DATEO, BNO, FNO, DRIVER, FORML, barcode)
+                    VALUES (@A, @orderNo, @serialNo, @projNo, @ProdctionNO, @C, @Prodc, @UNO, @OUTQTY, @Note, GETDATE(), @BNO, @FNO, @DRIVER, @FORML, @barcode)
                 `);
 
             const newShipped = item.alreadyShipped + shipQty;
@@ -780,9 +855,17 @@ router.post("/orders", async (req, res) => {
 // Rows without a UNO in the legacy data never got a real barcode at all
 // (a data-quality gap in the old system) — every new item here always gets
 // both, since UNO is required.
+// Type and SN (both COM-confirmed plain, unlocked textboxes on the legacy
+// STOCK form — no combo/lookup list, no VBA validation) are optional here,
+// same as Note: live data shows Type at 0/127,037 populated and SN at only
+// 22/127,037 — real but rare usage, not the same "essentially abandoned"
+// signal as e.g. Glass's Sticker charge (1 row, ever, in the source table
+// itself). Restored as accepted, optional inputs rather than investigated
+// further, since the web app's own total inability to set them at all is
+// itself a plausible explanation for the low SN count.
 router.post("/orders/:orderNo/items", async (req, res) => {
     const orderNo = parseInt(req.params.orderNo);
-    const { Prodc, UNO, QTY, Note } = req.body;
+    const { Prodc, UNO, QTY, Note, Type, SN } = req.body;
     if (!Number.isInteger(orderNo)) {
         return res.status(400).json({ success: false, message: "Invalid orderNo" });
     }
@@ -810,13 +893,16 @@ router.post("/orders/:orderNo/items", async (req, res) => {
             .query("SELECT ISNULL(MAX(serialNo), 0) AS maxSerial FROM Stock WHERE orderNo = @orderNo");
         const serialNo = maxResult.recordset[0].maxSerial + 1;
 
+        const snValue = SN !== undefined && SN !== null && SN !== "" ? parseInt(SN) : null;
+        const typeValue = Type !== undefined && Type !== null && Type !== "" ? parseInt(Type) : null;
+
         const barcode = parseInt(`${orderNo}${serialNo}`);
         const barcode1 = [
             pad(order.projNo, 5),
             pad(order.additional, 2),
             pad(order.ProdctionNO, 3),
             pad(UNO, 6),
-            pad(0, 6), // SN — a separate legacy sub-serial field, not used here
+            pad(snValue ?? 0, 6),
         ].join(" ");
 
         await transaction.request()
@@ -824,14 +910,16 @@ router.post("/orders/:orderNo/items", async (req, res) => {
             .input("serialNo", serialNo)
             .input("C", order.C)
             .input("Prodc", Prodc)
+            .input("Type", typeValue)
             .input("UNO", String(UNO))
+            .input("SN", snValue)
             .input("QTY", parseInt(QTY))
             .input("Note", Note || null)
             .input("barcode", barcode)
             .input("barcode1", barcode1)
             .query(`
-                INSERT INTO Stock (orderNo, serialNo, C, Prodc, UNO, QTY, SQTY, QTYOUT, X, Date, Note, barcode, barcode1)
-                VALUES (@orderNo, @serialNo, @C, @Prodc, @UNO, @QTY, @QTY, 0, 0, GETDATE(), @Note, @barcode, @barcode1)
+                INSERT INTO Stock (orderNo, serialNo, C, Prodc, Type, UNO, SN, QTY, SQTY, QTYOUT, X, Date, Note, barcode, barcode1)
+                VALUES (@orderNo, @serialNo, @C, @Prodc, @Type, @UNO, @SN, @QTY, @QTY, 0, 0, GETDATE(), @Note, @barcode, @barcode1)
             `);
 
         await transaction.commit();
@@ -840,6 +928,180 @@ router.post("/orders/:orderNo/items", async (req, res) => {
         if (transaction) { try { await transaction.rollback(); } catch { /* already rolled back */ } }
         console.error("❌ MAIN STOCK CREATE ITEM ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to create stock item" });
+    }
+});
+
+// PATCH /api/main-stock/orders/:orderNo/items/:serialNo — edit a Stock item.
+// QTY can't drop below what's already shipped (out.OUTQTY) — the checkout
+// endpoints already guard the same invariant on write, this closes the same
+// gap from the other direction (editing QTY down after shipping already
+// happened, rather than shipping more than what's left).
+router.patch("/orders/:orderNo/items/:serialNo", async (req, res) => {
+    const orderNo = parseInt(req.params.orderNo);
+    const serialNo = parseInt(req.params.serialNo);
+    const { Prodc, UNO, QTY, Note, Type, SN } = req.body;
+    if (!Number.isInteger(orderNo) || !Number.isInteger(serialNo)) {
+        return res.status(400).json({ success: false, message: "Invalid orderNo/serialNo" });
+    }
+    if (!Prodc || !UNO || !QTY || parseInt(QTY) <= 0) {
+        return res.status(400).json({ success: false, message: "Prodc, UNO, and a positive QTY are required" });
+    }
+
+    try {
+        const pool = await getSqlPool("minstock");
+        const shippedResult = await pool.request()
+            .input("orderNo", orderNo)
+            .input("serialNo", serialNo)
+            .query("SELECT ISNULL(SUM(OUTQTY), 0) AS shipped FROM [out] WHERE orderNo = @orderNo AND serialNo = @serialNo");
+        const shipped = shippedResult.recordset[0].shipped;
+        const qty = parseInt(QTY);
+        if (qty < shipped) {
+            return res.status(409).json({
+                success: false,
+                message: `Cannot set quantity below ${shipped} — ${shipped} already shipped for this item`,
+            });
+        }
+
+        const snValue = SN !== undefined && SN !== null && SN !== "" ? parseInt(SN) : null;
+        const typeValue = Type !== undefined && Type !== null && Type !== "" ? parseInt(Type) : null;
+
+        const result = await pool.request()
+            .input("orderNo", orderNo)
+            .input("serialNo", serialNo)
+            .input("Prodc", Prodc)
+            .input("Type", typeValue)
+            .input("UNO", String(UNO))
+            .input("SN", snValue)
+            .input("QTY", qty)
+            .input("Note", Note || null)
+            .query(`
+                UPDATE Stock
+                SET Prodc = @Prodc, Type = @Type, UNO = @UNO, SN = @SN, QTY = @QTY, SQTY = @QTY - QTYOUT, Note = @Note
+                WHERE orderNo = @orderNo AND serialNo = @serialNo
+            `);
+        if (!result.rowsAffected[0]) {
+            return res.status(404).json({ success: false, message: "Item not found" });
+        }
+        res.json({ success: true });
+    } catch (err) {
+        console.error("❌ MAIN STOCK UPDATE ITEM ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to update stock item" });
+    }
+});
+
+// DELETE /api/main-stock/orders/:orderNo/items/:serialNo — blocked (409) if
+// the item already has shipment history in the permanent `out` log, since
+// out doesn't reference Stock by foreign key (confirmed: sys.foreign_keys
+// has zero rows for this table family) — deleting a shipped item would
+// silently orphan real shipment records rather than erroring loudly.
+router.delete("/orders/:orderNo/items/:serialNo", async (req, res) => {
+    const orderNo = parseInt(req.params.orderNo);
+    const serialNo = parseInt(req.params.serialNo);
+    if (!Number.isInteger(orderNo) || !Number.isInteger(serialNo)) {
+        return res.status(400).json({ success: false, message: "Invalid orderNo/serialNo" });
+    }
+
+    try {
+        const pool = await getSqlPool("minstock");
+        const shippedResult = await pool.request()
+            .input("orderNo", orderNo)
+            .input("serialNo", serialNo)
+            .query("SELECT ISNULL(SUM(OUTQTY), 0) AS shipped FROM [out] WHERE orderNo = @orderNo AND serialNo = @serialNo");
+        if (shippedResult.recordset[0].shipped > 0) {
+            return res.status(409).json({
+                success: false,
+                message: "Cannot delete — this item already has shipment history",
+            });
+        }
+
+        const result = await pool.request()
+            .input("orderNo", orderNo)
+            .input("serialNo", serialNo)
+            .query("DELETE FROM Stock WHERE orderNo = @orderNo AND serialNo = @serialNo");
+        if (!result.rowsAffected[0]) {
+            return res.status(404).json({ success: false, message: "Item not found" });
+        }
+        res.json({ success: true });
+    } catch (err) {
+        console.error("❌ MAIN STOCK DELETE ITEM ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to delete stock item" });
+    }
+});
+
+// PATCH /api/main-stock/orders/:orderNo — edit a STOCKO order header.
+router.patch("/orders/:orderNo", async (req, res) => {
+    const orderNo = parseInt(req.params.orderNo);
+    const { projName, projNo, additional, ProdctionNO, projMgr, Worker, C } = req.body;
+    if (!Number.isInteger(orderNo)) {
+        return res.status(400).json({ success: false, message: "Invalid orderNo" });
+    }
+    if (!projNo || !ProdctionNO || ![1, 2, 3].includes(parseInt(C))) {
+        return res.status(400).json({ success: false, message: "projNo, ProdctionNO, and a valid category (C) are required" });
+    }
+
+    try {
+        const pool = await getSqlPool("minstock");
+        const result = await pool.request()
+            .input("orderNo", orderNo)
+            .input("projName", projName || null)
+            .input("projNo", projNo)
+            .input("additional", additional !== undefined && additional !== null && additional !== "" ? parseInt(additional) : null)
+            .input("ProdctionNO", ProdctionNO)
+            .input("projMgr", projMgr || null)
+            .input("Worker", Worker || null)
+            .input("C", parseInt(C))
+            .query(`
+                UPDATE STOCKO
+                SET projName = @projName, projNo = @projNo, additional = @additional, ProdctionNO = @ProdctionNO,
+                    projMgr = @projMgr, Worker = @Worker, C = @C
+                WHERE orderNo = @orderNo
+            `);
+        if (!result.rowsAffected[0]) {
+            return res.status(404).json({ success: false, message: "Order not found" });
+        }
+        res.json({ success: true });
+    } catch (err) {
+        console.error("❌ MAIN STOCK UPDATE ORDER ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to update stock order" });
+    }
+});
+
+// DELETE /api/main-stock/orders/:orderNo — blocked (409) if the order still
+// has Stock items. The legacy STOCKO form has AllowDeletions=True with no
+// VBA and no enforced relationship to Stock (confirmed: no FK, no code-
+// behind module on either form) — deleting an order there would silently
+// orphan its items rather than erroring. Blocking here instead of
+// replicating that is a deliberate improvement, same category as this
+// codebase already not replicating other confirmed legacy report bugs
+// (OrderCH's date-calc bug, QALL/QALLR's undercounting bug).
+router.delete("/orders/:orderNo", async (req, res) => {
+    const orderNo = parseInt(req.params.orderNo);
+    if (!Number.isInteger(orderNo)) {
+        return res.status(400).json({ success: false, message: "Invalid orderNo" });
+    }
+
+    try {
+        const pool = await getSqlPool("minstock");
+        const itemCountResult = await pool.request()
+            .input("orderNo", orderNo)
+            .query("SELECT COUNT(*) AS cnt FROM Stock WHERE orderNo = @orderNo");
+        if (itemCountResult.recordset[0].cnt > 0) {
+            return res.status(409).json({
+                success: false,
+                message: "Cannot delete — this order still has items. Delete its items first.",
+            });
+        }
+
+        const result = await pool.request()
+            .input("orderNo", orderNo)
+            .query("DELETE FROM STOCKO WHERE orderNo = @orderNo");
+        if (!result.rowsAffected[0]) {
+            return res.status(404).json({ success: false, message: "Order not found" });
+        }
+        res.json({ success: true });
+    } catch (err) {
+        console.error("❌ MAIN STOCK DELETE ORDER ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to delete stock order" });
     }
 });
 

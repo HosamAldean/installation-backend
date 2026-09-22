@@ -31,12 +31,25 @@
 //   - orderdetailsI.barcode exists but is NOT reliably populated (confirmed
 //     live: only 1,811 of 14,953 rows are non-zero, with no evident
 //     generation pattern on the populated ones) — unlike Proj/Glass, this
-//     doesn't invent a barcode formula; it's a plain optional int.
+//     doesn't invent a barcode formula. CORRECTED from an earlier decision
+//     that had it as a plain optional web-editable int: legacy has no
+//     barcode textbox anywhere in the item form or its reports (a pure
+//     backend column, never hand-typed), so exposing a free-entry field
+//     here was itself the bug — it let a web user type a value that
+//     collides with another item's real barcode, something legacy
+//     structurally couldn't produce. Read-only/display-only now; see the
+//     items POST/PUT handlers below.
 //   - D1I (notes) has no Action/ActionDate columns — just Ditails/
-//     DitalsDate, a flatter event log than Proj's D1. D1I is the
-//     dominant/active variant (its siblings D1I1-4 have 1/11/3/0 rows
-//     respectively, same "one real table, rest are unused near-duplicates"
-//     pattern as Proj's D2-D5) so only D1I is used here.
+//     DitalsDate, a flatter event log than Proj's D1. TWICE corrected: an
+//     earlier assumption (row counts 1/11/3/0 on D1I1-4 vs 23 on D1I) read
+//     this as "one real table, rest unused duplicates" like Proj's D2-D5 —
+//     but that only checked row counts, not the VBA. Direct M1 module
+//     inspection shows M1.D1I() (called from Form_D1I's Form_Load) branches
+//     on the exact same department signal as the event log below
+//     (Form_SendordersI.Label18.Caption) to route to D1I1/D1I2/D1I3/D1I4 —
+//     genuine department scoping, just with low historical note counts.
+//     See the notes route below for the full mapping and the ID-column
+//     caveat on D1I2/D1I4.
 //   - X1I (event log) is structurally identical to Proj's x1 (xc1-3
 //     checkboxes, x1/x2 generic-labeled value fields, a completion date) —
 //     same generic "x1"/"x2" Label captions confirmed live, so exposed the
@@ -44,11 +57,12 @@
 //     (genuinely one real table plus unused near-duplicates), X1I1-4 here
 //     ARE a real department dimension, same idea as Proj's x1-x5 — each is
 //     a distinct department's own inquiry screen off the Main Menu (MIX/
-//     specified-works/lathe/factory, see the event-log route below for the
-//     verified button-caption mapping), and 52% of orders present in both
-//     X1I and X1I2 have a genuinely different completion date between
-//     them. All five tables are read/written by department. See PUT/GET
-//     .../event-log for the full detail.
+//     Steel/Maintenance/Factory — corrected a second time from an initial
+//     caption-based mistranslation, see the event-log route below for the
+//     verified Click-handler-to-table mapping), and 52% of orders present
+//     in both X1I and X1I2 have a genuinely different completion date
+//     between them. All five tables are read/written by department. See
+//     PUT/GET .../event-log for the full detail.
 //   - ProcessI (per-item cutting/prep status) confirmed as real Access
 //     checkboxes (0/1, not the -1/0 OLE convention seen elsewhere) for
 //     Cuting ("القص" — cutting) and Colcting ("التجهيز" — preparation, not
@@ -59,20 +73,20 @@
 //     respectively, confirmed live), not free text.
 import express from "express";
 import { withSqlRetry } from "../config/db.js";
-import { authenticateToken, authorizeReadWrite } from "../middleware/auth.js";
+import { authenticateToken } from "../middleware/auth.js";
+import { requirePermission } from "../middleware/permissions.js";
+import { PERMISSIONS } from "../constants/permissions.js";
 import { User } from "../models/User.js";
 import { pushFinishedUnitToMinStock } from "../utils/minStockSync.js";
 
 const router = express.Router();
 
-// Now owned by the dedicated "production" role (same taxonomy gap
-// projOrders.js was in, now revisited for both together).
-// installation_manager keeps view-only access; edit actions (POST/PUT/
-// DELETE) are production/admin only.
-router.use(authenticateToken, authorizeReadWrite(
-    ["installation_manager", "production", "admin"],
-    ["production", "admin"],
-));
+// Grain matches the old authorizeReadWrite split's superset (view roles
+// already included everyone who could edit) -- one key covers both tiers,
+// per this codebase's "one key per page" convention (see the permission-
+// system plan). installation_manager/production/admin were the only
+// roles with any access before; seeded to match exactly.
+router.use(authenticateToken, requirePermission(PERMISSIONS.INSTALLATION_IRON));
 
 async function resolveUsername(req) {
     const user = await User.findByPk(req.user.userId, { attributes: ["username"] });
@@ -120,6 +134,37 @@ router.get("/", async (req, res) => {
     } catch (err) {
         console.error("❌ IRON ORDERS LIST ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to fetch orders" });
+    }
+});
+
+// GET /api/iron/project-lookup/:projNo — canonical manager/name for a
+// project number, from guest.Project (2,824 rows). Matches the legacy
+// ordersI form's projNo_AfterUpdate -> Project() VBA sub, which overwrites
+// projMgr/projName from this table the moment a project number is entered
+// -- confirmed live via COM/VBA inspection. Restoring this stops two orders
+// for the same project from silently ending up with two different manager
+// names on record, which the legacy app structurally prevented and this
+// app previously didn't.
+router.get("/project-lookup/:projNo", async (req, res) => {
+    const projNo = String(req.params.projNo || "").trim();
+    if (!projNo) {
+        return res.status(400).json({ success: false, message: "projNo is required" });
+    }
+    try {
+        const result = await withSqlRetry("iron", (pool) => pool.request()
+            .input("projNo", projNo)
+            .query(`
+                SELECT TOP 1 ProjectManger AS projMgr, ProjectName AS projName
+                FROM guest.Project
+                WHERE ProjectNO = @projNo
+            `));
+        if (result.recordset.length === 0) {
+            return res.json({ success: true, project: null });
+        }
+        res.json({ success: true, project: result.recordset[0] });
+    } catch (err) {
+        console.error("❌ IRON PROJECT LOOKUP ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to look up project" });
     }
 });
 
@@ -233,15 +278,22 @@ router.get("/:orderNo/items", async (req, res) => {
 });
 
 // POST /api/iron/:orderNo/items — add an order line (dbo.orderdetailsI).
-// No barcode auto-generation — confirmed live this field isn't reliably
-// populated even in the legacy app (see file header), so it's accepted as
-// a plain optional value rather than invented.
+// barcode is NOT accepted as client input (deliberate — see the audit
+// finding this closes out): legacy has no barcode textbox anywhere in the
+// item form or its reports, it's a pure backend column never hand-typed,
+// and there's no reliable generation formula to invent one with either
+// (confirmed live: only 1,811 of 14,953 rows are non-zero, no evident
+// pattern on the populated ones — see file header). Rather than either
+// inventing a fake formula or leaving it web-editable (letting a user type
+// a value that collides with another item's real barcode), new rows are
+// always inserted with barcode = NULL, same as the column's own dominant
+// live state.
 router.post("/:orderNo/items", async (req, res) => {
     const orderNo = parseInt(req.params.orderNo, 10);
     if (!Number.isInteger(orderNo)) {
         return res.status(400).json({ success: false, message: "Invalid orderNo" });
     }
-    const { itemNo, Prudact, dimenisons, quntity, color, note, referenceI, referenceM, location, prudactS, barcode } = req.body;
+    const { itemNo, Prudact, dimenisons, quntity, color, note, referenceI, referenceM, location, prudactS } = req.body;
 
     try {
         const result = await withSqlRetry("iron", async (pool) => {
@@ -274,14 +326,32 @@ router.post("/:orderNo/items", async (req, res) => {
                     .input("referenceM", referenceM || null)
                     .input("location", location || null)
                     .input("prudactS", prudactS || null)
-                    .input("barcode", barcode !== undefined && barcode !== null && barcode !== "" ? parseInt(barcode, 10) : null)
                     .query(`
                         INSERT INTO dbo.orderdetailsI
                             (orderNo, serialNo, itemNo, Prudact, dimenisons, quntity, color, note,
-                             referenceI, referenceM, Location, PrudactS, barcode)
+                             referenceI, referenceM, Location, PrudactS)
                         VALUES
                             (@orderNo, @serialNo, @itemNo, @Prudact, @dimenisons, @quntity, @color, @note,
-                             @referenceI, @referenceM, @location, @prudactS, @barcode)
+                             @referenceI, @referenceM, @location, @prudactS)
+                    `);
+
+                // Legacy created the matching ProcessI row in lockstep with
+                // the line item -- orderdetailsI's own updatable-join
+                // mechanics (IDNo1(), confirmed via COM/VBA) inserted it the
+                // instant a new item's itemNo was set. This app used to
+                // create it lazily, only on the first Status-dialog save,
+                // so an untouched line had no ProcessI row at all and came
+                // back as a NULL (not 0%) cutting/collecting average in
+                // GET /report -- a state the legacy app could never reach.
+                // Cuting/Colcting=0 (not left NULL) so the line is counted
+                // as "not yet processed" in that average from the moment it
+                // exists, matching what a freshly-added legacy line meant.
+                await transaction.request()
+                    .input("orderNo", orderNo)
+                    .input("serialNo", serialNo)
+                    .query(`
+                        INSERT INTO dbo.ProcessI (orderNo, serialNo, Cuting, Colcting)
+                        VALUES (@orderNo, @serialNo, 0, 0)
                     `);
 
                 await transaction.commit();
@@ -304,14 +374,16 @@ router.post("/:orderNo/items", async (req, res) => {
 
 // PUT /api/iron/:orderNo/items/:serialNo — edit an order line. Same
 // composite-key upsert target as ProcessI, but this is the orderdetailsI
-// row itself (specs/qty/references), not the cutting/prep status.
+// row itself (specs/qty/references), not the cutting/prep status. barcode
+// is deliberately not writable here either — see the POST handler above —
+// so an edit leaves whatever value (usually NULL) already exists untouched.
 router.put("/:orderNo/items/:serialNo", async (req, res) => {
     const orderNo = parseInt(req.params.orderNo, 10);
     const serialNo = parseInt(req.params.serialNo, 10);
     if (!Number.isInteger(orderNo) || !Number.isInteger(serialNo)) {
         return res.status(400).json({ success: false, message: "Invalid orderNo or serialNo" });
     }
-    const { itemNo, Prudact, dimenisons, quntity, color, note, referenceI, referenceM, location, prudactS, barcode } = req.body;
+    const { itemNo, Prudact, dimenisons, quntity, color, note, referenceI, referenceM, location, prudactS } = req.body;
 
     try {
         const result = await withSqlRetry("iron", (pool) => pool.request()
@@ -327,12 +399,11 @@ router.put("/:orderNo/items/:serialNo", async (req, res) => {
             .input("referenceM", referenceM || null)
             .input("location", location || null)
             .input("prudactS", prudactS || null)
-            .input("barcode", barcode !== undefined && barcode !== null && barcode !== "" ? parseInt(barcode, 10) : null)
             .query(`
                 UPDATE dbo.orderdetailsI
                 SET itemNo = @itemNo, Prudact = @Prudact, dimenisons = @dimenisons, quntity = @quntity,
                     color = @color, note = @note, referenceI = @referenceI, referenceM = @referenceM,
-                    Location = @location, PrudactS = @prudactS, barcode = @barcode
+                    Location = @location, PrudactS = @prudactS
                 WHERE orderNo = @orderNo AND serialNo = @serialNo
             `));
         if (!result.rowsAffected[0]) {
@@ -393,29 +464,60 @@ router.delete("/:orderNo/items/:serialNo", async (req, res) => {
     }
 });
 
-// --- Order notes (dbo.D1I) --------------------------------------------
-// Confirmed live: D1I is the real, actively-used notes table — its
-// siblings D1I1-4 have 1/11/3/0 rows respectively, same "one dominant
-// table, rest near-unused duplicates" pattern Proj's D1 vs D2-D5 had.
-// Flatter than Proj's D1 — no Action/ActionDate resolve-tracking columns,
-// just a straight event log. ID is a real identity column.
+// --- Order notes (dbo.D1I / D1I1-4, department-scoped) -----------------
+// CORRECTED from an earlier assumption that D1I1-4 (row counts 1/11/3/0)
+// were near-unused duplicates like Proj's D2-D5. Direct COM/VBA inspection
+// of the M1 module proved otherwise: M1.D1I() (called from Form_D1I's
+// Form_Load) actively branches on Form_SendordersI.Label18.Caption — the
+// exact same department label ("MIX"/"Steel"/"Maintenance"/"Factory") set
+// by SendordersI1-4, which is itself keyed off the live dbo.PrudactS lookup
+// (confirmed live: MIX/Steel/Maintenance/Factory, id 5/2/3/4) already used
+// throughout this file's item-report endpoints — and routes the notes form
+// to D1I1/D1I2/D1I3/D1I4 respectively, falling back to D1I only when no
+// department context is set. This is real, deliberate department scoping,
+// not leftover cruft; the earlier low-row-count read was an incomplete
+// read that missed the VBA routing entirely.
+//
+// D1I, D1I1, and D1I3 have a real ID identity column (confirmed live
+// schema); D1I2 and D1I4 do NOT — there is no stable per-row identifier in
+// those two tables to target for edit/delete without a schema change
+// (a bigger, separate decision, flagged rather than silently applied), so
+// PUT/DELETE below only support the three ID-bearing tables.
+//
+// Keys are lowercase to match this file's existing IRON_EVENT_LOG_DEPARTMENTS
+// convention (and what the frontend's IronDepartment type actually sends) —
+// not the live PrudactS casing ("MIX"/"Steel"/...) itself, which is only
+// what the legacy VBA compares Label18.Caption against internally.
+const NOTE_TABLE_BY_DEPARTMENT = {
+    mix: "D1I1",
+    steel: "D1I2",
+    maintenance: "D1I3",
+    factory: "D1I4",
+};
+const NOTE_TABLES_WITH_ID = new Set(["D1I", "D1I1", "D1I3"]);
+function resolveNoteTable(department) {
+    return NOTE_TABLE_BY_DEPARTMENT[department] || "D1I";
+}
+
 router.get("/:orderNo/notes", async (req, res) => {
     try {
         const orderNo = parseInt(req.params.orderNo, 10);
         if (!Number.isInteger(orderNo)) {
             return res.status(400).json({ success: false, message: "Invalid orderNo" });
         }
+        const table = resolveNoteTable(String(req.query.department || "").trim());
+        const hasId = NOTE_TABLES_WITH_ID.has(table);
 
         const result = await withSqlRetry("iron", (pool) => pool.request()
             .input("orderNo", orderNo)
             .query(`
-                SELECT ID, Ditails, DitalsDate
-                FROM dbo.D1I
+                SELECT ${hasId ? "ID," : ""} Ditails, DitalsDate
+                FROM dbo.${table}
                 WHERE orderno = @orderNo
-                ORDER BY ID DESC
+                ORDER BY ${hasId ? "ID" : "DitalsDate"} DESC
             `));
 
-        res.json({ success: true, notes: result.recordset });
+        res.json({ success: true, notes: result.recordset, canEdit: hasId });
     } catch (err) {
         console.error("❌ IRON ORDER NOTES ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to fetch order notes" });
@@ -427,10 +529,12 @@ router.post("/:orderNo/notes", async (req, res) => {
     if (!Number.isInteger(orderNo)) {
         return res.status(400).json({ success: false, message: "Invalid orderNo" });
     }
-    const { ditails } = req.body;
+    const { ditails, department } = req.body;
     if (!ditails || !String(ditails).trim()) {
         return res.status(400).json({ success: false, message: "ditails is required" });
     }
+    const table = resolveNoteTable(String(department || "").trim());
+    const hasId = NOTE_TABLES_WITH_ID.has(table);
 
     try {
         const result = await withSqlRetry("iron", async (pool) => {
@@ -443,8 +547,8 @@ router.post("/:orderNo/notes", async (req, res) => {
                 .input("orderNo", orderNo)
                 .input("ditails", String(ditails).trim())
                 .query(`
-                    INSERT INTO dbo.D1I (orderno, Ditails, DitalsDate)
-                    OUTPUT INSERTED.ID
+                    INSERT INTO dbo.${table} (orderno, Ditails, DitalsDate)
+                    ${hasId ? "OUTPUT INSERTED.ID" : ""}
                     VALUES (@orderNo, @ditails, GETDATE())
                 `);
         });
@@ -452,7 +556,7 @@ router.post("/:orderNo/notes", async (req, res) => {
         if (!result) {
             return res.status(404).json({ success: false, message: "Order not found" });
         }
-        res.status(201).json({ success: true, id: result.recordset[0].ID });
+        res.status(201).json({ success: true, id: hasId ? result.recordset[0].ID : null });
     } catch (err) {
         console.error("❌ IRON ORDER NOTE CREATE ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to add order note" });
@@ -464,16 +568,20 @@ router.put("/:orderNo/notes/:id", async (req, res) => {
     if (!Number.isInteger(id)) {
         return res.status(400).json({ success: false, message: "Invalid id" });
     }
-    const { ditails } = req.body;
+    const { ditails, department } = req.body;
     if (!ditails || !String(ditails).trim()) {
         return res.status(400).json({ success: false, message: "ditails is required" });
+    }
+    const table = resolveNoteTable(String(department || "").trim());
+    if (!NOTE_TABLES_WITH_ID.has(table)) {
+        return res.status(400).json({ success: false, message: "Notes in this department can't be edited — the legacy table has no row identifier" });
     }
 
     try {
         const result = await withSqlRetry("iron", (pool) => pool.request()
             .input("id", id)
             .input("ditails", String(ditails).trim())
-            .query("UPDATE dbo.D1I SET Ditails = @ditails WHERE ID = @id"));
+            .query(`UPDATE dbo.${table} SET Ditails = @ditails WHERE ID = @id`));
         if (!result.rowsAffected[0]) {
             return res.status(404).json({ success: false, message: "Note not found" });
         }
@@ -489,9 +597,13 @@ router.delete("/:orderNo/notes/:id", async (req, res) => {
     if (!Number.isInteger(id)) {
         return res.status(400).json({ success: false, message: "Invalid id" });
     }
+    const table = resolveNoteTable(String(req.query.department || "").trim());
+    if (!NOTE_TABLES_WITH_ID.has(table)) {
+        return res.status(400).json({ success: false, message: "Notes in this department can't be deleted — the legacy table has no row identifier" });
+    }
 
     try {
-        const result = await withSqlRetry("iron", (pool) => pool.request().input("id", id).query("DELETE FROM dbo.D1I WHERE ID = @id"));
+        const result = await withSqlRetry("iron", (pool) => pool.request().input("id", id).query(`DELETE FROM dbo.${table} WHERE ID = @id`));
         if (!result.rowsAffected[0]) {
             return res.status(404).json({ success: false, message: "Note not found" });
         }
@@ -624,26 +736,35 @@ router.post("/:orderNo/items/:serialNo/process", async (req, res) => {
 
 // --- Order event log (dbo.X1I + department siblings X1I1-4) ---------------
 // Corrected from an earlier assumption: X1I1-4 are NOT near-unused
-// duplicates of X1I. Confirmed live via the Main Menu's own button
-// captions (COM-inspected, not guessed) that each is a distinct
-// department's inquiry screen — Command1="الاستفسار عن التبادلات الانتاج"
-// (production exchanges, X1I), Command41="...تبادلات MIX" (MIX, X1I1),
-// Command42="...اعمال المحددة" (specified/designated works, X1I2),
-// Command43="...اعمال المخرطة" (lathe/turning work, X1I3), Command44=
-// "...المصنع" (factory, X1I4) — and confirmed live that this isn't
-// redundant tracking: of the ~3,362 orders present in both X1I and X1I2,
-// 52% have a genuinely different x3 completion date between the two
-// tables. Reading/writing only X1I (as this endpoint used to) means the
-// app is blind to — or edits the wrong record for — any order whose real
-// status lives in a department table instead. xc4/xc5 exist on all five
-// tables but are confirmed entirely unused (0 non-zero rows across all
-// five, live) — not exposed here, matching the legacy form which never
-// shows them either.
+// duplicates of X1I. First confirmed live via the Main Menu's own button
+// captions (COM-inspected) that each is a distinct department's inquiry
+// screen; the department NAMES below are a second, later correction of
+// that same finding — the button captions ("specified/designated works"
+// for X1I2, "lathe/turning work" for X1I3) turned out to be a mistranslation
+// of what those buttons actually route to. Traced the real chain instead
+// of trusting the caption text: Main Menu Command41/42/43/44's Click
+// handlers call M1.SendordersI1/2/3/4 directly (not just similarly-named
+// subs — literally the same call), each of which sets
+// Form_SendordersI.Label18.Caption to "MIX"/"Steel"/"Maintenance"/"Factory"
+// respectively (and filters by the exact same string against the live
+// dbo.PrudactS lookup — confirmed live values: MIX/Steel/Maintenance/
+// Factory). M1.X1I() (and M1.D1I(), see the notes section below) then
+// branches on that same Label18.Caption to pick X1I1/X1I2/X1I3/X1I4. So
+// Command42 -> SendordersI2 -> "Steel" -> X1I2, and Command43 ->
+// SendordersI3 -> "Maintenance" -> X1I3 — not specifiedWorks/lathe as
+// originally labeled. Confirmed live that this isn't redundant tracking:
+// of the ~3,362 orders present in both X1I and X1I2, 52% have a genuinely
+// different x3 completion date between the two tables. Reading/writing
+// only X1I (as this endpoint used to) means the app is blind to — or edits
+// the wrong record for — any order whose real status lives in a department
+// table instead. xc4/xc5 exist on all five tables but are confirmed
+// entirely unused (0 non-zero rows across all five, live) — not exposed
+// here, matching the legacy form which never shows them either.
 const IRON_EVENT_LOG_DEPARTMENTS = {
     production: "X1I",
     mix: "X1I1",
-    specifiedWorks: "X1I2",
-    lathe: "X1I3",
+    steel: "X1I2",
+    maintenance: "X1I3",
     factory: "X1I4",
 };
 
@@ -687,6 +808,20 @@ router.post("/:orderNo/event-log", async (req, res) => {
     const { checkboxes, values, date } = req.body;
     const department = IRON_EVENT_LOG_DEPARTMENTS[req.body.department] ? req.body.department : "production";
     const table = IRON_EVENT_LOG_DEPARTMENTS[department];
+
+    // xc1/xc2/xc3 (Optionx1/2/3 in the legacy form) were a mutually-exclusive
+    // tri-state enforced by VBA -- each option's _Click handler disabled the
+    // other two, so at most one was ever true at a time. This app used to
+    // expose them as three independent checkboxes with no such rule, which
+    // let a unit get saved in two contradictory stages at once. Reject that
+    // outright rather than silently normalizing it, so a caller (the
+    // frontend now prevents this client-side too) finds out immediately.
+    if (Array.isArray(checkboxes) && checkboxes.filter(Boolean).length > 1) {
+        return res.status(400).json({
+            success: false,
+            message: "Only one stage can be active at a time",
+        });
+    }
 
     try {
         const cb = [0, 1, 2].map((i) => (Array.isArray(checkboxes) && checkboxes[i] ? "-1" : "0"));
@@ -771,6 +906,23 @@ router.post("/:orderNo/event-log", async (req, res) => {
 // inProgressOnly filters collectingPct < 1 (the aggregate's own direct
 // equivalent of "Colcting <> 1"), dropping Rep3's narrow "ordered in the
 // last 0-2 days" recency clause.
+// ?blended=true — the legacy report's OWN default view (Main Menu Command1,
+// no department button pressed): M1.SendordersI() (COM/VBA-confirmed, not
+// guessed) sets Form_SendordersI.RecordSource to
+//   SELECT ... Avg(Expr1) AS Expr11, Avg(Expr2) AS Expr12, SUM(Expr3) AS Expr13, ...
+//   FROM SendOrdersCI INNER JOIN X1I ON SendOrdersCI.orderNo = X1I.orderno
+//   GROUP BY SendOrdersCI.orderno, projNo, projName, projMgr, oderDate, ProdctionNO
+// i.e. it takes this endpoint's own per-(order,section) SendOrdersCI rows
+// and averages them again, one level up, into a single blended row per
+// order — genuinely different from ?prudactS=X (which narrows to one
+// section) or the unfiltered default (one row per section, still split).
+// Ported as a literal AVG(Expr1)/AVG(Expr2) re-aggregation (a "mean of
+// means" across sections, not a qty-weighted average) since that's exactly
+// what the legacy VBA computes — not "improved" into a different formula.
+// The INNER JOIN X1I is preserved too: confirmed live it drops only 13 of
+// 6,291 orders (99.8% have an X1I row), matching legacy behavior with
+// negligible practical difference rather than silently loosening it to
+// LEFT JOIN.
 router.get("/report", async (req, res) => {
     try {
         const search = String(req.query.search || "").trim();
@@ -778,9 +930,60 @@ router.get("/report", async (req, res) => {
         const dateFrom = String(req.query.dateFrom || "").trim();
         const dateTo = String(req.query.dateTo || "").trim();
         const inProgressOnly = req.query.inProgressOnly === "true";
+        const blended = req.query.blended === "true";
         const page = Math.max(1, parseInt(req.query.page, 10) || 1);
         const pageSize = Math.min(5000, Math.max(1, parseInt(req.query.pageSize, 10) || 25));
         const offset = (page - 1) * pageSize;
+
+        if (blended) {
+            const { total, rows } = await withSqlRetry("iron", async (pool) => {
+                const whereParts = [];
+                const applyInputs = (request) => {
+                    if (search) { request.input("search", `%${search}%`); whereParts.push("(s.projNo LIKE @search OR s.projName LIKE @search)"); }
+                    if (dateFrom) { request.input("dateFrom", dateFrom); whereParts.push("s.oderDate >= @dateFrom"); }
+                    if (dateTo) { request.input("dateTo", dateTo); whereParts.push("s.oderDate <= @dateTo"); }
+                };
+
+                const baseFrom = `
+                    FROM guest.SendOrdersCI s
+                    INNER JOIN dbo.X1I x ON s.orderNo = x.orderno
+                `;
+                const groupBy = "GROUP BY s.orderNo, s.projNo, s.projName, s.projMgr, s.oderDate, s.ProdctionNO";
+                const having = inProgressOnly ? "HAVING (AVG(s.Expr1) IS NULL OR AVG(s.Expr1) < 1)" : "";
+
+                const countRequest = pool.request();
+                applyInputs(countRequest);
+                const countWhere = whereParts.length ? `WHERE ${whereParts.join(" AND ")}` : "";
+                const countResult = await countRequest.query(`
+                    SELECT COUNT(*) AS total FROM (
+                        SELECT s.orderNo ${baseFrom} ${countWhere} ${groupBy} ${having}
+                    ) t
+                `);
+
+                whereParts.length = 0;
+                const listRequest = pool.request();
+                listRequest.input("offset", offset).input("pageSize", pageSize);
+                applyInputs(listRequest);
+                const listWhere = whereParts.length ? `WHERE ${whereParts.join(" AND ")}` : "";
+                const listResult = await listRequest.query(`
+                    SELECT
+                        s.orderNo, s.projNo, s.projName, s.projMgr, s.oderDate, s.ProdctionNO,
+                        AVG(s.Expr2) AS cuttingPct, AVG(s.Expr1) AS collectingPct,
+                        SUM(s.Expr3) AS cutQty, SUM(s.SumOfquntity) AS totalQty,
+                        COUNT(*) AS sectionCount
+                    ${baseFrom}
+                    ${listWhere}
+                    ${groupBy}
+                    ${having}
+                    ORDER BY s.orderNo DESC
+                    OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY
+                `);
+
+                return { total: countResult.recordset[0].total, rows: listResult.recordset };
+            });
+
+            return res.json({ success: true, entries: rows, total, page, pageSize, blended: true });
+        }
 
         const { total, rows } = await withSqlRetry("iron", async (pool) => {
             const whereParts = [];
@@ -822,6 +1025,117 @@ router.get("/report", async (req, res) => {
     }
 });
 
+// GET /api/iron/items-report?prudactS=&mode=&dateFrom=&dateTo=&page=&pageSize=
+// The three raw item-level reports GET /report's aggregate can't reproduce
+// (it's already GROUP BY order+section) — confirmed live via COM/VBA that
+// each is a real, reachable report (SendordersI's department buttons ->
+// Rep1/Rep2/Rep3 in module M1), not guessed from captions, all three built
+// on the same underlying view, dbo.noRecItemI (pulled directly via
+// OBJECT_DEFINITION, not reconstructed): an INNER JOIN chain through X1I,
+// ProcessI, orderdetailsI, ordersI. Because every join is INNER, a line
+// with no event-log row (X1I) or no status row (ProcessI) is invisible
+// here even though it exists in ordersI/orderdetailsI -- the same "no
+// ProcessI row yet" gap POST /:orderNo/items now closes for new lines
+// (older lines predating that fix can still be missing here, matching
+// legacy's own real behavior, not a bug introduced by this endpoint).
+//   mode=all       (Rep1/noRecItemI):     WHERE PrudactS = @prudactS
+//   mode=dateRange (Rep2/noRecItemIFrom): WHERE date BETWEEN @dateFrom AND @dateTo [AND PrudactS = @prudactS]
+//   mode=inProgress(Rep3/noRecItemIX):    WHERE Colcting <> 1 AND (DateI <= GETDATE() OR DateI IS NULL)
+//                                               AND (CAST(oderDate AS DATE) IN (CAST(GETDATE() AS DATE), <-1d>, <-2d>))
+//                                               [AND PrudactS = @prudactS]
+// prudactS is optional in all three modes, matching Rep1/2/3's own Else
+// branch (no section selected -> no PrudactS filter, not "no results").
+router.get("/items-report", async (req, res) => {
+    try {
+        const prudactS = String(req.query.prudactS || "").trim();
+        const mode = String(req.query.mode || "all").trim();
+        const dateFrom = String(req.query.dateFrom || "").trim();
+        const dateTo = String(req.query.dateTo || "").trim();
+        if (mode === "dateRange" && (!dateFrom || !dateTo)) {
+            return res.status(400).json({ success: false, message: "dateFrom and dateTo are required for mode=dateRange" });
+        }
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const pageSize = Math.min(5000, Math.max(1, parseInt(req.query.pageSize, 10) || 25));
+        const offset = (page - 1) * pageSize;
+
+        const { total, rows, totals } = await withSqlRetry("iron", async (pool) => {
+            const whereParts = [];
+            const applyInputs = (request) => {
+                if (prudactS) { request.input("prudactS", prudactS); whereParts.push("PrudactS = @prudactS"); }
+                if (mode === "dateRange") {
+                    request.input("dateFrom", dateFrom).input("dateTo", dateTo);
+                    whereParts.push("(date BETWEEN @dateFrom AND @dateTo)");
+                } else if (mode === "inProgress") {
+                    whereParts.push(`
+                        (Colcting <> 1)
+                        AND (DateI <= GETDATE() OR DateI IS NULL)
+                        AND (
+                            CAST(oderDate AS DATE) = CAST(GETDATE() AS DATE)
+                            OR CAST(oderDate AS DATE) = CAST(DATEADD(day, -1, GETDATE()) AS DATE)
+                            OR CAST(oderDate AS DATE) = CAST(DATEADD(day, -2, GETDATE()) AS DATE)
+                        )
+                    `);
+                }
+            };
+
+            const countRequest = pool.request();
+            applyInputs(countRequest);
+            const countWhere = whereParts.length ? `WHERE ${whereParts.join(" AND ")}` : "";
+            const countResult = await countRequest.query(`SELECT COUNT(*) AS total FROM dbo.noRecItemI ${countWhere}`);
+
+            // Footer running totals, COM-confirmed against the legacy
+            // Form_ProcessI's own FormFooter controls (Text43=Sum([quntity]),
+            // Text36=Avg([cuting]), Text23=Avg([Colcting])) bound to this
+            // exact noRecItemI recordset -- computed across the whole
+            // filtered set (matching Access's live footer behavior), not
+            // just the current page.
+            whereParts.length = 0;
+            const totalsRequest = pool.request();
+            applyInputs(totalsRequest);
+            const totalsWhere = whereParts.length ? `WHERE ${whereParts.join(" AND ")}` : "";
+            const totalsResult = await totalsRequest.query(`
+                SELECT SUM(quntity) AS totalQty, AVG(CAST(Cuting AS FLOAT)) AS avgCuting, AVG(CAST(Colcting AS FLOAT)) AS avgColcting
+                FROM dbo.noRecItemI
+                ${totalsWhere}
+            `);
+
+            whereParts.length = 0;
+            const listRequest = pool.request();
+            listRequest.input("offset", offset).input("pageSize", pageSize);
+            applyInputs(listRequest);
+            const listWhere = whereParts.length ? `WHERE ${whereParts.join(" AND ")}` : "";
+            const listResult = await listRequest.query(`
+                SELECT
+                    orderNo, serialNo, itemNo, PrudactS, Prudact, dimenisons, quntity, color, note,
+                    referenceI, referenceM, barcode, Location, Cuting, Colcting, DateI, finaldate,
+                    date, ProdctionNO, projNo, projName, oderDate
+                FROM dbo.noRecItemI
+                ${listWhere}
+                ORDER BY orderNo DESC, serialNo ASC
+                OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY
+            `);
+
+            return { total: countResult.recordset[0].total, rows: listResult.recordset, totals: totalsResult.recordset[0] };
+        });
+
+        res.json({
+            success: true,
+            items: rows,
+            total,
+            page,
+            pageSize,
+            totals: {
+                qty: totals.totalQty ?? 0,
+                cutingPct: totals.avgCuting ?? null,
+                colctingPct: totals.avgColcting ?? null,
+            },
+        });
+    } catch (err) {
+        console.error("❌ IRON ITEMS REPORT ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to fetch items report" });
+    }
+});
+
 // GET /api/iron/stock?search=&page=&pageSize= — Iron's current Main Stock
 // position, the legacy Access QSTOCK form's live equivalent (SELECT * FROM
 // QL2IRon, ordered by date DESC). This is a cross-database read against the
@@ -854,10 +1168,22 @@ router.get("/stock", async (req, res) => {
         if (search) conditions.push("(projNo LIKE @search OR projName LIKE @search OR Prodc LIKE @search)");
         const whereClause = `WHERE ${conditions.join(" AND ")}`;
 
-        const { total, rows } = await withSqlRetry("minstock", async (pool) => {
+        const { total, rows, totalRemaining } = await withSqlRetry("minstock", async (pool) => {
             const countRequest = pool.request();
             if (search) countRequest.input("search", `%${search}%`);
             const countResult = await countRequest.query(`SELECT COUNT(*) AS total FROM guest.QL2IRon ${whereClause}`);
+
+            // The legacy QSTOCK form's own FormFooter (COM-confirmed:
+            // Text26, ControlSource =Sum([QTY])) totals across the whole
+            // filtered recordset, not just one page. Summed here as
+            // Expr4/remaining rather than raw QTY to match this endpoint's
+            // own already-established correction above (QTY is the
+            // original total, not what's actually on hand) -- a straight
+            // Sum(QTY) footer would reintroduce the exact "mostly already
+            // shipped" distortion that fix exists to avoid.
+            const totalsRequest = pool.request();
+            if (search) totalsRequest.input("search", `%${search}%`);
+            const totalsResult = await totalsRequest.query(`SELECT SUM(Expr4) AS totalRemaining FROM guest.QL2IRon ${whereClause}`);
 
             const listRequest = pool.request();
             listRequest.input("offset", offset).input("pageSize", pageSize);
@@ -871,10 +1197,10 @@ router.get("/stock", async (req, res) => {
                 OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY
             `);
 
-            return { total: countResult.recordset[0].total, rows: listResult.recordset };
+            return { total: countResult.recordset[0].total, rows: listResult.recordset, totalRemaining: totalsResult.recordset[0].totalRemaining ?? 0 };
         });
 
-        res.json({ success: true, items: rows, total, page, pageSize });
+        res.json({ success: true, items: rows, total, page, pageSize, totalRemaining });
     } catch (err) {
         console.error("❌ IRON STOCK ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to fetch stock" });
