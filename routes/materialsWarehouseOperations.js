@@ -7,7 +7,7 @@
 // reservation line and external processing both do.
 import express from 'express';
 import { Op } from 'sequelize';
-import { sequelize2PetraErp } from '../config/db.js';
+import { sequelize2PetraErp, sequelizeUtf8 } from '../config/db.js';
 import { authenticateToken } from '../middleware/auth.js';
 import { requirePermission, getPermissionsForRole } from '../middleware/permissions.js';
 import { PERMISSIONS } from '../constants/permissions.js';
@@ -583,6 +583,71 @@ router.post('/reservations/:id/items/:lineId/reject', requireReserve, async (req
     }
 });
 
+// "Compensation" -- covers some or all of a shortfall line's still-owed
+// quantity with a DIFFERENT item/color/length that's actually available
+// right now, instead of only ever waiting on the shortfall's already-
+// raised auto-PO (left untouched here, same "don't implicitly touch an
+// already-raised PO" precedent /release documents). The substitute is
+// created as its OWN new confirmed line on the same header/store -- not a
+// mutation of the original line -- so the original keeps recording what
+// was actually requested, and the new line records what was actually
+// handed over instead. Same actor as Confirm (.reserve): this is a
+// store's own decision about how to cover a shortfall it already owns.
+router.post('/reservations/:id/items/:lineId/substitute', requireReserve, async (req, res) => {
+    const line = await MatWhReservationItem.findOne({
+        where: { id: req.params.lineId, reservationHeaderId: req.params.id },
+    });
+    if (!line) return res.status(404).json({ message: 'Line not found' });
+    if (line.status !== 'partially_confirmed') {
+        return res.status(409).json({ message: `Cannot substitute on a line in status '${line.status}' -- only a real shortfall can be covered this way` });
+    }
+
+    const { itemId, color, lengthMm } = req.body;
+    const qty = Number(req.body.qty);
+    if (!itemId) return res.status(400).json({ message: 'itemId is required' });
+    if (!Number.isFinite(qty) || qty <= 0) {
+        return res.status(400).json({ message: 'qty must be a positive number' });
+    }
+    if (qty > Number(line.qtyShortfall) + 0.0001) {
+        return res.status(409).json({ message: `Only ${line.qtyShortfall} still owed on this line -- cannot substitute more than that` });
+    }
+    if (Number(itemId) === line.itemId) {
+        return res.status(400).json({ message: 'That is the same item this line already requested -- nothing to substitute' });
+    }
+
+    const substituteItem = await MatWhItem.findByPk(itemId);
+    if (!substituteItem) return res.status(400).json({ message: `Unknown item id: ${itemId}` });
+
+    const available = await getAvailableToReserve(line.storeId, itemId);
+    if (available < qty) {
+        return res.status(409).json({ message: `Only ${available} of the substitute item available at this store`, available });
+    }
+
+    const t = await sequelizeUtf8.transaction();
+    try {
+        const substituteLine = await MatWhReservationItem.create({
+            reservationHeaderId: line.reservationHeaderId, itemId, storeId: line.storeId,
+            color: color || null, lengthMm: lengthMm ?? null,
+            qtyRequested: qty, qtyReserved: qty, qtyShortfall: 0,
+            status: 'confirmed', reservedBy: req.user.userId, reservedDate: new Date(),
+            substitutesLineId: line.id,
+        }, { transaction: t });
+
+        const remainingShortfall = Number(line.qtyShortfall) - qty;
+        await line.update({
+            qtyShortfall: Math.max(0, remainingShortfall),
+            status: remainingShortfall > 0.0001 ? 'partially_confirmed' : 'confirmed',
+        }, { transaction: t });
+
+        await t.commit();
+        res.status(201).json({ originalLine: line, substituteLine });
+    } catch (err) {
+        await t.rollback();
+        console.error('Error substituting reservation line:', err);
+        res.status(500).json({ message: 'Failed to substitute item' });
+    }
+});
+
 // Storekeeper's physical hand-over of one confirmed line (WM 10-22) --
 // deliberately a distinct permission from Confirm (.reserve, the
 // production-supervisor approval on WM 10-21): a reservation can be fully
@@ -732,6 +797,42 @@ router.post('/reservations/:id/release', requireReserve, async (req, res) => {
         }
     }
     await header.update({ status: computeHeaderStatus(lines) });
+    res.json(header);
+});
+
+// Reassigns a reservation to a different project -- header-level only (a
+// reservation is one project covering several items, not the other way
+// around, so "transfer" moves the whole header, never a single line).
+// Blocked once every line is terminal (issued/released/rejected -- nothing
+// left to actually reassign, the material's already gone one way or the
+// other for the OLD project). Deliberately does NOT touch matWhStockLedger
+// or any already-issued line's own historical record: postLedgerMovement
+// snapshots projectId at issue time, so an already-issued line's ledger
+// row keeps recording the project it was actually handed over to,
+// regardless of a later transfer -- exactly the same "don't rewrite
+// history" reasoning release's own comment already documents for an
+// already-raised auto-PO.
+router.post('/reservations/:id/transfer', requireReserve, async (req, res) => {
+    const header = await MatWhReservationHeader.findByPk(req.params.id);
+    if (!header) return res.status(404).json({ message: 'Not found' });
+    if (['issued', 'released', 'rejected'].includes(header.status)) {
+        return res.status(409).json({ message: `Cannot transfer a reservation in status '${header.status}' -- nothing left to reassign` });
+    }
+    const { projectId, projectNo, projectName, projectManager } = req.body;
+    if (!projectId) return res.status(400).json({ message: 'projectId is required' });
+    if (Number(projectId) === header.projectId) {
+        return res.status(400).json({ message: 'This reservation is already assigned to that project' });
+    }
+
+    await header.update({
+        previousProjectId: header.projectId,
+        previousProjectNo: header.projectNo,
+        previousProjectName: header.projectName,
+        transferredBy: req.user.userId,
+        transferredDate: new Date(),
+        projectId, projectNo: projectNo ?? null, projectName: projectName ?? null,
+        projectManager: projectManager ?? null,
+    });
     res.json(header);
 });
 

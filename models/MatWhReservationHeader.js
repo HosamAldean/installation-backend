@@ -49,6 +49,18 @@ export const MatWhReservationHeader = sequelizeUtf8.define('MatWhReservationHead
     createdBy: { type: DataTypes.INTEGER, allowNull: true },
     confirmedBy: { type: DataTypes.INTEGER, allowNull: true },
     confirmedDate: { type: DataTypes.DATE, allowNull: true },
+    // Set only when this reservation has been transferred to a different
+    // project (see routes' /transfer action) -- a one-step-back snapshot of
+    // what it was transferred FROM, not a full history table, same
+    // convention as MatWhPurchaseOrder's own storekeeperConfirmedBy/
+    // managerConfirmedBy fields. A second transfer overwrites these with
+    // the project it was just transferred FROM (the one before that is
+    // lost, by design -- one step of undo-context is enough for this).
+    previousProjectId: { type: DataTypes.INTEGER, allowNull: true },
+    previousProjectNo: { type: DataTypes.STRING(50), allowNull: true },
+    previousProjectName: { type: DataTypes.STRING(255), allowNull: true },
+    transferredBy: { type: DataTypes.INTEGER, allowNull: true },
+    transferredDate: { type: DataTypes.DATE, allowNull: true },
 }, {
     tableName: 'matWhReservationHeaders',
     timestamps: true,

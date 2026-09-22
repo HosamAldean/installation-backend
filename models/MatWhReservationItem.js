@@ -70,6 +70,14 @@ export const MatWhReservationItem = sequelizeUtf8.define('MatWhReservationItem',
     rejectedBy: { type: DataTypes.INTEGER, allowNull: true },
     rejectedDate: { type: DataTypes.DATE, allowNull: true },
     rejectionReason: { type: DataTypes.STRING(500), allowNull: true },
+    // Set only on a line CREATED as a substitute (see the /substitute
+    // route in services/matWhReservations.js) -- points back at the
+    // shortfall line it covers, on the same header. Compensates for a
+    // shortfall with a different item/color/length that's actually in
+    // stock, as an alternative to only ever waiting on the shortfall's
+    // auto-generated PO (which is left untouched, same "don't implicitly
+    // touch an already-raised PO" precedent as releasing a reservation).
+    substitutesLineId: { type: DataTypes.INTEGER, allowNull: true },
 }, {
     tableName: 'matWhReservationItems',
     timestamps: true,
