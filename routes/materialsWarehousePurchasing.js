@@ -30,6 +30,7 @@ import { MatWhStockLedger } from '../models/MatWhStockLedger.js';
 import { MatWhExternalProcessing } from '../models/MatWhExternalProcessing.js';
 import { MatWhItem } from '../models/MatWhItem.js';
 import { MatWhStore } from '../models/MatWhStore.js';
+import { MatWhItemStore } from '../models/MatWhItemStore.js';
 import { Vendor } from '../models/Vendor.js';
 import { User } from '../models/User.js';
 import { postLedgerMovement, applyReceiptCost } from '../services/matWhLedger.js';
@@ -508,6 +509,15 @@ router.get('/goods-receipt-candidates', requireReceive, async (req, res) => {
         receivedByPoItem.set(r.poItemId, (receivedByPoItem.get(r.poItemId) || 0) + Number(r.qtyReceived));
     }
 
+    // Where each item's pooled stock is generally kept in its destination
+    // store (WH gap #9) -- lets the storekeeper see where it'll end up
+    // before receiving, same context Reservations/Issue by Item already
+    // surface.
+    const itemStores = (itemIds.length > 0 && storeIds.length > 0)
+        ? await MatWhItemStore.findAll({ where: { itemId: itemIds, storeId: storeIds } })
+        : [];
+    const itemStoreByKey = new Map(itemStores.map((s) => [`${s.itemId}:${s.storeId}`, s]));
+
     const candidates = [];
     for (const poItem of poItems) {
         const po = poById.get(poItem.purchaseOrderId);
@@ -516,6 +526,7 @@ router.get('/goods-receipt-candidates', requireReceive, async (req, res) => {
         const qtyOutstanding = Number(poItem.qtyOrdered) - receivedSoFar;
         if (qtyOutstanding <= 0.0001) continue; // fully received already, nothing left to offer
         const item = itemById.get(poItem.itemId);
+        const itemStore = itemStoreByKey.get(`${poItem.itemId}:${po.destinationStoreId}`);
         candidates.push({
             poItemId: poItem.id,
             purchaseOrderId: po.id,
@@ -525,6 +536,9 @@ router.get('/goods-receipt-candidates', requireReceive, async (req, res) => {
             vendorName: vendorById.get(po.vendorId)?.vendorName ?? null,
             destinationStoreId: po.destinationStoreId,
             storeName: storeById.get(po.destinationStoreId)?.storeName ?? null,
+            zone: itemStore?.zone ?? null,
+            locationColumn: itemStore?.locationColumn ?? null,
+            locationRow: itemStore?.locationRow ?? null,
             itemId: poItem.itemId,
             itemCode: item?.itemCode ?? null,
             itemName: item?.itemName ?? null,
