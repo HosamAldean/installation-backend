@@ -101,6 +101,11 @@ router.get('/purchase-orders', requirePurchaseOrdersReadAccess, async (req, res)
     // Lets the Store Manager dashboard ask for exactly what's awaiting
     // that manager's own confirmation (?internalApprovalStatus=pending_manager).
     if (req.query.internalApprovalStatus) where.internalApprovalStatus = req.query.internalApprovalStatus;
+    // Only ever set on an auto-generated shortfall PO (see
+    // services/matWhReservations.js) -- a manually-created PO has no
+    // project of its own, so this only ever narrows to shortfall-driven
+    // purchasing for one project, not every PO touching it.
+    if (req.query.projectId) where.projectId = req.query.projectId;
 
     const { count, rows } = await MatWhPurchaseOrder.findAndCountAll({
         where, limit: pageSize, offset: (page - 1) * pageSize, order: [['id', 'DESC']],

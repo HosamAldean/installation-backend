@@ -20,6 +20,7 @@ export const MatWhProfileStock = sequelizeUtf8.define('MatWhProfileStock', {
     // data-entry point (receive, reserve, ship, return, coating, transfer),
     // same role Stock House's ComputerNO played.
     barcode: { type: DataTypes.STRING(50), allowNull: false, unique: true },
+    zone: { type: DataTypes.STRING(20), allowNull: true },
     locationColumn: { type: DataTypes.STRING(20), allowNull: true },
     locationRow: { type: DataTypes.STRING(20), allowNull: true },
     isActive: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: true },

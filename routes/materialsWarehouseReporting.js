@@ -99,6 +99,13 @@ router.get('/reports/in-out', async (req, res) => {
     if (req.query.storeId) where.storeId = req.query.storeId;
     if (req.query.itemId) where.itemId = req.query.itemId;
     if (req.query.docType) where.docType = req.query.docType;
+    // Only ever populated on a reservation-line issue movement --
+    // issueReservationLine (services/matWhReservations.js) is the one
+    // postLedgerMovement caller that passes it. A goods receipt, external
+    // processing, or opening-balance movement never carries a project, so
+    // this narrows to issue activity for one project, not "everything that
+    // ever touched this project."
+    if (req.query.projectId) where.projectId = req.query.projectId;
     if (req.query.dateFrom || req.query.dateTo) {
         where.movementDate = {};
         if (req.query.dateFrom) where.movementDate[Op.gte] = new Date(req.query.dateFrom);
@@ -120,11 +127,13 @@ router.get('/reports/in-out', async (req, res) => {
 // Purchase Pipeline -- Alpha-side equivalent: POs by status.
 // ------------------------------------------------------------
 router.get('/reports/purchase-pipeline', async (req, res) => {
+    const projectId = req.query.projectId ? Number(req.query.projectId) : null;
     const [rows] = await sequelizeUtf8.query(`
         SELECT status, COUNT(*) AS count, SUM(netAmt) AS totalAmt
         FROM matWhPurchaseOrders
+        ${projectId ? 'WHERE projectId = :projectId' : ''}
         GROUP BY status
-    `);
+    `, { replacements: projectId ? { projectId } : {} });
     res.json({ statuses: rows });
 });
 

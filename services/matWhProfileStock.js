@@ -48,7 +48,7 @@ export async function getAvailableToReserve(profileStockId) {
 // profileCatalogId+color+lengthMm+storeId combination, or creates one when
 // `createIfMissing` is true and a barcode is supplied -- mirrors Stock
 // House's resolveComputerNo, but as a real row instead of a derived lookup.
-export async function resolveProfileStock({ profileCatalogId, color, lengthMm, storeId, barcode, locationColumn, locationRow }, { createIfMissing = false } = {}) {
+export async function resolveProfileStock({ profileCatalogId, color, lengthMm, storeId, barcode, zone, locationColumn, locationRow }, { createIfMissing = false } = {}) {
     const existing = await MatWhProfileStock.findOne({
         where: { profileCatalogId, color, lengthMm, storeId },
     });
@@ -57,7 +57,7 @@ export async function resolveProfileStock({ profileCatalogId, color, lengthMm, s
     if (!barcode) return null;
     return MatWhProfileStock.create({
         profileCatalogId, color, lengthMm, storeId, barcode,
-        locationColumn: locationColumn || null, locationRow: locationRow || null,
+        zone: zone || null, locationColumn: locationColumn || null, locationRow: locationRow || null,
     });
 }
 

@@ -664,6 +664,57 @@ router.post('/reservation-items/:lineId/issue', requireIssue, async (req, res) =
     }
 });
 
+// Sums this line's already-returned quantity across every prior return
+// movement -- live-computed off the ledger (the single source of truth for
+// stock movements) rather than a cached counter, same convention as
+// materialsWarehousePurchasing.js's own getReceivedSoFar for goods
+// receipts. Used to stop a project from "returning" more than it was
+// actually issued.
+async function getReturnedSoFar(lineId) {
+    const rows = await MatWhStockLedger.findAll({
+        where: { refType: 'reservation_item_return', refId: lineId },
+        attributes: ['qty'],
+    });
+    return rows.reduce((sum, r) => sum + Number(r.qty), 0);
+}
+
+// Material physically returned from a project back into a store -- the
+// piece this module was missing entirely on the item-level ledger (Profile
+// Store has its own separate MatWhProfileReturn for per-piece aluminum;
+// this is the main-flow equivalent, closing that gap). Deliberately scoped
+// to reversing a specific ISSUED reservation line rather than a free-
+// standing "return anything" action -- a return only makes sense against
+// material that was actually handed out through this system in the first
+// place, and tying it to the line keeps the audit trail (who issued it,
+// to which project, now returned how much of it) intact. Reuses .receive
+// (same actor who already accepts goods receipts) rather than a new key.
+router.post('/reservation-items/:lineId/return', requireReceive, async (req, res) => {
+    const line = await MatWhReservationItem.findByPk(req.params.lineId);
+    if (!line) return res.status(404).json({ message: 'Line not found' });
+    if (line.status !== 'issued') {
+        return res.status(409).json({ message: `Cannot return a line in status '${line.status}' -- only an issued line has stock out to return` });
+    }
+    const qty = Number(req.body?.qty);
+    if (!Number.isFinite(qty) || qty <= 0) {
+        return res.status(400).json({ message: 'qty must be a positive number' });
+    }
+    const returnedSoFar = await getReturnedSoFar(line.id);
+    if (returnedSoFar + qty > Number(line.qtyReserved) + 0.0001) {
+        return res.status(409).json({
+            message: `Only ${Number(line.qtyReserved) - returnedSoFar} still returnable on this line (issued ${line.qtyReserved}, already returned ${returnedSoFar})`,
+        });
+    }
+
+    const header = await MatWhReservationHeader.findByPk(line.reservationHeaderId);
+    const ledgerRow = await postLedgerMovement({
+        storeId: line.storeId, itemId: line.itemId, projectId: header?.projectId ?? null,
+        qty, direction: 'in', docType: 'return',
+        refType: 'reservation_item_return', refId: line.id,
+        performedBy: req.user.userId,
+    });
+    res.status(201).json({ ledgerRow, returnedSoFar: returnedSoFar + qty, qtyReserved: line.qtyReserved });
+});
+
 // Releases every held line on a confirmed reservation -- e.g. the project
 // no longer needs the material. Lines already covered by an auto-PO keep
 // that PO (canceling a purchase already raised is a separate, explicit

@@ -93,14 +93,14 @@ async function attachBarcodes(rows) {
 // profileCatalogId+color+lengthMm+storeId are also supplied, created if it
 // doesn't exist yet -- first-time receipt of a new combination).
 async function resolveStock(body) {
-    const { stockId, barcode, profileCatalogId, color, lengthMm, storeId, locationColumn, locationRow } = body;
+    const { stockId, barcode, profileCatalogId, color, lengthMm, storeId, zone, locationColumn, locationRow } = body;
     if (stockId) return MatWhProfileStock.findByPk(stockId);
     if (barcode) {
         const found = await MatWhProfileStock.findOne({ where: { barcode } });
         if (found) return found;
         if (profileCatalogId && color && lengthMm != null && storeId) {
             return resolveProfileStock(
-                { profileCatalogId, color, lengthMm: parseFloat(lengthMm), storeId, barcode, locationColumn, locationRow },
+                { profileCatalogId, color, lengthMm: parseFloat(lengthMm), storeId, barcode, zone, locationColumn, locationRow },
                 { createIfMissing: true },
             );
         }
@@ -329,13 +329,13 @@ router.get('/stock', requireAnyStockAccess, async (req, res) => {
 // receipt ever arrives.
 router.post('/stock', requireReceive, async (req, res) => {
     try {
-        const { profileCatalogId, color, lengthMm, storeId, barcode, locationColumn, locationRow } = req.body;
+        const { profileCatalogId, color, lengthMm, storeId, barcode, zone, locationColumn, locationRow } = req.body;
         if (!profileCatalogId || !color || lengthMm === undefined || lengthMm === null || !storeId || !barcode?.trim()) {
             return res.status(400).json({ success: false, message: 'profileCatalogId, color, lengthMm, storeId and barcode are required' });
         }
         const row = await MatWhProfileStock.create({
             profileCatalogId, color, lengthMm: parseFloat(lengthMm), storeId,
-            barcode: barcode.trim(), locationColumn: locationColumn || null, locationRow: locationRow || null,
+            barcode: barcode.trim(), zone: zone || null, locationColumn: locationColumn || null, locationRow: locationRow || null,
         });
         res.status(201).json({ success: true, id: row.id });
     } catch (err) {
@@ -347,7 +347,7 @@ router.post('/stock', requireReceive, async (req, res) => {
     }
 });
 
-// Location (and barcode) are the only fields a storekeeper should ever
+// Location (zone/column/row) and barcode are the only fields a storekeeper should ever
 // correct after the fact -- identity fields (profile/color/length/store)
 // are excluded, same "identity keys stay fixed" convention Stock House used
 // throughout (see routes/stockHouse.js's PUT /enter/:recordNo comment).
@@ -355,8 +355,9 @@ router.put('/stock/:id', requireReceive, async (req, res) => {
     try {
         const row = await MatWhProfileStock.findByPk(req.params.id);
         if (!row) return res.status(404).json({ success: false, message: 'Stock entry not found' });
-        const { locationColumn, locationRow, barcode, isActive } = req.body;
+        const { zone, locationColumn, locationRow, barcode, isActive } = req.body;
         await row.update({
+            zone: zone !== undefined ? zone : row.zone,
             locationColumn: locationColumn !== undefined ? locationColumn : row.locationColumn,
             locationRow: locationRow !== undefined ? locationRow : row.locationRow,
             barcode: barcode?.trim() || row.barcode,
