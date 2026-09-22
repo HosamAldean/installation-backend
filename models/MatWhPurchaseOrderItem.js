@@ -26,6 +26,14 @@ export const MatWhPurchaseOrderItem = sequelizeUtf8.define('MatWhPurchaseOrderIt
     // carried this before -- reservations didn't either until later).
     color: { type: DataTypes.STRING(50), allowNull: true },
     lengthMm: { type: DataTypes.FLOAT, allowNull: true },
+    // Set only by the auto-routing logic in services/matWhReservations.js
+    // when a painted ALM reservation line's shortfall is covered by buying
+    // mill-finish stock instead (color above is null on such a line --
+    // that's what's actually being procured) -- this remembers what color
+    // it needs to become once coated, carried through to the draft
+    // external-processing job the goods receipt auto-creates. Never set on
+    // a manually-created PO line.
+    targetColor: { type: DataTypes.STRING(50), allowNull: true },
 }, {
     tableName: 'matWhPurchaseOrderItems',
     timestamps: true,

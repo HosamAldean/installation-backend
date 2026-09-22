@@ -99,7 +99,7 @@ export async function submitReservation(headerId) {
 // below, which only makes sense when several lines are decided in the
 // same action). Caller supplies the transaction.
 async function confirmOneLine(line, header, confirmedBy, t) {
-    const available = await getAvailableToReserve(line.storeId, line.itemId);
+    const available = await getAvailableToReserve(line.storeId, line.itemId, line.color ?? undefined);
     const qtyReserved = Math.max(0, Math.min(line.qtyRequested, available));
     const qtyShortfall = line.qtyRequested - qtyReserved;
     const status = qtyShortfall > 0 ? 'partially_confirmed' : 'confirmed';
@@ -122,10 +122,20 @@ async function confirmOneLine(line, header, confirmedBy, t) {
             // separate track from `status`.
             internalApprovalStatus: 'pending_storekeeper',
         }, t);
+        // A painted aluminum line's shortfall is ALWAYS covered by buying
+        // mill-finish (raw, color: null) stock instead of the painted
+        // color directly -- the PO item remembers what color it needs to
+        // become via targetColor, picked up later by the goods receipt to
+        // auto-create a draft coating job (routes/
+        // materialsWarehousePurchasing.js's POST /goods-receipts). A
+        // plain/uncolored ALM line or any non-ALM line is unaffected.
+        const needsCoating = item?.category === 'ALM' && !!line.color;
         const poItem = await MatWhPurchaseOrderItem.create({
             purchaseOrderId: po.id, itemId: line.itemId,
             qtyOrdered: qtyShortfall, unitPrice: 0, lineAmt: 0,
-            color: line.color, lengthMm: line.lengthMm,
+            color: needsCoating ? null : line.color,
+            targetColor: needsCoating ? line.color : null,
+            lengthMm: line.lengthMm,
             reservationItemId: line.id, neededByDate: line.itemNeededByDate,
         }, { transaction: t });
         await line.update({ purchaseOrderId: po.id, purchaseOrderItemId: poItem.id }, { transaction: t });
@@ -244,7 +254,7 @@ export async function confirmReservation(headerId, confirmedBy) {
         const shortfallGroups = new Map(); // key -> { vendorId, storeId, lines: [{ reservationItem, item, qty }] }
 
         for (const line of lines) {
-            const available = await getAvailableToReserve(line.storeId, line.itemId);
+            const available = await getAvailableToReserve(line.storeId, line.itemId, line.color ?? undefined);
             const qtyReserved = Math.max(0, Math.min(line.qtyRequested, available));
             const qtyShortfall = line.qtyRequested - qtyReserved;
             const status = qtyShortfall > 0 ? 'partially_confirmed' : 'confirmed';
@@ -261,7 +271,11 @@ export async function confirmReservation(headerId, confirmedBy) {
                 if (!shortfallGroups.has(key)) {
                     shortfallGroups.set(key, { vendorId, storeId: line.storeId, lines: [] });
                 }
-                shortfallGroups.get(key).lines.push({ reservationItem: line, qty: qtyShortfall });
+                // See confirmOneLine's own comment -- a painted ALM line's
+                // shortfall always buys mill-finish instead, same rule
+                // applied here for the bulk-confirm path.
+                const needsCoating = item?.category === 'ALM' && !!line.color;
+                shortfallGroups.get(key).lines.push({ reservationItem: line, qty: qtyShortfall, needsCoating });
             }
         }
 
@@ -278,11 +292,13 @@ export async function confirmReservation(headerId, confirmedBy) {
                 internalApprovalStatus: 'pending_storekeeper',
             }, t);
 
-            for (const { reservationItem, qty } of group.lines) {
+            for (const { reservationItem, qty, needsCoating } of group.lines) {
                 const poItem = await MatWhPurchaseOrderItem.create({
                     purchaseOrderId: po.id, itemId: reservationItem.itemId,
                     qtyOrdered: qty, unitPrice: 0, lineAmt: 0,
-                    color: reservationItem.color, lengthMm: reservationItem.lengthMm,
+                    color: needsCoating ? null : reservationItem.color,
+                    targetColor: needsCoating ? reservationItem.color : null,
+                    lengthMm: reservationItem.lengthMm,
                     reservationItemId: reservationItem.id,
                     neededByDate: reservationItem.itemNeededByDate,
                 }, { transaction: t });
@@ -386,7 +402,7 @@ export async function issueReservationLine(lineId, issuedBy, issuedBarcode) {
             storeId: line.storeId, itemId: line.itemId, projectId: header.projectId,
             qty: line.qtyReserved, direction: 'out', docType: 'issue',
             refType: 'reservation_item', refId: line.id,
-            performedBy: issuedBy,
+            performedBy: issuedBy, color: line.color ?? null,
         }, t);
 
         await line.update({

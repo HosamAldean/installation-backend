@@ -22,7 +22,7 @@ router.use(authenticateToken, requirePermission(PERMISSIONS.MATERIALS_WAREHOUSE_
 // not a way to silently adjust stock later (that's what a write-off/
 // adjustment movement type would be, not built in this pass).
 router.post('/opening-balance', async (req, res) => {
-    const { storeId, itemId, qty, unitCost, note } = req.body;
+    const { storeId, itemId, qty, unitCost, note, color } = req.body;
     if (!storeId || !itemId || qty === undefined) {
         return res.status(400).json({ message: 'storeId, itemId and qty are required' });
     }
@@ -37,13 +37,14 @@ router.post('/opening-balance', async (req, res) => {
     const ledgerRow = await postLedgerMovement({
         storeId, itemId, qty, direction: 'in', docType: 'opening_balance',
         refType: 'cutover', refId: null, unitCost, performedBy: req.user.userId,
+        color: color || null,
     });
 
     if (unitCost != null) {
         await applyReceiptCost(itemId, storeId, qty, unitCost);
     }
 
-    res.status(201).json({ ledgerEntryId: ledgerRow.id, storeId, itemId, qty, unitCost, note: note ?? null });
+    res.status(201).json({ ledgerEntryId: ledgerRow.id, storeId, itemId, qty, unitCost, color: color || null, note: note ?? null });
 });
 
 // Spot-check during the WH.6 parallel run: compare a manually-counted or

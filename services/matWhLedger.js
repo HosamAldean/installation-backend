@@ -17,10 +17,14 @@ const HELD_STATUSES = ['confirmed', 'partially_confirmed'];
 
 // Appends one ledger row. `transaction` is required for callers already
 // inside one (goods receipt, external processing) -- pass undefined for a
-// standalone call.
+// standalone call. `color` is optional -- omit it (or pass undefined) for
+// a movement with no color dimension; pass an explicit value (including
+// null, meaning mill-finish/raw) when the item genuinely has one. See
+// MatWhStockLedger.js's own comment for why null and undefined mean
+// different things here.
 export async function postLedgerMovement({
     storeId, itemId, projectId, qty, direction, docType, refType, refId,
-    unitCost, performedBy,
+    unitCost, performedBy, color,
 }, transaction) {
     return MatWhStockLedger.create({
         storeId, itemId, projectId: projectId ?? null,
@@ -29,6 +33,7 @@ export async function postLedgerMovement({
         totalCost: unitCost != null ? unitCost * qty : null,
         movementDate: new Date(),
         performedBy: performedBy ?? null,
+        color: color ?? null,
     }, { transaction });
 }
 
@@ -36,44 +41,58 @@ export async function postLedgerMovement({
 // the whole ledger. Does not account for reservations -- see
 // getAvailableToReserve for the figure that actually matters when deciding
 // whether a new reservation can be made.
-export async function getPhysicalBalance(storeId, itemId) {
-    const rows = await MatWhStockLedger.findAll({ where: { storeId, itemId } });
+//
+// `color` is the backward-compatibility hinge for every function below
+// that takes it: passed as `undefined` (the default -- simply not
+// supplying the argument), the where-clause gets no color condition at
+// all, so an existing caller that doesn't know about color sees EXACTLY
+// today's pooled-across-all-colors total, unchanged. Passing an explicit
+// color (including `null`, meaning "raw/mill-finish only") narrows the
+// query to that one color specifically. Never pass `null` meaning
+// "ignore color" -- that's what omitting the argument is for.
+export async function getPhysicalBalance(storeId, itemId, color) {
+    const where = { storeId, itemId };
+    if (color !== undefined) where.color = color;
+    const rows = await MatWhStockLedger.findAll({ where });
     let balance = 0;
     for (const r of rows) balance += r.direction === 'in' ? r.qty : -r.qty;
     return balance;
 }
 
 // Available-to-reserve = physical balance - currently active reservations
-// for the same store+item. This is the figure feasibility checks and new
-// reservations actually validate against.
-export async function getAvailableToReserve(storeId, itemId) {
-    const physical = await getPhysicalBalance(storeId, itemId);
-    const reserved = await getAlreadyReserved(storeId, itemId);
+// for the same store+item(+color). This is the figure feasibility checks
+// and new reservations actually validate against.
+export async function getAvailableToReserve(storeId, itemId, color) {
+    const physical = await getPhysicalBalance(storeId, itemId, color);
+    const reserved = await getAlreadyReserved(storeId, itemId, undefined, color);
     return physical - reserved;
 }
 
 // Sum of qtyReserved across every other held reservation line for this
-// store+item -- what a new reservation line's own available-to-reserve
-// figure is competing against. Exposed separately from
+// store+item(+color) -- what a new reservation line's own available-to-
+// reserve figure is competing against. Exposed separately from
 // getAvailableToReserve so the reservation UI can show "already reserved: N"
 // alongside "available: N" on the same line, not just the net figure.
-export async function getAlreadyReserved(storeId, itemId, excludeLineId) {
+export async function getAlreadyReserved(storeId, itemId, excludeLineId, color) {
     const where = { storeId, itemId, status: HELD_STATUSES };
+    if (color !== undefined) where.color = color;
     const rows = await MatWhReservationItem.findAll({ where });
     return rows
         .filter((r) => r.id !== excludeLineId)
         .reduce((sum, r) => sum + r.qtyReserved, 0);
 }
 
-// Sum of qtyRequested across every 'pending' line for this store+item --
-// submitted, awaiting that line's own store's confirm/reject decision.
-// Not yet earmarked (only a confirmed/partially_confirmed line actually
-// holds stock, see HELD_STATUSES above), but real demand already sitting
-// in the queue -- shown alongside available/already-reserved so a
+// Sum of qtyRequested across every 'pending' line for this store+item
+// (+color) -- submitted, awaiting that line's own store's confirm/reject
+// decision. Not yet earmarked (only a confirmed/partially_confirmed line
+// actually holds stock, see HELD_STATUSES above), but real demand already
+// sitting in the queue -- shown alongside available/already-reserved so a
 // storekeeper can see stock that's about to be spoken for if those
 // pending requests get approved, not just what's already committed.
-export async function getPendingQty(storeId, itemId, excludeLineId) {
-    const rows = await MatWhReservationItem.findAll({ where: { storeId, itemId, status: 'pending' } });
+export async function getPendingQty(storeId, itemId, excludeLineId, color) {
+    const where = { storeId, itemId, status: 'pending' };
+    if (color !== undefined) where.color = color;
+    const rows = await MatWhReservationItem.findAll({ where });
     return rows
         .filter((r) => r.id !== excludeLineId)
         .reduce((sum, r) => sum + r.qtyRequested, 0);

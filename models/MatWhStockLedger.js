@@ -16,6 +16,14 @@ export const MatWhStockLedger = sequelizeUtf8.define('MatWhStockLedger', {
     storeId: { type: DataTypes.INTEGER, allowNull: false },
     itemId: { type: DataTypes.INTEGER, allowNull: false },
     projectId: { type: DataTypes.INTEGER, allowNull: true },
+    // Null means either "not a color-tracked item" or "mill-finish/raw" --
+    // the same reservation/PO-item convention this ledger otherwise never
+    // recorded until Phase 3 of the 2026-09-22 capability audit. Every
+    // read helper below treats an OMITTED color argument as "don't filter
+    // by color at all" (pooled total, today's exact behavior) -- passing
+    // an explicit null means "raw/mill only," a genuinely narrower filter.
+    // Never conflate the two.
+    color: { type: DataTypes.STRING(50), allowNull: true },
     qty: { type: DataTypes.FLOAT, allowNull: false }, // always positive; direction carries the sign meaning
     direction: { type: DataTypes.STRING(3), allowNull: false }, // 'in' | 'out'
     // receipt, transfer_in, transfer_out, issue, return, external_send,

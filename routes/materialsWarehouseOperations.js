@@ -18,6 +18,7 @@ import { MatWhStore } from '../models/MatWhStore.js';
 import { MatWhItemStore } from '../models/MatWhItemStore.js';
 import { MatWhFeasibilityCheck } from '../models/MatWhFeasibilityCheck.js';
 import { MatWhExternalProcessing } from '../models/MatWhExternalProcessing.js';
+import { MatWhPurchaseOrderItem } from '../models/MatWhPurchaseOrderItem.js';
 import { MatWhStockLedger } from '../models/MatWhStockLedger.js';
 import { postLedgerMovement, getAvailableToReserve, getAlreadyReserved, getPendingQty, getPhysicalBalance } from '../services/matWhLedger.js';
 import {
@@ -73,13 +74,18 @@ router.get('/stock-balance', requireAnyOf(
     // being edited (not yet used by the frontend, but avoids the line
     // double-counting against its own hold if that's added later).
     const excludeLineId = req.query.excludeLineId ? Number(req.query.excludeLineId) : undefined;
+    // Omitted entirely -> undefined -> pooled total across every color,
+    // unchanged from before color-awareness existed. Only a caller that
+    // actually knows the color (ReservationDetail.tsx's ALM line entry)
+    // passes one.
+    const color = req.query.color || undefined;
     const [physicalBalance, alreadyReserved, pendingQty] = await Promise.all([
-        getPhysicalBalance(storeId, itemId),
-        getAlreadyReserved(storeId, itemId, excludeLineId),
-        getPendingQty(storeId, itemId, excludeLineId),
+        getPhysicalBalance(storeId, itemId, color),
+        getAlreadyReserved(storeId, itemId, excludeLineId, color),
+        getPendingQty(storeId, itemId, excludeLineId, color),
     ]);
     res.json({
-        storeId, itemId, physicalBalance, alreadyReserved, pendingQty,
+        storeId, itemId, color: color ?? null, physicalBalance, alreadyReserved, pendingQty,
         availableToReserve: physicalBalance - alreadyReserved,
     });
 });
@@ -356,7 +362,21 @@ router.get('/reservations/:id', requireAnyOf(
     const items = await MatWhReservationItem.findAll({
         where: { reservationHeaderId: header.id }, order: [['id', 'ASC']],
     });
-    res.json({ ...header.toJSON(), items });
+
+    // Surface each line's linked PO item's targetColor, if any -- lets the
+    // UI explain why a partially_confirmed line's auto-PO shows color: null
+    // (it's a mill-finish buy headed for coating, see matWhReservations.js's
+    // confirmOneLine/confirmReservation).
+    const poItemIds = [...new Set(items.map((i) => i.purchaseOrderItemId).filter(Boolean))];
+    const poItemById = poItemIds.length > 0
+        ? new Map((await MatWhPurchaseOrderItem.findAll({ where: { id: poItemIds } })).map((p) => [p.id, p]))
+        : new Map();
+    const itemsWithTargetColor = items.map((i) => ({
+        ...i.toJSON(),
+        targetColor: poItemById.get(i.purchaseOrderItemId)?.targetColor ?? null,
+    }));
+
+    res.json({ ...header.toJSON(), items: itemsWithTargetColor });
 });
 
 router.post('/reservations', requireReserve, async (req, res) => {
@@ -618,7 +638,7 @@ router.post('/reservations/:id/items/:lineId/substitute', requireReserve, async 
     const substituteItem = await MatWhItem.findByPk(itemId);
     if (!substituteItem) return res.status(400).json({ message: `Unknown item id: ${itemId}` });
 
-    const available = await getAvailableToReserve(line.storeId, itemId);
+    const available = await getAvailableToReserve(line.storeId, itemId, color || undefined);
     if (available < qty) {
         return res.status(409).json({ message: `Only ${available} of the substitute item available at this store`, available });
     }
@@ -646,6 +666,42 @@ router.post('/reservations/:id/items/:lineId/substitute', requireReserve, async 
         console.error('Error substituting reservation line:', err);
         res.status(500).json({ message: 'Failed to substitute item' });
     }
+});
+
+// Applies newly-available stock of the EXACT item/color a shortfall line is
+// still owed -- the counterpart to Substitute above, for the case
+// Substitute can't handle: the coating loop returns the SAME item (just now
+// available in the requested color), and Substitute explicitly rejects a
+// same-itemId substitute. Deliberately generic, not coating-specific -- any
+// route that adds real stock (a plain receipt, a return, a manual ledger
+// correction) can also be what a storekeeper is reacting to here, not just
+// a coating receive. Deliberately NOT auto-called from external-processing
+// receive: more than one line can be waiting on the same item+color, so a
+// storekeeper decides allocation explicitly, one click per line. Also
+// deliberately leaves the line's already-raised PO/coating job untouched,
+// same "don't implicitly touch a live PO" precedent /release documents.
+router.post('/reservations/:id/items/:lineId/fulfill-shortfall', requireReserve, async (req, res) => {
+    const line = await MatWhReservationItem.findOne({
+        where: { id: req.params.lineId, reservationHeaderId: req.params.id },
+    });
+    if (!line) return res.status(404).json({ message: 'Line not found' });
+    if (line.status !== 'partially_confirmed') {
+        return res.status(409).json({ message: `Cannot fulfill shortfall on a line in status '${line.status}' -- only a real shortfall can be covered this way` });
+    }
+
+    const available = await getAvailableToReserve(line.storeId, line.itemId, line.color ?? undefined);
+    if (!(available > 0)) {
+        return res.status(409).json({ message: 'No newly-available stock for this item/color yet', available });
+    }
+
+    const qtyToApply = Math.min(Number(line.qtyShortfall), available);
+    const remainingShortfall = Number(line.qtyShortfall) - qtyToApply;
+    await line.update({
+        qtyReserved: Number(line.qtyReserved) + qtyToApply,
+        qtyShortfall: Math.max(0, remainingShortfall),
+        status: remainingShortfall > 0.0001 ? 'partially_confirmed' : 'confirmed',
+    });
+    res.json(line);
 });
 
 // Storekeeper's physical hand-over of one confirmed line (WM 10-22) --
@@ -775,7 +831,7 @@ router.post('/reservation-items/:lineId/return', requireReceive, async (req, res
         storeId: line.storeId, itemId: line.itemId, projectId: header?.projectId ?? null,
         qty, direction: 'in', docType: 'return',
         refType: 'reservation_item_return', refId: line.id,
-        performedBy: req.user.userId,
+        performedBy: req.user.userId, color: line.color ?? null,
     });
     res.status(201).json({ ledgerRow, returnedSoFar: returnedSoFar + qty, qtyReserved: line.qtyReserved });
 });
@@ -841,15 +897,15 @@ router.post('/reservations/:id/transfer', requireReserve, async (req, res) => {
 // ============================================================
 
 router.post('/feasibility-checks', requireReserve, async (req, res) => {
-    const { itemId, storeId, projectId, productionRef, qtyRequested } = req.body;
+    const { itemId, storeId, projectId, productionRef, qtyRequested, color } = req.body;
     if (!itemId || !storeId || !qtyRequested) {
         return res.status(400).json({ message: 'itemId, storeId and qtyRequested are required' });
     }
-    const available = await getAvailableToReserve(storeId, itemId);
+    const available = await getAvailableToReserve(storeId, itemId, color || undefined);
     const status = Number(qtyRequested) <= available ? 'feasible' : 'not_feasible';
     const row = await MatWhFeasibilityCheck.create({
         itemId, storeId, projectId: projectId ?? null, productionRef: productionRef ?? null,
-        qtyRequested, status, checkedBy: req.user.userId, checkedDate: new Date(),
+        color: color || null, qtyRequested, status, checkedBy: req.user.userId, checkedDate: new Date(),
     });
     res.status(201).json({ ...row.toJSON(), availableAtCheckTime: available });
 });
@@ -876,7 +932,32 @@ router.get('/external-processing', requireAnyOf(
     if (req.query.status) where.status = req.query.status;
     if (req.query.storeId) where.storeId = req.query.storeId;
     const rows = await MatWhExternalProcessing.findAll({ where, order: [['id', 'DESC']] });
-    res.json({ items: rows });
+
+    // Resolve the originating reservation for auto-generated coating jobs
+    // (see POST /goods-receipts' targetColor branch) so the frontend can
+    // link back without a separate round trip -- same batched-lookup style
+    // as issue-candidates above.
+    const sourceLineIds = [...new Set(rows.map((r) => r.sourceReservationItemId).filter(Boolean))];
+    const sourceLines = sourceLineIds.length > 0
+        ? await MatWhReservationItem.findAll({ where: { id: sourceLineIds } })
+        : [];
+    const lineById = new Map(sourceLines.map((l) => [l.id, l]));
+    const headerIds = [...new Set(sourceLines.map((l) => l.reservationHeaderId))];
+    const headers = headerIds.length > 0
+        ? await MatWhReservationHeader.findAll({ where: { id: headerIds } })
+        : [];
+    const headerById = new Map(headers.map((h) => [h.id, h]));
+
+    const items = rows.map((r) => {
+        const sourceLine = r.sourceReservationItemId ? lineById.get(r.sourceReservationItemId) : null;
+        const sourceHeader = sourceLine ? headerById.get(sourceLine.reservationHeaderId) : null;
+        return {
+            ...r.toJSON(),
+            reservationHeaderId: sourceHeader?.id ?? null,
+            reservationNo: sourceHeader?.reservationNo ?? null,
+        };
+    });
+    res.json({ items });
 });
 
 router.post('/external-processing', requireIssue, async (req, res) => {
@@ -916,9 +997,54 @@ router.post('/external-processing/:id/receive', requireReceive, async (req, res)
         await postLedgerMovement({
             storeId: row.storeId, itemId: row.itemId, qty: qtyReceived, direction: 'in',
             docType: 'external_receive', refType: 'external_processing', refId: row.id,
-            performedBy: req.user.userId,
+            performedBy: req.user.userId, color: row.targetColor ?? null,
         });
     }
+    res.json(row);
+});
+
+// Confirms an auto-created draft coating job (see POST /goods-receipts'
+// targetColor branch): a storekeeper must always pick the vendor by hand --
+// there's no safe default across multiple real coating partners -- and this
+// is the point the physical send becomes real, posting the external_send
+// ledger movement. Mirrors the existing auto-PO's own "raised automatically,
+// confirmed explicitly" shape. Manually-created jobs (POST /external-
+// processing) never pass through here -- they start at 'sent' already.
+router.post('/external-processing/:id/confirm-send', requireIssue, async (req, res) => {
+    const row = await MatWhExternalProcessing.findByPk(req.params.id);
+    if (!row) return res.status(404).json({ message: 'Not found' });
+    if (row.status !== 'draft') {
+        return res.status(409).json({ message: `Cannot confirm-send a job in status '${row.status}'` });
+    }
+    const { processVendorId } = req.body;
+    if (!processVendorId) {
+        return res.status(400).json({ message: 'processVendorId is required' });
+    }
+    const qtySent = req.body.qtySent !== undefined ? Number(req.body.qtySent) : row.qtySent;
+
+    // Mill-finish stock is the untargeted (null-color) pool -- pass null
+    // explicitly (not row.targetColor, and not undefined/pooled). The
+    // external_send movement this route posts below always writes
+    // color: null, so what it actually debits is the null-color balance
+    // specifically; checking against the ALL-colors pooled total
+    // (undefined) could pass on the strength of other colors' stock that
+    // this movement never touches, then still drive the null-color balance
+    // negative once posted. The check has to scope to the same color the
+    // write uses.
+    const available = await getAvailableToReserve(row.storeId, row.itemId, null);
+    if (qtySent > available) {
+        return res.status(409).json({ message: `Only ${available} available to send`, available });
+    }
+
+    await postLedgerMovement({
+        storeId: row.storeId, itemId: row.itemId, qty: qtySent, direction: 'out',
+        docType: 'external_send', refType: 'external_processing', refId: row.id,
+        performedBy: req.user.userId, color: null,
+    });
+    await row.update({
+        status: 'sent', processVendorId, qtySent,
+        sentBy: req.user.userId, sentDate: new Date(),
+    });
     res.json(row);
 });
 
