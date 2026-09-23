@@ -152,13 +152,17 @@ export async function createCoatingJob(reservationHeaderId, values, t) {
 async function earmarkTiersOneAndTwo(line, item, qtyToDecide, t) {
     const needsCoating = item?.category === 'ALM' && !!line.color && line.color !== 'MILL';
 
-    const availableExactColor = await getAvailableToReserve(line.storeId, line.itemId, line.color ?? undefined);
+    const availableExactColor = await getAvailableToReserve(
+        line.storeId, line.itemId, line.color ?? undefined, line.lengthMm ?? undefined,
+    );
     const qtyReserved = Math.max(0, Math.min(qtyToDecide, availableExactColor));
     let remaining = qtyToDecide - qtyReserved;
 
     let qtyPendingCoating = 0;
     if (needsCoating && remaining > 0) {
-        const availableMill = await getAvailableToReserve(line.storeId, line.itemId, null);
+        const availableMill = await getAvailableToReserve(
+            line.storeId, line.itemId, null, line.lengthMm ?? undefined,
+        );
         qtyPendingCoating = Math.max(0, Math.min(remaining, availableMill));
         remaining -= qtyPendingCoating;
 
@@ -542,7 +546,7 @@ export async function issueReservationLine(lineId, issuedBy, issuedBarcode, issu
             storeId: line.storeId, itemId: line.itemId, projectId: header.projectId,
             qty: line.qtyReserved, direction: 'out', docType: 'issue',
             refType: 'reservation_item', refId: line.id,
-            performedBy: issuedBy, color: line.color ?? null,
+            performedBy: issuedBy, color: line.color ?? null, lengthMm: line.lengthMm ?? null,
         }, t);
 
         await line.update({

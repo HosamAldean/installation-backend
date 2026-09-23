@@ -645,8 +645,9 @@ router.post('/goods-receipts', requireReceive, async (req, res) => {
                     // line -- see services/matWhReservations.js's
                     // confirmOneLine/confirmReservation) is what's actually
                     // physically arriving; a manual PO line's real color
-                    // carries straight through.
+                    // carries straight through. Same for lengthMm.
                     color: poItem?.color ?? null,
+                    lengthMm: poItem?.lengthMm ?? null,
                 }, t);
                 await grItem.update({ ledgerEntryId: ledgerRow.id }, { transaction: t });
                 // WH.4: feeds the running valuation (matWhItemCost) from

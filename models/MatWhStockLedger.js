@@ -24,6 +24,11 @@ export const MatWhStockLedger = sequelizeUtf8.define('MatWhStockLedger', {
     // an explicit null means "raw/mill only," a genuinely narrower filter.
     // Never conflate the two.
     color: { type: DataTypes.STRING(50), allowNull: true },
+    // Companion to color, added alongside the item-variants/barcode layer
+    // (2026-09-23). Same "omitted -> no filter, explicit -> narrows"
+    // convention on the read side (services/matWhLedger.js) -- simpler
+    // than color, no length equivalent of "MILL" needing normalization.
+    lengthMm: { type: DataTypes.FLOAT, allowNull: true },
     qty: { type: DataTypes.FLOAT, allowNull: false }, // always positive; direction carries the sign meaning
     direction: { type: DataTypes.STRING(3), allowNull: false }, // 'in' | 'out'
     // receipt, transfer_in, transfer_out, issue, return, external_send,

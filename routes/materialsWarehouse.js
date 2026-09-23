@@ -28,6 +28,7 @@ import { MatWhSubCategory } from '../models/MatWhSubCategory.js';
 import { MatWhUnit } from '../models/MatWhUnit.js';
 import { Vendor } from '../models/Vendor.js';
 import { MatWhItemStore } from '../models/MatWhItemStore.js';
+import { MatWhItemVariant } from '../models/MatWhItemVariant.js';
 
 const router = express.Router();
 router.use(authenticateToken, requirePermission(PERMISSIONS.MATERIALS_WAREHOUSE_MASTER_DATA));
@@ -272,6 +273,75 @@ router.put('/items/:id/stores', async (req, res) => {
             storeId: r.storeId, zone: r.zone, locationColumn: r.locationColumn, locationRow: r.locationRow,
         })),
     });
+});
+
+// ============================================================
+// Item variants (matWhItemVariants) -- one real, physically-barcoded SKU
+// per color+length combination of a profile item. See MatWhItemVariant.js's
+// own header comment for why this is additive alongside matWhItems, not a
+// redesign of it. Only expected to matter for category='ALM' items, but
+// not enforced at the route level -- no harm in a plain item having one.
+// ============================================================
+
+router.get('/items/:id/variants', async (req, res) => {
+    const item = await MatWhItem.findByPk(req.params.id);
+    if (!item) return res.status(404).json({ message: 'Item not found' });
+    const rows = await MatWhItemVariant.findAll({ where: { itemId: item.id }, order: [['id', 'ASC']] });
+    res.json({ items: rows });
+});
+
+// Replace-the-whole-set, same diff pattern as PUT /items/:id/stores --
+// rows carrying their own `id` are updated in place, rows without one are
+// created, and any existing row missing from the submitted set is deleted.
+// Barcode uniqueness (globally, not just per item) is a real DB constraint
+// here, not just a UI nicety -- a collision surfaces as a clear 409, not a
+// raw 500.
+router.put('/items/:id/variants', async (req, res) => {
+    const item = await MatWhItem.findByPk(req.params.id);
+    if (!item) return res.status(404).json({ message: 'Item not found' });
+    const incoming = Array.isArray(req.body?.variants) ? req.body.variants : [];
+
+    const submittedWithId = incoming.filter((v) => v?.id);
+    const submittedNew = incoming.filter((v) => !v?.id);
+    const keepIds = submittedWithId.map((v) => Number(v.id));
+
+    const existing = await MatWhItemVariant.findAll({ where: { itemId: item.id } });
+    const toRemove = existing.filter((r) => !keepIds.includes(r.id));
+
+    try {
+        if (toRemove.length > 0) {
+            await MatWhItemVariant.destroy({ where: { itemId: item.id, id: toRemove.map((r) => r.id) } });
+        }
+        for (const v of submittedWithId) {
+            const row = existing.find((r) => r.id === Number(v.id));
+            if (!row) continue;
+            await row.update({
+                color: v.color || null,
+                lengthMm: v.lengthMm === '' || v.lengthMm == null ? null : Number(v.lengthMm),
+                barcode: String(v.barcode || '').trim(),
+                isActive: v.isActive !== false,
+            });
+        }
+        for (const v of submittedNew) {
+            if (!v.barcode || !String(v.barcode).trim()) continue;
+            await MatWhItemVariant.create({
+                itemId: item.id,
+                color: v.color || null,
+                lengthMm: v.lengthMm === '' || v.lengthMm == null ? null : Number(v.lengthMm),
+                barcode: String(v.barcode).trim(),
+                isActive: v.isActive !== false,
+            });
+        }
+    } catch (err) {
+        if (err.name === 'SequelizeUniqueConstraintError') {
+            return res.status(409).json({ message: 'That barcode is already assigned to another variant' });
+        }
+        console.error('Error saving item variants:', err);
+        return res.status(500).json({ message: 'Failed to save variants' });
+    }
+
+    const rows = await MatWhItemVariant.findAll({ where: { itemId: item.id }, order: [['id', 'ASC']] });
+    res.json({ items: rows });
 });
 
 export default router;

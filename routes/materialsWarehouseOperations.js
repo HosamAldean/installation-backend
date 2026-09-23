@@ -16,6 +16,7 @@ import { MatWhReservationItem } from '../models/MatWhReservationItem.js';
 import { MatWhItem } from '../models/MatWhItem.js';
 import { MatWhStore } from '../models/MatWhStore.js';
 import { MatWhItemStore } from '../models/MatWhItemStore.js';
+import { MatWhItemVariant } from '../models/MatWhItemVariant.js';
 import { MatWhFeasibilityCheck } from '../models/MatWhFeasibilityCheck.js';
 import { MatWhExternalProcessing } from '../models/MatWhExternalProcessing.js';
 import { MatWhPurchaseOrder } from '../models/MatWhPurchaseOrder.js';
@@ -81,14 +82,19 @@ router.get('/stock-balance', requireAnyOf(
     // actually knows the color (ReservationDetail.tsx's ALM line entry)
     // passes one.
     const color = req.query.color || undefined;
+    // Same convention, added alongside the item-variants/barcode layer --
+    // omitted -> pooled across every length, unchanged; a real number
+    // narrows to that one length specifically.
+    const lengthMm = req.query.lengthMm ? Number(req.query.lengthMm) : undefined;
     const [physicalBalance, alreadyReserved, pendingQty, itemStore] = await Promise.all([
-        getPhysicalBalance(storeId, itemId, color),
-        getAlreadyReserved(storeId, itemId, excludeLineId, color),
-        getPendingQty(storeId, itemId, excludeLineId, color),
+        getPhysicalBalance(storeId, itemId, color, lengthMm),
+        getAlreadyReserved(storeId, itemId, excludeLineId, color, lengthMm),
+        getPendingQty(storeId, itemId, excludeLineId, color, lengthMm),
         MatWhItemStore.findOne({ where: { storeId, itemId } }),
     ]);
     res.json({
-        storeId, itemId, color: color ?? null, physicalBalance, alreadyReserved, pendingQty,
+        storeId, itemId, color: color ?? null, lengthMm: lengthMm ?? null,
+        physicalBalance, alreadyReserved, pendingQty,
         availableToReserve: physicalBalance - alreadyReserved,
         // General location of this item's pooled stock in this store (WH
         // gap #9) -- null when never recorded, same as no location data
@@ -187,6 +193,32 @@ router.get('/item-search', requireAnyOf(
     });
 });
 
+// Resolves a physical piece's real barcode to its (item, color, length) --
+// same narrow storekeeper-action gate as store-lookup/item-lookup/
+// color-lookup above, not MATERIALS_WAREHOUSE_MASTER_DATA (which owns
+// creating/editing variants themselves, routes/materialsWarehouse.js's
+// PUT /items/:id/variants). Scanning a barcode that isn't in
+// matWhItemVariants yet is a normal, expected case (not every item has
+// variants defined) -- a plain 404, not an error, for the caller (the
+// Issue action's barcode field) to fall back to today's unvalidated
+// free-text behavior.
+router.get('/variant-lookup', requireAnyOf(
+    PERMISSIONS.MATERIALS_WAREHOUSE_RESERVE,
+    PERMISSIONS.MATERIALS_WAREHOUSE_ISSUE,
+    PERMISSIONS.MATERIALS_WAREHOUSE_RECEIVE,
+), async (req, res) => {
+    const barcode = String(req.query.barcode || '').trim();
+    if (!barcode) return res.status(400).json({ message: 'barcode is required' });
+    const variant = await MatWhItemVariant.findOne({ where: { barcode, isActive: true } });
+    if (!variant) return res.status(404).json({ message: 'Barcode not recognized' });
+    const item = await MatWhItem.findByPk(variant.itemId);
+    res.json({
+        variantId: variant.id, itemId: variant.itemId,
+        itemCode: item?.itemCode ?? null, itemName: item?.itemName ?? null,
+        color: variant.color, lengthMm: variant.lengthMm,
+    });
+});
+
 // Resolves a specific set of item ids in one call -- for displaying
 // already-known lines (a reservation's or PO's own items table), NOT for
 // picking a new one (that's item-lookup/item-search above). Exists
@@ -231,6 +263,10 @@ router.get('/color-lookup', requireAnyOf(
     PERMISSIONS.MATERIALS_WAREHOUSE_RECEIVE,
     PERMISSIONS.MATERIALS_WAREHOUSE_PURCHASE_ORDERS,
     PERMISSIONS.MATERIALS_WAREHOUSE_PURCHASING,
+    // Added alongside the item-variants/barcode layer (2026-09-23) --
+    // Master Data's own item-variant editor needs the same real color list
+    // when defining a variant's color.
+    PERMISSIONS.MATERIALS_WAREHOUSE_MASTER_DATA,
 ), async (req, res) => {
     const rows = await sequelize2PetraErp.query(
         `SELECT ci.colorInfoId, ci.mixCode, ci.code, ci.colorDesc
@@ -655,7 +691,7 @@ router.post('/reservations/:id/items/:lineId/substitute', requireReserve, async 
     const substituteItem = await MatWhItem.findByPk(itemId);
     if (!substituteItem) return res.status(400).json({ message: `Unknown item id: ${itemId}` });
 
-    const available = await getAvailableToReserve(line.storeId, itemId, color || undefined);
+    const available = await getAvailableToReserve(line.storeId, itemId, color || undefined, lengthMm ?? undefined);
     if (available < qty) {
         return res.status(409).json({ message: `Only ${available} of the substitute item available at this store`, available });
     }
@@ -706,7 +742,9 @@ router.post('/reservations/:id/items/:lineId/fulfill-shortfall', requireReserve,
         return res.status(409).json({ message: `Cannot fulfill shortfall on a line in status '${line.status}' -- only a real shortfall can be covered this way` });
     }
 
-    const available = await getAvailableToReserve(line.storeId, line.itemId, line.color ?? undefined);
+    const available = await getAvailableToReserve(
+        line.storeId, line.itemId, line.color ?? undefined, line.lengthMm ?? undefined,
+    );
     if (!(available > 0)) {
         return res.status(409).json({ message: 'No newly-available stock for this item/color yet', available });
     }
@@ -871,7 +909,7 @@ router.post('/reservation-items/:lineId/return', requireReceive, async (req, res
         storeId: line.storeId, itemId: line.itemId, projectId: header?.projectId ?? null,
         qty, direction: 'in', docType: 'return',
         refType: 'reservation_item_return', refId: line.id,
-        performedBy: req.user.userId, color: line.color ?? null,
+        performedBy: req.user.userId, color: line.color ?? null, lengthMm: line.lengthMm ?? null,
     });
     res.status(201).json({ ledgerRow, returnedSoFar: returnedSoFar + qty, qtyReserved: line.qtyReserved });
 });

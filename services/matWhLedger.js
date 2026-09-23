@@ -57,10 +57,12 @@ function reservationItemColorWhere(color) {
 // a movement with no color dimension; pass an explicit value (including
 // null, meaning mill-finish/raw) when the item genuinely has one. See
 // MatWhStockLedger.js's own comment for why null and undefined mean
-// different things here.
+// different things here. `lengthMm` is optional too, same "omit to not
+// record a length at all" idea, but simpler than color -- there's no
+// length equivalent of "MILL" needing normalization, a plain pass-through.
 export async function postLedgerMovement({
     storeId, itemId, projectId, qty, direction, docType, refType, refId,
-    unitCost, performedBy, color,
+    unitCost, performedBy, color, lengthMm,
 }, transaction) {
     return MatWhStockLedger.create({
         storeId, itemId, projectId: projectId ?? null,
@@ -70,6 +72,7 @@ export async function postLedgerMovement({
         movementDate: new Date(),
         performedBy: performedBy ?? null,
         color: normalizeColor(color) ?? null,
+        lengthMm: lengthMm ?? null,
     }, { transaction });
 }
 
@@ -86,9 +89,14 @@ export async function postLedgerMovement({
 // color (including `null`, meaning "raw/mill-finish only") narrows the
 // query to that one color specifically. Never pass `null` meaning
 // "ignore color" -- that's what omitting the argument is for.
-export async function getPhysicalBalance(storeId, itemId, color) {
+// `lengthMm` follows the same "omitted = pooled, explicit = narrowed"
+// convention as `color` -- omit it entirely for today's exact behavior
+// (every existing color-only caller is unaffected), pass a real number to
+// scope the balance to that one length specifically.
+export async function getPhysicalBalance(storeId, itemId, color, lengthMm) {
     const where = { storeId, itemId };
     if (color !== undefined) where.color = normalizeColor(color);
+    if (lengthMm !== undefined) where.lengthMm = lengthMm;
     const rows = await MatWhStockLedger.findAll({ where });
     let balance = 0;
     for (const r of rows) balance += r.direction === 'in' ? r.qty : -r.qty;
@@ -96,11 +104,11 @@ export async function getPhysicalBalance(storeId, itemId, color) {
 }
 
 // Available-to-reserve = physical balance - currently active reservations
-// for the same store+item(+color). This is the figure feasibility checks
-// and new reservations actually validate against.
-export async function getAvailableToReserve(storeId, itemId, color) {
-    const physical = await getPhysicalBalance(storeId, itemId, color);
-    const reserved = await getAlreadyReserved(storeId, itemId, undefined, color);
+// for the same store+item(+color)(+length). This is the figure
+// feasibility checks and new reservations actually validate against.
+export async function getAvailableToReserve(storeId, itemId, color, lengthMm) {
+    const physical = await getPhysicalBalance(storeId, itemId, color, lengthMm);
+    const reserved = await getAlreadyReserved(storeId, itemId, undefined, color, lengthMm);
     return physical - reserved;
 }
 
@@ -109,8 +117,14 @@ export async function getAvailableToReserve(storeId, itemId, color) {
 // reserve figure is competing against. Exposed separately from
 // getAvailableToReserve so the reservation UI can show "already reserved: N"
 // alongside "available: N" on the same line, not just the net figure.
-export async function getAlreadyReserved(storeId, itemId, excludeLineId, color) {
+export async function getAlreadyReserved(storeId, itemId, excludeLineId, color, lengthMm) {
     const where = { storeId, itemId, status: HELD_STATUSES, ...reservationItemColorWhere(color) };
+    // Same "omitted = pooled, explicit = narrowed" convention as color --
+    // see getPhysicalBalance. Deliberately NOT applied to the
+    // qtyPendingCoating cross-check below -- that tier draws from the raw
+    // pool by color alone today; scoping it to length too is real future
+    // work, out of scope for this pass (adding the variant/barcode layer).
+    if (lengthMm !== undefined) where.lengthMm = lengthMm;
     const rows = await MatWhReservationItem.findAll({ where });
     let total = rows
         .filter((r) => r.id !== excludeLineId)
@@ -144,8 +158,9 @@ export async function getAlreadyReserved(storeId, itemId, excludeLineId, color) 
 // sitting in the queue -- shown alongside available/already-reserved so a
 // storekeeper can see stock that's about to be spoken for if those
 // pending requests get approved, not just what's already committed.
-export async function getPendingQty(storeId, itemId, excludeLineId, color) {
+export async function getPendingQty(storeId, itemId, excludeLineId, color, lengthMm) {
     const where = { storeId, itemId, status: 'pending', ...reservationItemColorWhere(color) };
+    if (lengthMm !== undefined) where.lengthMm = lengthMm;
     const rows = await MatWhReservationItem.findAll({ where });
     return rows
         .filter((r) => r.id !== excludeLineId)
