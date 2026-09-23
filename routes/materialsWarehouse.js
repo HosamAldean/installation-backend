@@ -78,71 +78,42 @@ router.post('/items/:id/photo', itemPhotoUpload.single('photo'), async (req, res
     }
 });
 
-// GET /catalog -- combined, paginated Item + Aluminum Profile listing for
-// Master Data's unified "Items" view (per explicit direction: one place to
-// browse/add either kind, not two separate tabs). A real SQL UNION ALL
-// (both tables live on this same sequelizeUtf8 connection) rather than a
-// client-side merge of two separately-paginated fetches -- that would give
-// wrong page boundaries the moment the combined row count crosses a single
-// page size. `kind` tags each row so the frontend knows which real
-// endpoint (`/items` vs `/profile-store/catalog`) owns it for edit/delete/
-// photo actions.
-//
-// Deliberately gated by this router's own MATERIALS_WAREHOUSE_MASTER_DATA
-// permission only, same as every other endpoint here -- NOT also requiring
-// MATERIALS_WAREHOUSE_PROFILE_CATALOG. That means anyone with Master Data
-// access now sees profile rows here too, even without Profile Catalog
-// access on its own. Accepted deliberately (explicit direction: combine
-// them), but worth remembering if that boundary matters later.
+// GET /catalog -- paginated Items listing for Master Data's unified
+// "Items" view. Used to be a real SQL UNION ALL against matWhProfileCatalog
+// too (aluminum profiles had their own table) -- that table's contents were
+// migrated into matWhItems directly back on 2026-09-15 (see the
+// materials-warehouse-module memory's "profiles and items merged into ONE
+// table" entry) and matWhProfileCatalog has been empty ever since, so the
+// UNION was contributing zero rows. Simplified to a plain matWhItems query;
+// `_kind` is now always `'item'` rather than something to genuinely
+// distinguish (kept on the response so the frontend's existing
+// `_kind ?? 'item'` handling and edit/delete/photo routing needs no
+// changes) -- see MasterData.tsx's CatalogKind type.
 router.get('/catalog', async (req, res) => {
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const pageSize = Math.min(200, Math.max(1, parseInt(req.query.pageSize) || 25));
     const search = String(req.query.search || '').trim();
     const searchLike = `%${search}%`;
 
-    const itemWhere = search
+    const where = search
         ? `WHERE itemCode LIKE :searchLike OR itemName LIKE :searchLike OR itemNameAr LIKE :searchLike OR barcode LIKE :searchLike`
         : '';
-    const profileWhere = search
-        ? `WHERE profileNo LIKE :searchLike OR profileName LIKE :searchLike OR profileNameAr LIKE :searchLike OR barcode LIKE :searchLike`
-        : '';
 
-    // matWhItems and matWhProfileCatalog ended up on different text
-    // collations (utf8mb4_unicode_ci vs utf8mb4_general_ci -- the item
-    // table's barcode/details/etc. columns were added later via a plain
-    // ALTER TABLE that inherited the connection's default rather than the
-    // original table's collation). MySQL refuses to UNION mismatched
-    // collations, so every text column is explicitly coerced to one common
-    // collation here rather than altering either table to fix the root
-    // cause.
-    const C = 'COLLATE utf8mb4_general_ci';
-    const unionSql = `
+    const baseSql = `
         SELECT 'item' AS _kind, id,
-               itemCode ${C} AS code, itemName ${C} AS name, itemNameAr ${C} AS nameAr,
-               barcode ${C} AS barcode, category ${C} AS category, subCategory ${C} AS subCategory,
-               baseUnit ${C} AS baseUnit, altUnit ${C} AS altUnit, conversionFactor,
+               itemCode AS code, itemName AS name, itemNameAr AS nameAr,
+               barcode, category, subCategory, baseUnit, altUnit, conversionFactor,
                minQty, maxQty, reorderQty, preferredVendorId, allowPurchase, allowIssue,
-               details ${C} AS details, detailsAr ${C} AS detailsAr,
-               photoUrl ${C} AS photoUrl, isActive
-        FROM matWhItems ${itemWhere}
-        UNION ALL
-        SELECT 'profile' AS _kind, id,
-               profileNo ${C} AS code, profileName ${C} AS name, profileNameAr ${C} AS nameAr,
-               barcode ${C} AS barcode, category ${C} AS category, subCategory ${C} AS subCategory,
-               baseUnit ${C} AS baseUnit, altUnit ${C} AS altUnit, conversionFactor,
-               minQty, NULL AS maxQty, NULL AS reorderQty, NULL AS preferredVendorId,
-               NULL AS allowPurchase, NULL AS allowIssue,
-               details ${C} AS details, detailsAr ${C} AS detailsAr,
-               photoUrl ${C} AS photoUrl, isActive
-        FROM matWhProfileCatalog ${profileWhere}
+               details, detailsAr, photoUrl, isActive
+        FROM matWhItems ${where}
     `;
 
     const replacements = { searchLike, limit: pageSize, offset: (page - 1) * pageSize };
     const [rows, countRows] = await Promise.all([
-        sequelizeUtf8.query(`${unionSql} ORDER BY _kind, code LIMIT :limit OFFSET :offset`, {
+        sequelizeUtf8.query(`${baseSql} ORDER BY code LIMIT :limit OFFSET :offset`, {
             replacements, type: QueryTypes.SELECT,
         }),
-        sequelizeUtf8.query(`SELECT COUNT(*) AS total FROM (${unionSql}) AS combined`, {
+        sequelizeUtf8.query(`SELECT COUNT(*) AS total FROM matWhItems ${where}`, {
             replacements, type: QueryTypes.SELECT,
         }),
     ]);
