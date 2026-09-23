@@ -112,9 +112,29 @@ export async function getAvailableToReserve(storeId, itemId, color) {
 export async function getAlreadyReserved(storeId, itemId, excludeLineId, color) {
     const where = { storeId, itemId, status: HELD_STATUSES, ...reservationItemColorWhere(color) };
     const rows = await MatWhReservationItem.findAll({ where });
-    return rows
+    let total = rows
         .filter((r) => r.id !== excludeLineId)
         .reduce((sum, r) => sum + r.qtyReserved, 0);
+
+    // A painted-ALM line's qtyPendingCoating (material drawn from existing
+    // mill-finish stock, routed straight to coating -- see
+    // matWhReservations.js) always claims the raw/mill (null-color) pool
+    // specifically, regardless of what color the line ITSELF displays --
+    // so a raw-pool query has to sum it from every held line, not just
+    // ones whose own color is null/MILL (which the where-clause above
+    // already covers via qtyReserved). No double-count risk: a line only
+    // ever carries qtyPendingCoating when it has a real painted color, and
+    // qtyReserved on that same line is its EXACT-color reservation --
+    // a completely different, non-overlapping bucket from the raw pool.
+    if (color !== undefined && normalizeColor(color) === null) {
+        const pendingRows = await MatWhReservationItem.findAll({
+            where: { storeId, itemId, status: HELD_STATUSES },
+        });
+        total += pendingRows
+            .filter((r) => r.id !== excludeLineId)
+            .reduce((sum, r) => sum + (r.qtyPendingCoating || 0), 0);
+    }
+    return total;
 }
 
 // Sum of qtyRequested across every 'pending' line for this store+item

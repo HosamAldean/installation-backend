@@ -10,6 +10,11 @@ import { sequelizeUtf8 } from '../config/db.js';
 
 export const MatWhExternalProcessing = sequelizeUtf8.define('MatWhExternalProcessing', {
     id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+    // Auto-generated, never typed by hand -- same "COAT-000123" idea as
+    // MatWhPurchaseOrder.poNo's own PO-AUTO-000123 numbering, for every job
+    // (manual Send Out included), so a coating request always has a real
+    // reference number to quote/track by.
+    requestNo: { type: DataTypes.STRING(50), allowNull: true, unique: true },
     itemId: { type: DataTypes.INTEGER, allowNull: false },
     storeId: { type: DataTypes.INTEGER, allowNull: false },
     processVendorId: { type: DataTypes.INTEGER, allowNull: true },

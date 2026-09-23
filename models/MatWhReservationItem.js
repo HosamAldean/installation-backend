@@ -38,6 +38,16 @@ export const MatWhReservationItem = sequelizeUtf8.define('MatWhReservationItem',
     lengthMm: { type: DataTypes.FLOAT, allowNull: true },
     qtyRequested: { type: DataTypes.FLOAT, allowNull: false },
     qtyReserved: { type: DataTypes.FLOAT, allowNull: false, defaultValue: 0 },
+    // Drawn from EXISTING mill-finish (raw) stock already sitting in the
+    // store, routed straight to a coating request -- no new purchase.
+    // Distinct from qtyReserved (stock reserved in the line's own EXACT
+    // requested color) and qtyShortfall (needs a brand-new mill-finish
+    // purchase): this is the middle tier, only ever set on a painted-ALM
+    // line, always drawn from the null-color pool regardless of what color
+    // this line itself displays. See services/matWhLedger.js's
+    // getAlreadyReserved, which sums this across every line (not just
+    // null/MILL-colored ones) whenever the raw pool itself is queried.
+    qtyPendingCoating: { type: DataTypes.FLOAT, allowNull: false, defaultValue: 0 },
     qtyShortfall: { type: DataTypes.FLOAT, allowNull: false, defaultValue: 0 },
     // pending (submitted, awaiting this line's own store's decision) ->
     // confirmed (qtyReserved == qtyRequested) / partially_confirmed

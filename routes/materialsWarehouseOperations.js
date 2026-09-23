@@ -27,6 +27,7 @@ import {
     confirmReservation, rejectReservation,
     confirmReservationLine, rejectReservationLine,
     issueReservationLine, computeHeaderStatus,
+    createWithGeneratedNo,
 } from '../services/matWhReservations.js';
 
 const router = express.Router();
@@ -591,7 +592,15 @@ router.post('/reservations/:id/items/:lineId/confirm', requireReserve, async (re
     });
     if (!line) return res.status(404).json({ message: 'Line not found' });
     try {
-        const result = await confirmReservationLine(line.id, req.user.userId);
+        // Optional -- the storekeeper's own manual cap on how much of this
+        // line to actually decide on right now (e.g. correcting a real
+        // physical-count discrepancy). Omitted/undefined falls back to
+        // deciding on the full requested qty, same as before this field
+        // existed.
+        const qtyToReserve = req.body?.qtyToReserve !== undefined && req.body.qtyToReserve !== null
+            ? Number(req.body.qtyToReserve)
+            : undefined;
+        const result = await confirmReservationLine(line.id, req.user.userId, qtyToReserve);
         res.json(result);
     } catch (err) {
         res.status(err.status || 500).json({ message: err.message || 'Failed to confirm line' });
@@ -1001,7 +1010,7 @@ router.post('/external-processing', requireIssue, async (req, res) => {
         return res.status(409).json({ message: `Only ${available} available to send`, available });
     }
 
-    const row = await MatWhExternalProcessing.create({
+    const row = await createWithGeneratedNo(MatWhExternalProcessing, 'requestNo', 'COAT', {
         itemId, storeId, processVendorId: processVendorId ?? null, qtySent,
         sentDate: new Date(), sentBy: req.user.userId,
     });
@@ -1031,6 +1040,28 @@ router.post('/external-processing/:id/receive', requireReceive, async (req, res)
             performedBy: req.user.userId, color: row.targetColor ?? null,
         });
     }
+
+    // Optional -- per direct request, where the now-coated material was put
+    // can be noted at receive time, same zone/column/row fields Master
+    // Data's item-store list already carries (WH gap #9). Deliberately
+    // optional and web-only for now (mobile app can add/edit it later);
+    // omitted fields are left untouched on an existing row rather than
+    // blanked. Updates the item's general store location, not a per-job
+    // note -- consistent with how a goods receipt's own location fields
+    // work (there's only ever one "where this item lives in this store").
+    const { zone, locationColumn, locationRow } = req.body;
+    if (zone !== undefined || locationColumn !== undefined || locationRow !== undefined) {
+        const [itemStore] = await MatWhItemStore.findOrCreate({
+            where: { itemId: row.itemId, storeId: row.storeId },
+            defaults: { zone: null, locationColumn: null, locationRow: null },
+        });
+        const locationUpdates = {};
+        if (zone !== undefined) locationUpdates.zone = zone || null;
+        if (locationColumn !== undefined) locationUpdates.locationColumn = locationColumn || null;
+        if (locationRow !== undefined) locationUpdates.locationRow = locationRow || null;
+        await itemStore.update(locationUpdates);
+    }
+
     res.json(row);
 });
 
