@@ -4,6 +4,7 @@
 // processing, manual movements) and routes/materialsWarehousePurchasing.js
 // (goods receipt posts here too, per the Alpha Warehouse Analysis report
 // §10: receipt makes stock usable immediately, independent of invoicing).
+import { Op } from 'sequelize';
 import { MatWhStockLedger } from '../models/MatWhStockLedger.js';
 import { MatWhReservationItem } from '../models/MatWhReservationItem.js';
 import { MatWhItemCost } from '../models/MatWhItemCost.js';
@@ -14,6 +15,41 @@ import { MatWhItemCost } from '../models/MatWhItemCost.js';
 // hold stock yet -- only Confirm Reservation does that, same as the old
 // flat model's 'active' status did.
 const HELD_STATUSES = ['confirmed', 'partially_confirmed'];
+
+// "MILL" is a real, user-selectable color (IIT_Petra.colorInfo, see
+// add-matwh-colorinfo-mill-and-black.js) representing mill-finish/raw
+// aluminum -- but physically it's the exact same untreated stock this
+// ledger has always tracked as color: null. Never let "MILL" become a
+// third, disconnected color bucket: every function below that takes a
+// color runs it through this first, so a caller can pass either
+// interchangeably and both land in the one real mill-finish pool. Any
+// other string (a real paint color, or already null/undefined) passes
+// through unchanged.
+function normalizeColor(color) {
+    return color === 'MILL' ? null : color;
+}
+
+// matWhStockLedger.color is always write-normalized (see
+// postLedgerMovement) -- a mill-finish movement is NEVER stored there as
+// the literal string 'MILL', only ever null, so a plain equality match on
+// the normalized value is correct for ledger queries.
+//
+// MatWhReservationItem.color is deliberately NOT write-normalized -- a
+// line where a technician explicitly picked "MILL" keeps that literal
+// value stored, so it still displays as "MILL" on the reservation (the
+// whole point of making it a real selectable color). That means an
+// already-reserved/pending query for the mill-finish pool has to match
+// EITHER a literal null (the original, pre-MILL convention -- e.g. every
+// line auto-routed there by a painted-color shortfall) OR the literal
+// string 'MILL' (a line where it was explicitly requested) -- both
+// represent the exact same physical demand. Returns a where-clause
+// fragment to merge in, not a bare value, for exactly that reason.
+function reservationItemColorWhere(color) {
+    if (color === undefined) return {};
+    const normalized = normalizeColor(color);
+    if (normalized === null) return { [Op.or]: [{ color: null }, { color: 'MILL' }] };
+    return { color: normalized };
+}
 
 // Appends one ledger row. `transaction` is required for callers already
 // inside one (goods receipt, external processing) -- pass undefined for a
@@ -33,7 +69,7 @@ export async function postLedgerMovement({
         totalCost: unitCost != null ? unitCost * qty : null,
         movementDate: new Date(),
         performedBy: performedBy ?? null,
-        color: color ?? null,
+        color: normalizeColor(color) ?? null,
     }, { transaction });
 }
 
@@ -52,7 +88,7 @@ export async function postLedgerMovement({
 // "ignore color" -- that's what omitting the argument is for.
 export async function getPhysicalBalance(storeId, itemId, color) {
     const where = { storeId, itemId };
-    if (color !== undefined) where.color = color;
+    if (color !== undefined) where.color = normalizeColor(color);
     const rows = await MatWhStockLedger.findAll({ where });
     let balance = 0;
     for (const r of rows) balance += r.direction === 'in' ? r.qty : -r.qty;
@@ -74,8 +110,7 @@ export async function getAvailableToReserve(storeId, itemId, color) {
 // getAvailableToReserve so the reservation UI can show "already reserved: N"
 // alongside "available: N" on the same line, not just the net figure.
 export async function getAlreadyReserved(storeId, itemId, excludeLineId, color) {
-    const where = { storeId, itemId, status: HELD_STATUSES };
-    if (color !== undefined) where.color = color;
+    const where = { storeId, itemId, status: HELD_STATUSES, ...reservationItemColorWhere(color) };
     const rows = await MatWhReservationItem.findAll({ where });
     return rows
         .filter((r) => r.id !== excludeLineId)
@@ -90,8 +125,7 @@ export async function getAlreadyReserved(storeId, itemId, excludeLineId, color) 
 // storekeeper can see stock that's about to be spoken for if those
 // pending requests get approved, not just what's already committed.
 export async function getPendingQty(storeId, itemId, excludeLineId, color) {
-    const where = { storeId, itemId, status: 'pending' };
-    if (color !== undefined) where.color = color;
+    const where = { storeId, itemId, status: 'pending', ...reservationItemColorWhere(color) };
     const rows = await MatWhReservationItem.findAll({ where });
     return rows
         .filter((r) => r.id !== excludeLineId)

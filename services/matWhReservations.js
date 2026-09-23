@@ -128,8 +128,12 @@ async function confirmOneLine(line, header, confirmedBy, t) {
         // become via targetColor, picked up later by the goods receipt to
         // auto-create a draft coating job (routes/
         // materialsWarehousePurchasing.js's POST /goods-receipts). A
-        // plain/uncolored ALM line or any non-ALM line is unaffected.
-        const needsCoating = item?.category === 'ALM' && !!line.color;
+        // plain/uncolored ALM line or any non-ALM line is unaffected --
+        // and neither is a line that explicitly requested "MILL" itself:
+        // that's already raw material, nothing to route to coating (see
+        // services/matWhLedger.js's normalizeColor for the companion fix
+        // that keeps 'MILL' sharing the real null-color stock pool).
+        const needsCoating = item?.category === 'ALM' && !!line.color && line.color !== 'MILL';
         const poItem = await MatWhPurchaseOrderItem.create({
             purchaseOrderId: po.id, itemId: line.itemId,
             qtyOrdered: qtyShortfall, unitPrice: 0, lineAmt: 0,
@@ -273,8 +277,10 @@ export async function confirmReservation(headerId, confirmedBy) {
                 }
                 // See confirmOneLine's own comment -- a painted ALM line's
                 // shortfall always buys mill-finish instead, same rule
-                // applied here for the bulk-confirm path.
-                const needsCoating = item?.category === 'ALM' && !!line.color;
+                // applied here for the bulk-confirm path. A line that
+                // explicitly requested "MILL" itself is excluded too --
+                // already raw, nothing to route to coating.
+                const needsCoating = item?.category === 'ALM' && !!line.color && line.color !== 'MILL';
                 shortfallGroups.get(key).lines.push({ reservationItem: line, qty: qtyShortfall, needsCoating });
             }
         }
