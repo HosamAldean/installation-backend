@@ -91,7 +91,7 @@ router.post('/items/:id/photo', itemPhotoUpload.single('photo'), async (req, res
 // changes) -- see MasterData.tsx's CatalogKind type.
 router.get('/catalog', async (req, res) => {
     const page = Math.max(1, parseInt(req.query.page) || 1);
-    const pageSize = Math.min(200, Math.max(1, parseInt(req.query.pageSize) || 25));
+    const pageSize = Math.min(200, Math.max(1, parseInt(req.query.pageSize) || 50));
     const search = String(req.query.search || '').trim();
     const searchLike = `%${search}%`;
 
