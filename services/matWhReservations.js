@@ -95,6 +95,39 @@ export async function submitReservation(headerId) {
     return header;
 }
 
+// Coating requests are grouped by (reservation, store) -- per direct
+// request, "the auto request no[.] for the all reservation order for the
+// same store, not for every item." Multiple items (even different colors)
+// going to coating for the same reservation+store share ONE request
+// number, the same way a shortfall's multiple PO items share one PO,
+// rather than each getting its own -- whether they're decided in the same
+// confirm action or across separate ones (a line confirmed later, same
+// reservation+store, still finds and reuses the earlier number). Returns
+// the existing number if any coating job already exists for this pairing,
+// else null so the caller generates a fresh one for the first job.
+async function findExistingCoatingRequestNo(reservationHeaderId, storeId, t) {
+    const lineIds = (await MatWhReservationItem.findAll({
+        where: { reservationHeaderId, storeId }, attributes: ['id'], transaction: t,
+    })).map((l) => l.id);
+    if (lineIds.length === 0) return null;
+    const existingJob = await MatWhExternalProcessing.findOne({
+        where: { sourceReservationItemId: lineIds },
+        order: [['id', 'ASC']],
+        transaction: t,
+    });
+    return existingJob?.requestNo ?? null;
+}
+
+// Creates one coating job, reusing the reservation+store's shared
+// requestNo when one already exists, generating a fresh one otherwise.
+export async function createCoatingJob(reservationHeaderId, values, t) {
+    const sharedRequestNo = await findExistingCoatingRequestNo(reservationHeaderId, values.storeId, t);
+    if (sharedRequestNo) {
+        return MatWhExternalProcessing.create({ ...values, requestNo: sharedRequestNo }, { transaction: t });
+    }
+    return createWithGeneratedNo(MatWhExternalProcessing, 'requestNo', 'COAT', values, t);
+}
+
 // Tiers 1+2 of earmarking one line -- shared between confirmOneLine (its
 // own PO per line) and the bulk confirmReservation (POs grouped by
 // vendor+store); only the tier-3 PO-raising step differs between the two,
@@ -130,7 +163,7 @@ async function earmarkTiersOneAndTwo(line, item, qtyToDecide, t) {
         remaining -= qtyPendingCoating;
 
         if (qtyPendingCoating > 0) {
-            await createWithGeneratedNo(MatWhExternalProcessing, 'requestNo', 'COAT', {
+            await createCoatingJob(line.reservationHeaderId, {
                 itemId: line.itemId, storeId: line.storeId,
                 targetColor: line.color,
                 sourceReservationItemId: line.id,
@@ -215,7 +248,7 @@ async function confirmOneLine(line, header, confirmedBy, t, requestedQtyToReserv
         // sourcePurchaseOrderItemId for why the receipt side can find this
         // exact row again instead of creating a duplicate.
         if (needsCoating) {
-            await createWithGeneratedNo(MatWhExternalProcessing, 'requestNo', 'COAT', {
+            await createCoatingJob(line.reservationHeaderId, {
                 itemId: line.itemId, storeId: line.storeId,
                 targetColor: line.color,
                 sourceReservationItemId: line.id,
@@ -395,7 +428,7 @@ export async function confirmReservation(headerId, confirmedBy) {
                 // material arrives" change as confirmOneLine -- see that
                 // function's own comment.
                 if (needsCoating) {
-                    await createWithGeneratedNo(MatWhExternalProcessing, 'requestNo', 'COAT', {
+                    await createCoatingJob(headerId, {
                         itemId: reservationItem.itemId, storeId: reservationItem.storeId,
                         targetColor: reservationItem.color,
                         sourceReservationItemId: reservationItem.id,

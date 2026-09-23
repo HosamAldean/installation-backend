@@ -34,7 +34,8 @@ import { MatWhItemStore } from '../models/MatWhItemStore.js';
 import { Vendor } from '../models/Vendor.js';
 import { User } from '../models/User.js';
 import { postLedgerMovement, applyReceiptCost } from '../services/matWhLedger.js';
-import { createWithGeneratedNo } from '../services/matWhReservations.js';
+import { createCoatingJob } from '../services/matWhReservations.js';
+import { MatWhReservationItem } from '../models/MatWhReservationItem.js';
 
 const router = express.Router();
 router.use(authenticateToken);
@@ -678,7 +679,10 @@ router.post('/goods-receipts', requireReceive, async (req, res) => {
                         // whose confirm happened before this change shipped
                         // (so no draft job was pre-created). Every new
                         // shortfall from here on always has one already.
-                        await createWithGeneratedNo(MatWhExternalProcessing, 'requestNo', 'COAT', {
+                        const resLine = poItem.reservationItemId
+                            ? await MatWhReservationItem.findByPk(poItem.reservationItemId, { transaction: t })
+                            : null;
+                        await createCoatingJob(resLine?.reservationHeaderId ?? null, {
                             itemId: line.itemId, storeId: po.destinationStoreId,
                             targetColor: poItem.targetColor,
                             sourceReservationItemId: poItem.reservationItemId,

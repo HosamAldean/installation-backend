@@ -13,8 +13,11 @@ export const MatWhExternalProcessing = sequelizeUtf8.define('MatWhExternalProces
     // Auto-generated, never typed by hand -- same "COAT-000123" idea as
     // MatWhPurchaseOrder.poNo's own PO-AUTO-000123 numbering, for every job
     // (manual Send Out included), so a coating request always has a real
-    // reference number to quote/track by.
-    requestNo: { type: DataTypes.STRING(50), allowNull: true, unique: true },
+    // reference number to quote/track by. NOT unique -- per direct request,
+    // every coating job raised for the same (reservation, store) pairing
+    // shares ONE request number (see matWhReservations.js's
+    // createCoatingJob), so this column legitimately repeats across rows.
+    requestNo: { type: DataTypes.STRING(50), allowNull: true },
     itemId: { type: DataTypes.INTEGER, allowNull: false },
     storeId: { type: DataTypes.INTEGER, allowNull: false },
     processVendorId: { type: DataTypes.INTEGER, allowNull: true },
