@@ -654,6 +654,26 @@ router.post('/goods-receipts', requireReceive, async (req, res) => {
                 // this receipt's provisional cost.
                 await applyReceiptCost(line.itemId, po.destinationStoreId, qtyAccepted, provisionalUnitCost, t);
 
+                // Optional -- same zone/column/row fields Master Data's
+                // item-store list and the coating-receive route already
+                // carry (WH gap #9), now also settable at regular
+                // goods-receipt time. Per line, since a single receipt can
+                // cover several items landing in different spots. Left
+                // blank, this item's existing store location is untouched.
+                const { zone, locationColumn, locationRow } = line;
+                if (zone !== undefined || locationColumn !== undefined || locationRow !== undefined) {
+                    const [itemStore] = await MatWhItemStore.findOrCreate({
+                        where: { itemId: line.itemId, storeId: po.destinationStoreId },
+                        defaults: { zone: null, locationColumn: null, locationRow: null },
+                        transaction: t,
+                    });
+                    const locationUpdates = {};
+                    if (zone !== undefined) locationUpdates.zone = zone || null;
+                    if (locationColumn !== undefined) locationUpdates.locationColumn = locationColumn || null;
+                    if (locationRow !== undefined) locationUpdates.locationRow = locationRow || null;
+                    await itemStore.update(locationUpdates, { transaction: t });
+                }
+
                 // A mill-finish shortfall line's coating/Mix request is now
                 // raised up-front, at reservation-confirm time (services/
                 // matWhReservations.js), not here -- this receipt just adds
