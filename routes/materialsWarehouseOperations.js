@@ -1052,6 +1052,15 @@ router.post('/external-processing/:id/confirm-send', requireIssue, async (req, r
         return res.status(400).json({ message: 'processVendorId is required' });
     }
     const qtySent = req.body.qtySent !== undefined ? Number(req.body.qtySent) : row.qtySent;
+    // An auto-raised coating job now exists from the moment its shortfall
+    // reservation is confirmed, before any mill-finish material has
+    // actually been received (qtySent starts at 0, topped up by each
+    // goods receipt -- see matWhReservations.js / POST /goods-receipts).
+    // Block confirming-and-sending it while there's still nothing to
+    // physically hand to a processor.
+    if (!(qtySent > 0)) {
+        return res.status(409).json({ message: 'No material received yet for this job -- nothing to send' });
+    }
 
     // Mill-finish stock is the untargeted (null-color) pool -- pass null
     // explicitly (not row.targetColor, and not undefined/pooled). The

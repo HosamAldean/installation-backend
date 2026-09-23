@@ -41,6 +41,15 @@ export const MatWhExternalProcessing = sequelizeUtf8.define('MatWhExternalProces
     // the coated stock is actually received back -- this FK alone doesn't
     // auto-apply anything).
     sourceReservationItemId: { type: DataTypes.INTEGER, allowNull: true },
+    // Set only on an auto-created draft job -- the exact MatWhPurchaseOrderItem
+    // (the mill-finish shortfall line) this job exists to receive material
+    // for. Set at reservation-confirm time now, before any receipt exists
+    // (see services/matWhReservations.js), so a later goods receipt against
+    // that same PO item can find THIS row and accumulate qtySent into it
+    // instead of creating a duplicate job -- direct FK, not derived via
+    // sourceReservationItemId, because a reservation line's PO item is the
+    // one unambiguous key a receipt line already has in hand.
+    sourcePurchaseOrderItemId: { type: DataTypes.INTEGER, allowNull: true },
     // True only for a job auto-created from a mill-finish goods receipt --
     // never for one a storekeeper started by hand through the External
     // Processing page's own "Send Out" dialog. Same convention as
