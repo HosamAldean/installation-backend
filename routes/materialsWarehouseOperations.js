@@ -28,7 +28,7 @@ import {
     confirmReservation, rejectReservation,
     confirmReservationLine, rejectReservationLine,
     issueReservationLine, computeHeaderStatus,
-    createWithGeneratedNo,
+    createWithGeneratedNo, requireVariantBarcode,
 } from '../services/matWhReservations.js';
 
 const router = express.Router();
@@ -1083,6 +1083,17 @@ router.post('/external-processing/:id/receive', requireReceive, async (req, res)
     // whole batch came back.
     const qtyReceived = req.body.qtyReceived !== undefined ? Number(req.body.qtyReceived) : row.qtySent;
 
+    // Barcode confirmation, required -- same narrow scope as Issue/goods-
+    // receipt (see requireVariantBarcode's own comment): the material
+    // coming back is now the job's targetColor, not the mill-finish color
+    // that went out -- a real barcode here confirms the coating actually
+    // came back as the right color/length, not just some quantity.
+    try {
+        await requireVariantBarcode(row.itemId, row.targetColor, row.lengthMm, req.body.barcode, 'receive it back');
+    } catch (err) {
+        return res.status(err.status || 500).json({ message: err.message || 'Failed to receive' });
+    }
+
     await row.update({ qtyReceived, status: 'received', receivedDate: new Date(), receivedBy: req.user.userId });
     if (qtyReceived > 0) {
         await postLedgerMovement({
@@ -1161,6 +1172,16 @@ router.post('/external-processing/:id/confirm-send', requireIssue, async (req, r
         return res.status(409).json({ message: `Only ${available} available to send`, available });
     }
 
+    // Barcode confirmation, required -- same narrow scope as Issue/goods-
+    // receipt: what's physically leaving is mill-finish (color: null), so
+    // the scanned barcode must resolve to THIS item's own mill/MILL
+    // variant specifically, not any painted one.
+    try {
+        await requireVariantBarcode(row.itemId, null, row.lengthMm, req.body.barcode, 'send it');
+    } catch (err) {
+        return res.status(err.status || 500).json({ message: err.message || 'Failed to confirm and send' });
+    }
+
     await postLedgerMovement({
         storeId: row.storeId, itemId: row.itemId, qty: qtySent, direction: 'out',
         docType: 'external_send', refType: 'external_processing', refId: row.id,
@@ -1211,6 +1232,23 @@ router.post('/external-processing/group/:requestNo/confirm-send', requireIssue, 
             return res.status(409).json({
                 message: `Only ${available} available to send for item ${row.itemId} -- adjust that job's quantity first`,
                 itemId: row.itemId, available,
+            });
+        }
+    }
+
+    // Barcode confirmation, required -- same narrow scope and same
+    // mill-finish expectation as the single-job route, just one barcode
+    // per job since a group can hold several different items. Same
+    // pre-pass-before-writing-anything reasoning as the availability
+    // check above -- req.body.barcodes is keyed by job id.
+    const barcodes = req.body.barcodes || {};
+    for (const row of ready) {
+        try {
+            await requireVariantBarcode(row.itemId, null, row.lengthMm, barcodes[row.id], 'send it');
+        } catch (err) {
+            return res.status(err.status || 500).json({
+                message: `Item ${row.itemId}: ${err.message || 'Failed to confirm and send'}`,
+                itemId: row.itemId, jobId: row.id,
             });
         }
     }

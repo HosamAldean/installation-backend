@@ -25,7 +25,7 @@ const HELD_STATUSES = ['confirmed', 'partially_confirmed'];
 // interchangeably and both land in the one real mill-finish pool. Any
 // other string (a real paint color, or already null/undefined) passes
 // through unchanged.
-function normalizeColor(color) {
+export function normalizeColor(color) {
     return color === 'MILL' ? null : color;
 }
 

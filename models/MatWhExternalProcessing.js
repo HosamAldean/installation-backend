@@ -20,6 +20,11 @@ export const MatWhExternalProcessing = sequelizeUtf8.define('MatWhExternalProces
     requestNo: { type: DataTypes.STRING(50), allowNull: true },
     itemId: { type: DataTypes.INTEGER, allowNull: false },
     storeId: { type: DataTypes.INTEGER, allowNull: false },
+    // Companion to targetColor -- a coating job's own source reservation/PO
+    // line has always carried lengthMm, this job just never did. Needed to
+    // resolve the exact matWhItemVariants row (item+color+length->barcode)
+    // for the barcode-confirmed send/receive gate.
+    lengthMm: { type: DataTypes.FLOAT, allowNull: true },
     processVendorId: { type: DataTypes.INTEGER, allowNull: true },
     qtySent: { type: DataTypes.FLOAT, allowNull: false },
     qtyReceived: { type: DataTypes.FLOAT, allowNull: true },
