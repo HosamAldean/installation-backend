@@ -980,15 +980,16 @@ router.post('/reservations/:id/transfer', requireReserve, async (req, res) => {
 // ============================================================
 
 router.post('/feasibility-checks', requireReserve, async (req, res) => {
-    const { itemId, storeId, projectId, productionRef, qtyRequested, color } = req.body;
+    const { itemId, storeId, projectId, productionRef, qtyRequested, color, lengthMm } = req.body;
     if (!itemId || !storeId || !qtyRequested) {
         return res.status(400).json({ message: 'itemId, storeId and qtyRequested are required' });
     }
-    const available = await getAvailableToReserve(storeId, itemId, color || undefined);
+    const available = await getAvailableToReserve(storeId, itemId, color || undefined, lengthMm ? Number(lengthMm) : undefined);
     const status = Number(qtyRequested) <= available ? 'feasible' : 'not_feasible';
     const row = await MatWhFeasibilityCheck.create({
         itemId, storeId, projectId: projectId ?? null, productionRef: productionRef ?? null,
-        color: color || null, qtyRequested, status, checkedBy: req.user.userId, checkedDate: new Date(),
+        color: color || null, lengthMm: lengthMm ? Number(lengthMm) : null,
+        qtyRequested, status, checkedBy: req.user.userId, checkedDate: new Date(),
     });
     res.status(201).json({ ...row.toJSON(), availableAtCheckTime: available });
 });
