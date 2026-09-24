@@ -106,9 +106,21 @@ export async function getPhysicalBalance(storeId, itemId, color, lengthMm) {
 // Available-to-reserve = physical balance - currently active reservations
 // for the same store+item(+color)(+length). This is the figure
 // feasibility checks and new reservations actually validate against.
-export async function getAvailableToReserve(storeId, itemId, color, lengthMm) {
+//
+// excludeLineId (optional): needed by a coating job's own confirm-send
+// check -- that job's SOURCE reservation line still carries its
+// qtyPendingCoating as a "held" claim on the raw/mill pool right up until
+// the send actually posts, so a naive available-to-reserve call double-
+// counts the very job trying to use it against itself (physical 5,
+// this job's own claim 3, another's claim 0 -> available comes back 2
+// instead of 5, a false-negative "not enough stock" on a job that's the
+// ONLY thing waiting on that stock). Passing that line's id here excludes
+// it from the reserved-elsewhere sum, same as every other caller of
+// getAlreadyReserved already does for its own line. Omitted (the default,
+// every other caller) keeps today's behavior unchanged.
+export async function getAvailableToReserve(storeId, itemId, color, lengthMm, excludeLineId) {
     const physical = await getPhysicalBalance(storeId, itemId, color, lengthMm);
-    const reserved = await getAlreadyReserved(storeId, itemId, undefined, color, lengthMm);
+    const reserved = await getAlreadyReserved(storeId, itemId, excludeLineId, color, lengthMm);
     return physical - reserved;
 }
 

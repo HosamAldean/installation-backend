@@ -194,7 +194,15 @@ async function earmarkTiersOneAndTwo(line, item, qtyToDecide, t) {
 // unchanged, when omitted). Per direct confirmation: anything above this
 // cap is treated exactly like unavailable stock always has been -- folded
 // into tier 3's shortfall, never left in an undecided limbo state.
-async function confirmOneLine(line, header, confirmedBy, t, requestedQtyToReserve) {
+//
+// buyExactColor (optional): the storekeeper's own override on a painted
+// ALM line's shortfall PO -- default behavior always buys mill-finish
+// (color: null) and routes the line to coating once it arrives (see the
+// PO-item comment below). Per direct confirmation, the storekeeper can
+// instead choose to buy the exact requested color directly from a vendor
+// that stocks it pre-painted, skipping the coating step entirely --
+// false/omitted leaves today's behavior byte-identical.
+async function confirmOneLine(line, header, confirmedBy, t, requestedQtyToReserve, buyExactColor) {
     const item = await MatWhItem.findByPk(line.itemId, { transaction: t });
 
     const qtyToDecide = requestedQtyToReserve != null
@@ -223,7 +231,7 @@ async function confirmOneLine(line, header, confirmedBy, t, requestedQtyToReserv
             // separate track from `status`.
             internalApprovalStatus: 'pending_storekeeper',
         }, t);
-        // A painted aluminum line's shortfall is ALWAYS covered by buying
+        // A painted aluminum line's shortfall defaults to buying
         // mill-finish (raw, color: null) stock instead of the painted
         // color directly -- the PO item remembers what color it needs to
         // become via targetColor, picked up later by the goods receipt to
@@ -231,11 +239,16 @@ async function confirmOneLine(line, header, confirmedBy, t, requestedQtyToReserv
         // materialsWarehousePurchasing.js's POST /goods-receipts). See
         // services/matWhLedger.js's normalizeColor for the companion fix
         // that keeps 'MILL' sharing the real null-color stock pool.
+        //
+        // The storekeeper can override this per line (buyExactColor) and
+        // buy the exact requested color directly instead -- skips the
+        // coating step entirely, since there's nothing left to paint.
+        const skipCoating = needsCoating && buyExactColor;
         const poItem = await MatWhPurchaseOrderItem.create({
             purchaseOrderId: po.id, itemId: line.itemId,
             qtyOrdered: qtyShortfall, unitPrice: 0, lineAmt: 0,
-            color: needsCoating ? null : line.color,
-            targetColor: needsCoating ? line.color : null,
+            color: skipCoating ? line.color : (needsCoating ? null : line.color),
+            targetColor: skipCoating ? null : (needsCoating ? line.color : null),
             lengthMm: line.lengthMm,
             reservationItemId: line.id, neededByDate: line.itemNeededByDate,
         }, { transaction: t });
@@ -251,7 +264,7 @@ async function confirmOneLine(line, header, confirmedBy, t, requestedQtyToReserv
         // MatWhExternalProcessing.js's own comment on
         // sourcePurchaseOrderItemId for why the receipt side can find this
         // exact row again instead of creating a duplicate.
-        if (needsCoating) {
+        if (needsCoating && !skipCoating) {
             await createCoatingJob(line.reservationHeaderId, {
                 itemId: line.itemId, storeId: line.storeId,
                 targetColor: line.color,
@@ -270,7 +283,7 @@ async function confirmOneLine(line, header, confirmedBy, t, requestedQtyToReserv
 // needed. Only reachable once the header's been submitted (each store
 // reviews its own lines independently from then on, not gated by any
 // other store's lines being decided yet).
-export async function confirmReservationLine(lineId, confirmedBy, requestedQtyToReserve) {
+export async function confirmReservationLine(lineId, confirmedBy, requestedQtyToReserve, buyExactColor) {
     const line = await MatWhReservationItem.findByPk(lineId);
     if (!line) {
         const err = new Error('Reservation line not found');
@@ -291,7 +304,7 @@ export async function confirmReservationLine(lineId, confirmedBy, requestedQtyTo
 
     const t = await sequelizeUtf8.transaction();
     try {
-        await confirmOneLine(line, header, confirmedBy, t, requestedQtyToReserve);
+        await confirmOneLine(line, header, confirmedBy, t, requestedQtyToReserve, buyExactColor);
         const siblings = await MatWhReservationItem.findAll({ where: { reservationHeaderId: header.id }, transaction: t });
         if (!siblings.some((l) => l.status === 'pending')) {
             await header.update({ status: computeHeaderStatus(siblings), confirmedBy, confirmedDate: new Date() }, { transaction: t });

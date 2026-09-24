@@ -636,7 +636,12 @@ router.post('/reservations/:id/items/:lineId/confirm', requireReserve, async (re
         const qtyToReserve = req.body?.qtyToReserve !== undefined && req.body.qtyToReserve !== null
             ? Number(req.body.qtyToReserve)
             : undefined;
-        const result = await confirmReservationLine(line.id, req.user.userId, qtyToReserve);
+        // Optional -- storekeeper override: buy the exact requested color
+        // directly on a painted ALM line's shortfall PO instead of the
+        // default mill-finish-then-coat routing. See confirmOneLine's own
+        // comment for what this does to the PO item and coating job.
+        const buyExactColor = req.body?.buyExactColor === true;
+        const result = await confirmReservationLine(line.id, req.user.userId, qtyToReserve, buyExactColor);
         res.json(result);
     } catch (err) {
         res.status(err.status || 500).json({ message: err.message || 'Failed to confirm line' });
@@ -1033,6 +1038,13 @@ router.get('/external-processing', requireAnyOf(
             ...r.toJSON(),
             reservationHeaderId: sourceHeader?.id ?? null,
             reservationNo: sourceHeader?.reservationNo ?? null,
+            // Same project info a PO already surfaces (po.projectNo/
+            // projectName, set from this same reservation header at
+            // shortfall-PO-creation time) -- a coating job has no project
+            // fields of its own, only ever reachable via its originating
+            // reservation, so null for a manually-created ad-hoc job.
+            projectNo: sourceHeader?.projectNo ?? null,
+            projectName: sourceHeader?.projectName ?? null,
         };
     });
     res.json({ items });
@@ -1139,8 +1151,11 @@ router.post('/external-processing/:id/confirm-send', requireIssue, async (req, r
     // (undefined) could pass on the strength of other colors' stock that
     // this movement never touches, then still drive the null-color balance
     // negative once posted. The check has to scope to the same color the
-    // write uses.
-    const available = await getAvailableToReserve(row.storeId, row.itemId, null);
+    // write uses. Excludes this job's own source reservation line -- its
+    // qtyPendingCoating is still counted as "held" until the send actually
+    // posts, so leaving it in would double-count this exact job against
+    // itself (see getAvailableToReserve's own comment on excludeLineId).
+    const available = await getAvailableToReserve(row.storeId, row.itemId, null, undefined, row.sourceReservationItemId);
     if (qtySent > available) {
         return res.status(409).json({ message: `Only ${available} available to send`, available });
     }
@@ -1155,6 +1170,74 @@ router.post('/external-processing/:id/confirm-send', requireIssue, async (req, r
         sentBy: req.user.userId, sentDate: new Date(),
     });
     res.json(row);
+});
+
+// Group version of the same action -- every coating request sharing one
+// requestNo (see services/matWhReservations.js's createCoatingJob: one
+// number per (reservation, store) pairing) gets confirmed and sent
+// together with ONE vendor pick, instead of storekeeper clicking Confirm &
+// Send once per item. Per direct confirmation: a job in the group still
+// awaiting its own mill-finish material (qtySent === 0) is silently
+// skipped rather than blocking the rest of the group -- it can be sent on
+// its own, later, once material for it actually arrives.
+router.post('/external-processing/group/:requestNo/confirm-send', requireIssue, async (req, res) => {
+    const { requestNo } = req.params;
+    const { processVendorId } = req.body;
+    if (!processVendorId) {
+        return res.status(400).json({ message: 'processVendorId is required' });
+    }
+
+    const rows = await MatWhExternalProcessing.findAll({ where: { requestNo, status: 'draft' } });
+    if (rows.length === 0) {
+        return res.status(404).json({ message: 'No draft coating jobs found for this request number' });
+    }
+
+    const ready = rows.filter((row) => Number(row.qtySent) > 0);
+    const skipped = rows.filter((row) => !(Number(row.qtySent) > 0));
+    if (ready.length === 0) {
+        return res.status(409).json({ message: 'No item in this group has received material yet -- nothing to send' });
+    }
+
+    // Check every ready job's own null-color availability BEFORE writing
+    // anything -- same reasoning as the single-job route's own check
+    // (including excluding each job's own source reservation line -- see
+    // getAvailableToReserve's own comment), just done as one pre-pass so a
+    // shortfall on item 3 of 5 doesn't leave the first 2 already sent while
+    // the rest silently fail.
+    for (const row of ready) {
+        const available = await getAvailableToReserve(row.storeId, row.itemId, null, undefined, row.sourceReservationItemId);
+        if (Number(row.qtySent) > available) {
+            return res.status(409).json({
+                message: `Only ${available} available to send for item ${row.itemId} -- adjust that job's quantity first`,
+                itemId: row.itemId, available,
+            });
+        }
+    }
+
+    const t = await sequelizeUtf8.transaction();
+    try {
+        for (const row of ready) {
+            await postLedgerMovement({
+                storeId: row.storeId, itemId: row.itemId, qty: Number(row.qtySent), direction: 'out',
+                docType: 'external_send', refType: 'external_processing', refId: row.id,
+                performedBy: req.user.userId, color: null,
+            }, t);
+            await row.update({
+                status: 'sent', processVendorId,
+                sentBy: req.user.userId, sentDate: new Date(),
+            }, { transaction: t });
+        }
+        await t.commit();
+    } catch (err) {
+        await t.rollback();
+        console.error('Error confirming coating request group:', err);
+        return res.status(500).json({ message: 'Failed to confirm and send the group' });
+    }
+
+    res.json({
+        updated: ready.map((row) => row.id),
+        skipped: skipped.map((row) => row.id),
+    });
 });
 
 export default router;
