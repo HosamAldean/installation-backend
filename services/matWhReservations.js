@@ -19,6 +19,7 @@ import { MatWhPurchaseOrder } from '../models/MatWhPurchaseOrder.js';
 import { MatWhPurchaseOrderItem } from '../models/MatWhPurchaseOrderItem.js';
 import { MatWhItem } from '../models/MatWhItem.js';
 import { MatWhExternalProcessing } from '../models/MatWhExternalProcessing.js';
+import { MatWhItemVariant } from '../models/MatWhItemVariant.js';
 import { getAvailableToReserve, postLedgerMovement } from './matWhLedger.js';
 
 // Derives the header's overall status from its lines -- but only once no
@@ -549,6 +550,44 @@ export async function issueReservationLine(lineId, issuedBy, issuedBarcode, issu
         const err = new Error(`issuePurpose is required and must be one of: ${ISSUE_PURPOSES.join(', ')}`);
         err.status = 400;
         throw err;
+    }
+
+    // Barcode confirmation, required -- but scoped narrowly, per direct
+    // decision: only aluminum items that actually HAVE variants defined
+    // (Master Data's per-color+length barcode layer) get gated; every
+    // other item keeps today's behavior (issuedBarcode purely optional,
+    // recorded as-typed, never validated -- see the field's own comment).
+    // A real barcode is only ever required when there's a real barcode
+    // list to check it against; an ALM item nobody's entered variants for
+    // yet isn't blocked just because its category matches.
+    const item = await MatWhItem.findByPk(line.itemId);
+    if (item?.category === 'ALM') {
+        const variantCount = await MatWhItemVariant.count({ where: { itemId: line.itemId, isActive: true } });
+        if (variantCount > 0) {
+            if (!issuedBarcode || !String(issuedBarcode).trim()) {
+                const err = new Error('This item has known barcoded variants -- scan or enter the barcode to issue it');
+                err.status = 400;
+                throw err;
+            }
+            const variant = await MatWhItemVariant.findOne({
+                where: { barcode: String(issuedBarcode).trim(), isActive: true },
+            });
+            if (!variant || variant.itemId !== line.itemId) {
+                const err = new Error('That barcode does not resolve to this item');
+                err.status = 409;
+                throw err;
+            }
+            if (line.color && variant.color !== line.color) {
+                const err = new Error('That barcode is a different color than this line reserved');
+                err.status = 409;
+                throw err;
+            }
+            if (line.lengthMm && Number(variant.lengthMm) !== Number(line.lengthMm)) {
+                const err = new Error('That barcode is a different length than this line reserved');
+                err.status = 409;
+                throw err;
+            }
+        }
     }
 
     const header = await MatWhReservationHeader.findByPk(line.reservationHeaderId);

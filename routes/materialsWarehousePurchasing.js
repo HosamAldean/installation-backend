@@ -296,6 +296,67 @@ router.post('/purchase-orders/:id/items', requirePurchaseOrders, async (req, res
     }
 });
 
+// Storekeeper override of one PO line's own color, before the PO is sent
+// -- explicit direct request: a shortfall PO always starts as mill-finish
+// (color: null, targetColor: the requested color, see
+// services/matWhReservations.js's confirmOneLine/confirmReservation), but
+// the storekeeper may already know a vendor stocks the exact requested
+// color directly, or simply prefer to buy it pre-painted instead of
+// routing through coating. This is a second, later edit point alongside
+// the reservation-confirm-time buyExactColor checkbox -- that one decides
+// the color at PO CREATION; this one lets it be changed afterward, any
+// time before Send.
+//
+// Setting a real (non-null) color on a line that still has a targetColor
+// means there's nothing left to coat -- per direct confirmation, this
+// automatically removes that line's own draft coating job (only ever
+// safe to do here: the PO is still 'draft', so nothing has been received
+// against it yet, meaning that job can only be in its own initial state,
+// draft with qtySent 0 -- never actually sent to a processor). Guarded
+// defensively anyway: a job that's somehow already sent/received (or has
+// qtySent > 0) is left alone and reported back rather than silently
+// deleted.
+router.patch('/purchase-orders/:id/items/:itemId/color', requireReserve, async (req, res) => {
+    const po = await MatWhPurchaseOrder.findByPk(req.params.id);
+    if (!po) return res.status(404).json({ message: 'Purchase order not found' });
+    if (po.status !== 'draft') {
+        return res.status(409).json({ message: `Cannot edit line color on a PO in status '${po.status}'` });
+    }
+    const line = await MatWhPurchaseOrderItem.findOne({
+        where: { id: req.params.itemId, purchaseOrderId: po.id },
+    });
+    if (!line) return res.status(404).json({ message: 'Line not found' });
+
+    const { color } = req.body;
+    if (color && !(await isValidPoLineColor(color))) {
+        return res.status(400).json({ message: `Unrecognized color: ${color}` });
+    }
+
+    const t = await sequelizeUtf8.transaction();
+    try {
+        let coatingJobRemoved = false;
+        if (color && line.targetColor) {
+            const job = await MatWhExternalProcessing.findOne({
+                where: { sourcePurchaseOrderItemId: line.id },
+                transaction: t,
+            });
+            if (job && job.status === 'draft' && Number(job.qtySent) === 0) {
+                await job.destroy({ transaction: t });
+                coatingJobRemoved = true;
+            }
+            await line.update({ color, targetColor: null }, { transaction: t });
+        } else {
+            await line.update({ color: color || null }, { transaction: t });
+        }
+        await t.commit();
+        res.json({ ...line.toJSON(), coatingJobRemoved });
+    } catch (err) {
+        await t.rollback();
+        console.error('Error updating purchase order item color:', err);
+        res.status(500).json({ message: 'Failed to update color' });
+    }
+});
+
 // Assign/change vendor -- the case that actually needed this: an
 // auto-generated PO for an item with no preferredVendorId is created with
 // vendorId left null (see services/matWhReservations.js) for someone to
