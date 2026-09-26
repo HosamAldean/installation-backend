@@ -1099,7 +1099,7 @@ router.post('/external-processing/:id/receive', requireReceive, async (req, res)
         await postLedgerMovement({
             storeId: row.storeId, itemId: row.itemId, qty: qtyReceived, direction: 'in',
             docType: 'external_receive', refType: 'external_processing', refId: row.id,
-            performedBy: req.user.userId, color: row.targetColor ?? null,
+            performedBy: req.user.userId, color: row.targetColor ?? null, lengthMm: row.lengthMm ?? null,
         });
     }
 
@@ -1185,12 +1185,27 @@ router.post('/external-processing/:id/confirm-send', requireIssue, async (req, r
     await postLedgerMovement({
         storeId: row.storeId, itemId: row.itemId, qty: qtySent, direction: 'out',
         docType: 'external_send', refType: 'external_processing', refId: row.id,
-        performedBy: req.user.userId, color: null,
+        performedBy: req.user.userId, color: null, lengthMm: row.lengthMm ?? null,
     });
     await row.update({
         status: 'sent', processVendorId, qtySent,
         sentBy: req.user.userId, sentDate: new Date(),
     });
+    // The send just posted a real ledger movement that already reflects
+    // this material leaving the mill pool -- the source line's
+    // qtyPendingCoating was only ever a placeholder "claim" against that
+    // pool for the window between confirm (earmarked) and this send
+    // (physically left). Left non-zero after the send, it permanently
+    // double-counts the same units against every future confirm-send's
+    // own availability check (getAlreadyReserved sums qtyPendingCoating
+    // across every held line), eventually driving the pool artificially
+    // negative for jobs that have nothing to do with this one.
+    if (row.sourceReservationItemId) {
+        await MatWhReservationItem.update(
+            { qtyPendingCoating: 0 },
+            { where: { id: row.sourceReservationItemId } },
+        );
+    }
     res.json(row);
 });
 
@@ -1259,12 +1274,23 @@ router.post('/external-processing/group/:requestNo/confirm-send', requireIssue, 
             await postLedgerMovement({
                 storeId: row.storeId, itemId: row.itemId, qty: Number(row.qtySent), direction: 'out',
                 docType: 'external_send', refType: 'external_processing', refId: row.id,
-                performedBy: req.user.userId, color: null,
+                performedBy: req.user.userId, color: null, lengthMm: row.lengthMm ?? null,
             }, t);
             await row.update({
                 status: 'sent', processVendorId,
                 sentBy: req.user.userId, sentDate: new Date(),
             }, { transaction: t });
+            // See the single-job confirm-send route's own comment -- the
+            // send just posted already reflects this material leaving the
+            // mill pool, so the source line's qtyPendingCoating placeholder
+            // claim has to clear too, or it double-counts against every
+            // later job's own availability check.
+            if (row.sourceReservationItemId) {
+                await MatWhReservationItem.update(
+                    { qtyPendingCoating: 0 },
+                    { where: { id: row.sourceReservationItemId }, transaction: t },
+                );
+            }
         }
         await t.commit();
     } catch (err) {
