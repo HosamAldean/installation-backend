@@ -652,6 +652,20 @@ router.post('/goods-receipts', requireReceive, async (req, res) => {
         }, { transaction: t });
 
         for (const line of items) {
+            // A poItemId that doesn't resolve to a line on THIS purchase
+            // order is never legitimate -- the real UI (PurchaseOrderDetail
+            // .tsx's openReceive) only ever sends ids it just read off this
+            // same PO's own items, so a mismatch here is either a stale/
+            // wrong id or a hand-crafted request, never an intentional
+            // "receive against no PO line" case. Treating it as null (the
+            // original behavior) silently skipped BOTH the received-so-far
+            // cap above and the mandatory barcode gate below -- a real way
+            // to post untracked, ungated stock. Fail loudly instead.
+            if (line.poItemId && !poItemById.has(Number(line.poItemId))) {
+                const err = new Error(`poItemId ${line.poItemId} does not belong to purchase order ${purchaseOrderId}`);
+                err.status = 400;
+                throw err;
+            }
             const poItem = line.poItemId ? poItemById.get(Number(line.poItemId)) : null;
             const qtyAccepted = Number(line.qtyAccepted ?? line.qtyReceived) || 0;
             const qtyLoss = Number(line.qtyLoss) || 0;
