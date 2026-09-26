@@ -13,6 +13,13 @@ export const MatWhWriteoffRequestItem = sequelizeUtf8.define('MatWhWriteoffReque
     writeoffRequestId: { type: DataTypes.INTEGER, allowNull: false },
     itemId: { type: DataTypes.INTEGER, allowNull: false },
     qtyRequested: { type: DataTypes.FLOAT, allowNull: false },
+    // Aluminum-only, same convention as matWhReservationItems/
+    // matWhPurchaseOrderItems: null means "not an ALM item, or mill-
+    // finish" -- needed so the report stage (and the ledger movement it
+    // posts) knows exactly which color/length is actually being
+    // destroyed, instead of silently posting against the mill-finish pool.
+    color: { type: DataTypes.STRING(50), allowNull: true },
+    lengthMm: { type: DataTypes.FLOAT, allowNull: true },
     // Optional per-line override/detail of the header's overall reason --
     // null means "same as the header reason".
     reason: { type: DataTypes.STRING(500), allowNull: true },

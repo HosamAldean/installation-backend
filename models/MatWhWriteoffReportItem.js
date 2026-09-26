@@ -13,6 +13,11 @@ export const MatWhWriteoffReportItem = sequelizeUtf8.define('MatWhWriteoffReport
     writeoffRequestItemId: { type: DataTypes.INTEGER, allowNull: false },
     itemId: { type: DataTypes.INTEGER, allowNull: false },
     storeId: { type: DataTypes.INTEGER, allowNull: false },
+    // Denormalized from the request line too, same reasoning as storeId/
+    // itemId above -- needed directly at ledger-post time so the movement
+    // debits the right color/length pool instead of mill-finish/pooled.
+    color: { type: DataTypes.STRING(50), allowNull: true },
+    lengthMm: { type: DataTypes.FLOAT, allowNull: true },
     // What actually got destroyed -- can be less than (or in principle
     // more than, if more turned out unusable on inspection) the request
     // line's own qtyRequested.

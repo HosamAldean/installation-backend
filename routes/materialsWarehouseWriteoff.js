@@ -107,12 +107,13 @@ router.post('/writeoff-requests/:id/items', requireWriteoff, async (req, res) =>
     if (request.status !== 'draft') {
         return res.status(409).json({ message: `Cannot add items to a request in status '${request.status}'` });
     }
-    const { itemId, qtyRequested, reason } = req.body;
+    const { itemId, qtyRequested, reason, color, lengthMm } = req.body;
     if (!itemId || !qtyRequested) {
         return res.status(400).json({ message: 'itemId and qtyRequested are required' });
     }
     const line = await MatWhWriteoffRequestItem.create({
         writeoffRequestId: request.id, itemId, qtyRequested, reason: reason || null,
+        color: color || null, lengthMm: lengthMm ?? null,
     });
     res.status(201).json(line);
 });

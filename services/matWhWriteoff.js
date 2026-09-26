@@ -111,6 +111,7 @@ export async function createWriteoffReport({ writeoffRequestId, reportNo, destro
             const reportItem = await MatWhWriteoffReportItem.create({
                 writeoffReportId: report.id, writeoffRequestItemId,
                 itemId: requestItem.itemId, storeId: request.storeId,
+                color: requestItem.color, lengthMm: requestItem.lengthMm,
                 qtyDestroyed,
             }, { transaction: t });
             const ledgerRow = await postLedgerMovement({
@@ -118,6 +119,7 @@ export async function createWriteoffReport({ writeoffRequestId, reportNo, destro
                 qty: qtyDestroyed, direction: 'out', docType: 'writeoff',
                 refType: 'writeoff_report_item', refId: reportItem.id,
                 performedBy: createdBy,
+                color: requestItem.color, lengthMm: requestItem.lengthMm,
             }, t);
             await reportItem.update({ ledgerEntryId: ledgerRow.id }, { transaction: t });
         }
