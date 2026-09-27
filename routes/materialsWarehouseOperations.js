@@ -1069,6 +1069,13 @@ router.get('/external-processing', requireAnyOf(
     const where = {};
     if (req.query.status) where.status = req.query.status;
     if (req.query.storeId) where.storeId = req.query.storeId;
+    // Lets ReceiveByItem.tsx pull a scanned item's own sent-but-not-yet-
+    // received-back coating jobs alongside its PO candidates, per direct
+    // request ("so all received in on place") -- one item-first receiving
+    // screen for both a purchase-order goods receipt and a coating
+    // receive-back, instead of the coating one only living on the
+    // External Processing detail page.
+    if (req.query.itemId) where.itemId = req.query.itemId;
     const rows = await MatWhExternalProcessing.findAll({ where, order: [['id', 'DESC']] });
 
     // Resolve the originating reservation for auto-generated coating jobs
@@ -1085,6 +1092,9 @@ router.get('/external-processing', requireAnyOf(
         ? await MatWhReservationHeader.findAll({ where: { id: headerIds } })
         : [];
     const headerById = new Map(headers.map((h) => [h.id, h]));
+    const storeIds = [...new Set(rows.map((r) => r.storeId).filter(Boolean))];
+    const stores = storeIds.length > 0 ? await MatWhStore.findAll({ where: { id: storeIds } }) : [];
+    const storeById = new Map(stores.map((s) => [s.id, s]));
 
     const items = rows.map((r) => {
         const sourceLine = r.sourceReservationItemId ? lineById.get(r.sourceReservationItemId) : null;
@@ -1100,6 +1110,7 @@ router.get('/external-processing', requireAnyOf(
             // reservation, so null for a manually-created ad-hoc job.
             projectNo: sourceHeader?.projectNo ?? null,
             projectName: sourceHeader?.projectName ?? null,
+            storeName: storeById.get(r.storeId)?.storeName ?? null,
         };
     });
     res.json({ items });
