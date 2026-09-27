@@ -1076,6 +1076,12 @@ router.get('/external-processing', requireAnyOf(
     // receive-back, instead of the coating one only living on the
     // External Processing detail page.
     if (req.query.itemId) where.itemId = req.query.itemId;
+    // Lets ReceiveByItem.tsx's own "Load Order" shortcut work with a
+    // coating request number too, not just a PO number (a coating job
+    // shares one requestNo across every item on the same request, same as
+    // a PO groups its own line items -- see services/matWhReservations.js's
+    // createCoatingJob).
+    if (req.query.requestNo) where.requestNo = req.query.requestNo;
     const rows = await MatWhExternalProcessing.findAll({ where, order: [['id', 'DESC']] });
 
     // Resolve the originating reservation for auto-generated coating jobs
@@ -1095,10 +1101,18 @@ router.get('/external-processing', requireAnyOf(
     const storeIds = [...new Set(rows.map((r) => r.storeId).filter(Boolean))];
     const stores = storeIds.length > 0 ? await MatWhStore.findAll({ where: { id: storeIds } }) : [];
     const storeById = new Map(stores.map((s) => [s.id, s]));
+    // Lets ReceiveByItem.tsx's "Load Order" shortcut build a full grid row
+    // straight from this one response (itemCode/itemName), same as
+    // goods-receipt-candidates already does for a PO -- without this, that
+    // caller would need a second round trip per distinct item.
+    const rowItemIds = [...new Set(rows.map((r) => r.itemId).filter(Boolean))];
+    const rowItems = rowItemIds.length > 0 ? await MatWhItem.findAll({ where: { id: rowItemIds } }) : [];
+    const itemById = new Map(rowItems.map((i) => [i.id, i]));
 
     const items = rows.map((r) => {
         const sourceLine = r.sourceReservationItemId ? lineById.get(r.sourceReservationItemId) : null;
         const sourceHeader = sourceLine ? headerById.get(sourceLine.reservationHeaderId) : null;
+        const item = itemById.get(r.itemId);
         return {
             ...r.toJSON(),
             reservationHeaderId: sourceHeader?.id ?? null,
@@ -1111,6 +1125,8 @@ router.get('/external-processing', requireAnyOf(
             projectNo: sourceHeader?.projectNo ?? null,
             projectName: sourceHeader?.projectName ?? null,
             storeName: storeById.get(r.storeId)?.storeName ?? null,
+            itemCode: item?.itemCode ?? null,
+            itemName: item?.itemName ?? null,
         };
     });
     res.json({ items });
