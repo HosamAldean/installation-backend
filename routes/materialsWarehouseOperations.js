@@ -28,7 +28,7 @@ import {
     confirmReservation, rejectReservation,
     confirmReservationLine, rejectReservationLine,
     issueReservationLine, computeHeaderStatus,
-    createWithGeneratedNo, requireVariantBarcode,
+    createWithGeneratedNo, requireVariantBarcode, splitOffRemainder,
 } from '../services/matWhReservations.js';
 
 const router = express.Router();
@@ -1198,15 +1198,25 @@ router.post('/external-processing/:id/confirm-send', requireIssue, async (req, r
     if (!processVendorId) {
         return res.status(400).json({ message: 'processVendorId is required' });
     }
-    const qtySent = req.body.qtySent !== undefined ? Number(req.body.qtySent) : row.qtySent;
+    const fullQtySent = Number(row.qtySent);
     // An auto-raised coating job now exists from the moment its shortfall
     // reservation is confirmed, before any mill-finish material has
     // actually been received (qtySent starts at 0, topped up by each
     // goods receipt -- see matWhReservations.js / POST /goods-receipts).
     // Block confirming-and-sending it while there's still nothing to
     // physically hand to a processor.
-    if (!(qtySent > 0)) {
+    if (!(fullQtySent > 0)) {
         return res.status(409).json({ message: 'No material received yet for this job -- nothing to send' });
+    }
+    // Per direct request: the storekeeper doesn't have to send this job's
+    // whole received quantity at once -- pass less to send only part of
+    // it now, clamped to what's actually here (never more). Omitted
+    // (today's default) sends the full amount, unchanged.
+    const qtySent = req.body.qtySent !== undefined
+        ? Math.max(0, Math.min(Number(req.body.qtySent), fullQtySent))
+        : fullQtySent;
+    if (!(qtySent > 0)) {
+        return res.status(400).json({ message: 'qtySent must be greater than 0' });
     }
 
     // Defaults to mill-finish (today's byte-identical behavior when
@@ -1231,39 +1241,51 @@ router.post('/external-processing/:id/confirm-send', requireIssue, async (req, r
         return res.status(409).json({ message: `Only ${available} available to send`, available });
     }
 
-    // Barcode confirmation, required -- same narrow scope as Issue/goods-
-    // receipt, now checked against whichever color is actually leaving
-    // (mill by default, or the storekeeper's chosen in-stock color), not
-    // always mill.
+    // No barcode gate here anymore -- per direct request. The explicit
+    // color picker (validated server-side against GET /available-colors'
+    // own real stock figures) already confirms what's being sent at least
+    // as reliably as a scanned barcode did, without the extra step. The
+    // receive-back side (POST /receive) is unrelated and still barcode-
+    // gated -- that one confirms the COATED material coming back actually
+    // matches targetColor, a check this change doesn't touch.
+    const t = await sequelizeUtf8.transaction();
     try {
-        await requireVariantBarcode(row.itemId, sourceColor, row.lengthMm, req.body.barcode, 'send it');
+        await splitOffRemainder(row, qtySent, t);
+        await postLedgerMovement({
+            storeId: row.storeId, itemId: row.itemId, qty: qtySent, direction: 'out',
+            docType: 'external_send', refType: 'external_processing', refId: row.id,
+            performedBy: req.user.userId, color: sourceColor, lengthMm: row.lengthMm ?? null,
+        }, t);
+        await row.update({
+            status: 'sent', processVendorId, qtySent, sourceColor,
+            sentBy: req.user.userId, sentDate: new Date(),
+        }, { transaction: t });
+        // The send just posted a real ledger movement that already
+        // reflects this much material leaving the mill pool -- the source
+        // line's qtyPendingCoating was only ever a placeholder "claim"
+        // against that pool for the window between confirm (earmarked) and
+        // this send (physically left). Reduced by exactly what left (not
+        // zeroed outright), so a partial send correctly leaves the
+        // remainder's own still-pending claim in place -- left too high
+        // after a FULL send, it permanently double-counts the same units
+        // against every future confirm-send's own availability check
+        // (getAlreadyReserved sums qtyPendingCoating across every held
+        // line), eventually driving the pool artificially negative for
+        // jobs that have nothing to do with this one.
+        if (row.sourceReservationItemId) {
+            const resLine = await MatWhReservationItem.findByPk(row.sourceReservationItemId, { transaction: t });
+            if (resLine) {
+                await resLine.update(
+                    { qtyPendingCoating: Math.max(0, Number(resLine.qtyPendingCoating || 0) - qtySent) },
+                    { transaction: t },
+                );
+            }
+        }
+        await t.commit();
     } catch (err) {
-        return res.status(err.status || 500).json({ message: err.message || 'Failed to confirm and send' });
-    }
-
-    await postLedgerMovement({
-        storeId: row.storeId, itemId: row.itemId, qty: qtySent, direction: 'out',
-        docType: 'external_send', refType: 'external_processing', refId: row.id,
-        performedBy: req.user.userId, color: sourceColor, lengthMm: row.lengthMm ?? null,
-    });
-    await row.update({
-        status: 'sent', processVendorId, qtySent, sourceColor,
-        sentBy: req.user.userId, sentDate: new Date(),
-    });
-    // The send just posted a real ledger movement that already reflects
-    // this material leaving the mill pool -- the source line's
-    // qtyPendingCoating was only ever a placeholder "claim" against that
-    // pool for the window between confirm (earmarked) and this send
-    // (physically left). Left non-zero after the send, it permanently
-    // double-counts the same units against every future confirm-send's
-    // own availability check (getAlreadyReserved sums qtyPendingCoating
-    // across every held line), eventually driving the pool artificially
-    // negative for jobs that have nothing to do with this one.
-    if (row.sourceReservationItemId) {
-        await MatWhReservationItem.update(
-            { qtyPendingCoating: 0 },
-            { where: { id: row.sourceReservationItemId } },
-        );
+        await t.rollback();
+        console.error('Error confirming and sending coating job:', err);
+        return res.status(500).json({ message: 'Failed to confirm and send' });
     }
     res.json(row);
 });
@@ -1301,15 +1323,35 @@ router.post('/external-processing/group/:requestNo/confirm-send', requireIssue, 
     const sourceColors = req.body.sourceColors || {};
     const sourceColorFor = (row) => normalizeColor(sourceColors[row.id] ? String(sourceColors[row.id]) : null);
 
-    // Check every ready job's own chosen-color availability BEFORE writing
-    // anything -- same reasoning as the single-job route's own check
-    // (including excluding each job's own source reservation line -- see
-    // getAvailableToReserve's own comment), just done as one pre-pass so a
-    // shortfall on item 3 of 5 doesn't leave the first 2 already sent while
-    // the rest silently fail.
-    for (const row of ready) {
+    // Per direct request: sending the group doesn't have to mean sending
+    // every ready job's full received quantity -- an entry here (clamped
+    // to that job's own qtySent, never more) sends only that much now,
+    // e.g. 20 of 35, leaving 15 to send later. A job with no entry sends
+    // its full amount, unchanged from before this feature -- also how a
+    // job gets skipped outright: send 0 for it and it's left untouched,
+    // same "pick which items go now" as the qty-based skip below already
+    // did for a job with nothing received yet.
+    const qtySents = req.body.qtySents || {};
+    const sendQtyFor = (row) => {
+        const requested = qtySents[row.id];
+        const full = Number(row.qtySent);
+        return requested != null ? Math.max(0, Math.min(Number(requested), full)) : full;
+    };
+    const toSend = ready.filter((row) => sendQtyFor(row) > 0);
+    const heldBack = ready.filter((row) => !(sendQtyFor(row) > 0));
+
+    // Check every to-send job's own chosen-color availability BEFORE
+    // writing anything -- same reasoning as the single-job route's own
+    // check (including excluding each job's own source reservation line --
+    // see getAvailableToReserve's own comment), just done as one pre-pass
+    // so a shortfall on item 3 of 5 doesn't leave the first 2 already sent
+    // while the rest silently fail. Checked against the chosen send qty,
+    // not the job's full qtySent -- sending only part of it needs only
+    // that much available, never the whole thing.
+    for (const row of toSend) {
         const available = await getAvailableToReserve(row.storeId, row.itemId, sourceColorFor(row), undefined, row.sourceReservationItemId);
-        if (Number(row.qtySent) > available) {
+        const sendQty = sendQtyFor(row);
+        if (sendQty > available) {
             return res.status(409).json({
                 message: `Only ${available} available to send for item ${row.itemId} -- adjust that job's quantity first`,
                 itemId: row.itemId, available,
@@ -1317,46 +1359,44 @@ router.post('/external-processing/group/:requestNo/confirm-send', requireIssue, 
         }
     }
 
-    // Barcode confirmation, required -- same narrow scope as the single-job
-    // route, now checked against each job's own chosen color, one barcode
-    // per job since a group can hold several different items. Same
-    // pre-pass-before-writing-anything reasoning as the availability
-    // check above -- req.body.barcodes is keyed by job id.
-    const barcodes = req.body.barcodes || {};
-    for (const row of ready) {
-        try {
-            await requireVariantBarcode(row.itemId, sourceColorFor(row), row.lengthMm, barcodes[row.id], 'send it');
-        } catch (err) {
-            return res.status(err.status || 500).json({
-                message: `Item ${row.itemId}: ${err.message || 'Failed to confirm and send'}`,
-                itemId: row.itemId, jobId: row.id,
-            });
-        }
-    }
-
+    // No barcode gate here anymore -- per direct request. The explicit
+    // color picker (validated server-side against GET /available-colors'
+    // own real stock figures) already confirms what's being sent at least
+    // as reliably as a scanned barcode did, without the extra step. The
+    // receive-back side (POST /receive) is unrelated and still barcode-
+    // gated -- that one confirms the COATED material coming back actually
+    // matches targetColor, a check this change doesn't touch.
     const t = await sequelizeUtf8.transaction();
     try {
-        for (const row of ready) {
+        for (const row of toSend) {
             const sourceColor = sourceColorFor(row);
+            const sendQty = sendQtyFor(row);
+            await splitOffRemainder(row, sendQty, t);
             await postLedgerMovement({
-                storeId: row.storeId, itemId: row.itemId, qty: Number(row.qtySent), direction: 'out',
+                storeId: row.storeId, itemId: row.itemId, qty: sendQty, direction: 'out',
                 docType: 'external_send', refType: 'external_processing', refId: row.id,
                 performedBy: req.user.userId, color: sourceColor, lengthMm: row.lengthMm ?? null,
             }, t);
             await row.update({
-                status: 'sent', processVendorId, sourceColor,
+                status: 'sent', processVendorId, qtySent: sendQty, sourceColor,
                 sentBy: req.user.userId, sentDate: new Date(),
             }, { transaction: t });
             // See the single-job confirm-send route's own comment -- the
-            // send just posted already reflects this material leaving the
-            // mill pool, so the source line's qtyPendingCoating placeholder
-            // claim has to clear too, or it double-counts against every
-            // later job's own availability check.
+            // send just posted already reflects this much material leaving
+            // the mill pool, so the source line's qtyPendingCoating
+            // placeholder claim has to reduce by the same amount (not
+            // zeroed outright -- a partial send correctly leaves the
+            // remainder's own still-pending claim in place), or it
+            // double-counts against every later job's own availability
+            // check.
             if (row.sourceReservationItemId) {
-                await MatWhReservationItem.update(
-                    { qtyPendingCoating: 0 },
-                    { where: { id: row.sourceReservationItemId }, transaction: t },
-                );
+                const resLine = await MatWhReservationItem.findByPk(row.sourceReservationItemId, { transaction: t });
+                if (resLine) {
+                    await resLine.update(
+                        { qtyPendingCoating: Math.max(0, Number(resLine.qtyPendingCoating || 0) - sendQty) },
+                        { transaction: t },
+                    );
+                }
             }
         }
         await t.commit();
@@ -1367,8 +1407,8 @@ router.post('/external-processing/group/:requestNo/confirm-send', requireIssue, 
     }
 
     res.json({
-        updated: ready.map((row) => row.id),
-        skipped: skipped.map((row) => row.id),
+        updated: toSend.map((row) => row.id),
+        skipped: [...skipped, ...heldBack].map((row) => row.id),
     });
 });
 
