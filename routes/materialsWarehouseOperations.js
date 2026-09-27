@@ -22,7 +22,7 @@ import { MatWhExternalProcessing } from '../models/MatWhExternalProcessing.js';
 import { MatWhPurchaseOrder } from '../models/MatWhPurchaseOrder.js';
 import { MatWhPurchaseOrderItem } from '../models/MatWhPurchaseOrderItem.js';
 import { MatWhStockLedger } from '../models/MatWhStockLedger.js';
-import { postLedgerMovement, getAvailableToReserve, getAlreadyReserved, getPendingQty, getPhysicalBalance } from '../services/matWhLedger.js';
+import { postLedgerMovement, getAvailableToReserve, getAlreadyReserved, getPendingQty, getPhysicalBalance, normalizeColor } from '../services/matWhLedger.js';
 import {
     createReservationHeader, submitReservation,
     confirmReservation, rejectReservation,
@@ -217,6 +217,38 @@ router.get('/variant-lookup', requireAnyOf(
         itemCode: item?.itemCode ?? null, itemName: item?.itemName ?? null,
         color: variant.color, lengthMm: variant.lengthMm,
     });
+});
+
+// The reverse of variant-lookup: once the color/length to receive (or
+// issue) is already known -- from the PO/reservation line itself, no scan
+// needed -- auto-fill the one barcode that already exists for that exact
+// (item, color, length), instead of making the storekeeper look it up by
+// hand or physically scan a piece that's usually still in the same box.
+// Same narrow storekeeper-action permission gate as variant-lookup; a
+// query that doesn't resolve to exactly one active variant is a normal,
+// expected case (no barcode entered for this combo yet, or more than one
+// somehow exists), not an error -- 404 either way, for the caller to fall
+// back to manual entry/scan. color compared via normalizeColor, same as
+// requireVariantBarcode's own check -- 'MILL' and null/absent both mean
+// mill-finish on either side.
+router.get('/variant-barcode', requireAnyOf(
+    PERMISSIONS.MATERIALS_WAREHOUSE_RESERVE,
+    PERMISSIONS.MATERIALS_WAREHOUSE_ISSUE,
+    PERMISSIONS.MATERIALS_WAREHOUSE_RECEIVE,
+), async (req, res) => {
+    const itemId = Number(req.query.itemId);
+    if (!itemId) return res.status(400).json({ message: 'itemId is required' });
+    const expectedColor = normalizeColor(req.query.color ? String(req.query.color) : null);
+    const expectedLengthMm = req.query.lengthMm ? Number(req.query.lengthMm) : null;
+
+    const variants = await MatWhItemVariant.findAll({ where: { itemId, isActive: true } });
+    const matches = variants.filter((v) => {
+        if (normalizeColor(v.color ?? null) !== expectedColor) return false;
+        if (expectedLengthMm != null && Number(v.lengthMm) !== expectedLengthMm) return false;
+        return true;
+    });
+    if (matches.length !== 1) return res.status(404).json({ message: 'No single matching barcode found' });
+    res.json({ variantId: matches[0].id, barcode: matches[0].barcode });
 });
 
 // Resolves a specific set of item ids in one call -- for displaying
