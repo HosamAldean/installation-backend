@@ -22,7 +22,7 @@ import { MatWhExternalProcessing } from '../models/MatWhExternalProcessing.js';
 import { MatWhPurchaseOrder } from '../models/MatWhPurchaseOrder.js';
 import { MatWhPurchaseOrderItem } from '../models/MatWhPurchaseOrderItem.js';
 import { MatWhStockLedger } from '../models/MatWhStockLedger.js';
-import { postLedgerMovement, getAvailableToReserve, getAlreadyReserved, getPendingQty, getPhysicalBalance, normalizeColor } from '../services/matWhLedger.js';
+import { postLedgerMovement, getAvailableToReserve, getAlreadyReserved, getPendingQty, getPhysicalBalance, normalizeColor, getAvailableColorsForItem } from '../services/matWhLedger.js';
 import {
     createReservationHeader, submitReservation,
     confirmReservation, rejectReservation,
@@ -249,6 +249,28 @@ router.get('/variant-barcode', requireAnyOf(
     });
     if (matches.length !== 1) return res.status(404).json({ message: 'No single matching barcode found' });
     res.json({ variantId: matches[0].id, barcode: matches[0].barcode });
+});
+
+// Every color this item genuinely has available stock of at this store --
+// what a coating job's send-color picker offers (per direct request: "cant
+// select only avalble color on the stor"), so a storekeeper can send
+// already-in-stock painted material to be re-coated instead of always
+// assuming mill. Same narrow storekeeper-action permission gate as
+// variant-lookup/variant-barcode. Only rows with available > 0 are
+// returned -- a color this item has moved through before but has none of
+// left isn't a real choice.
+router.get('/available-colors', requireAnyOf(
+    PERMISSIONS.MATERIALS_WAREHOUSE_RESERVE,
+    PERMISSIONS.MATERIALS_WAREHOUSE_ISSUE,
+    PERMISSIONS.MATERIALS_WAREHOUSE_RECEIVE,
+), async (req, res) => {
+    const itemId = Number(req.query.itemId);
+    const storeId = Number(req.query.storeId);
+    if (!itemId || !storeId) return res.status(400).json({ message: 'itemId and storeId are required' });
+    const lengthMm = req.query.lengthMm ? Number(req.query.lengthMm) : undefined;
+
+    const colors = await getAvailableColorsForItem(storeId, itemId, lengthMm);
+    res.json({ colors: colors.filter((c) => c.available > 0) });
 });
 
 // Resolves a specific set of item ids in one call -- for displaying
@@ -1187,29 +1209,34 @@ router.post('/external-processing/:id/confirm-send', requireIssue, async (req, r
         return res.status(409).json({ message: 'No material received yet for this job -- nothing to send' });
     }
 
-    // Mill-finish stock is the untargeted (null-color) pool -- pass null
-    // explicitly (not row.targetColor, and not undefined/pooled). The
-    // external_send movement this route posts below always writes
-    // color: null, so what it actually debits is the null-color balance
-    // specifically; checking against the ALL-colors pooled total
-    // (undefined) could pass on the strength of other colors' stock that
-    // this movement never touches, then still drive the null-color balance
-    // negative once posted. The check has to scope to the same color the
-    // write uses. Excludes this job's own source reservation line -- its
-    // qtyPendingCoating is still counted as "held" until the send actually
-    // posts, so leaving it in would double-count this exact job against
-    // itself (see getAvailableToReserve's own comment on excludeLineId).
-    const available = await getAvailableToReserve(row.storeId, row.itemId, null, undefined, row.sourceReservationItemId);
+    // Defaults to mill-finish (today's byte-identical behavior when
+    // omitted) -- per direct request, the storekeeper can instead pick any
+    // OTHER color this item genuinely has available stock of at this
+    // store (GET /available-colors is what the frontend's picker itself
+    // restricts to), to send existing painted stock for re-coating instead
+    // of assuming mill. Whatever color is chosen, the external_send
+    // movement below writes that exact color, so the availability check
+    // has to scope to that same color, not a hardcoded null -- checking
+    // against the ALL-colors pooled total (undefined) could pass on the
+    // strength of other colors' stock this movement never touches, then
+    // still drive THIS color's balance negative once posted. Excludes this
+    // job's own source reservation line -- its qtyPendingCoating is still
+    // counted as "held" until the send actually posts, so leaving it in
+    // would double-count this exact job against itself (only relevant when
+    // sourceColor normalizes to mill -- see getAvailableToReserve's own
+    // comment on excludeLineId).
+    const sourceColor = normalizeColor(req.body.sourceColor ? String(req.body.sourceColor) : null);
+    const available = await getAvailableToReserve(row.storeId, row.itemId, sourceColor, undefined, row.sourceReservationItemId);
     if (qtySent > available) {
         return res.status(409).json({ message: `Only ${available} available to send`, available });
     }
 
     // Barcode confirmation, required -- same narrow scope as Issue/goods-
-    // receipt: what's physically leaving is mill-finish (color: null), so
-    // the scanned barcode must resolve to THIS item's own mill/MILL
-    // variant specifically, not any painted one.
+    // receipt, now checked against whichever color is actually leaving
+    // (mill by default, or the storekeeper's chosen in-stock color), not
+    // always mill.
     try {
-        await requireVariantBarcode(row.itemId, null, row.lengthMm, req.body.barcode, 'send it');
+        await requireVariantBarcode(row.itemId, sourceColor, row.lengthMm, req.body.barcode, 'send it');
     } catch (err) {
         return res.status(err.status || 500).json({ message: err.message || 'Failed to confirm and send' });
     }
@@ -1217,10 +1244,10 @@ router.post('/external-processing/:id/confirm-send', requireIssue, async (req, r
     await postLedgerMovement({
         storeId: row.storeId, itemId: row.itemId, qty: qtySent, direction: 'out',
         docType: 'external_send', refType: 'external_processing', refId: row.id,
-        performedBy: req.user.userId, color: null, lengthMm: row.lengthMm ?? null,
+        performedBy: req.user.userId, color: sourceColor, lengthMm: row.lengthMm ?? null,
     });
     await row.update({
-        status: 'sent', processVendorId, qtySent,
+        status: 'sent', processVendorId, qtySent, sourceColor,
         sentBy: req.user.userId, sentDate: new Date(),
     });
     // The send just posted a real ledger movement that already reflects
@@ -1267,14 +1294,21 @@ router.post('/external-processing/group/:requestNo/confirm-send', requireIssue, 
         return res.status(409).json({ message: 'No item in this group has received material yet -- nothing to send' });
     }
 
-    // Check every ready job's own null-color availability BEFORE writing
+    // Per-job source color, keyed by job id -- same "defaults to mill,
+    // storekeeper can instead pick any color this item has real available
+    // stock of" override as the single-job route, just one per job since a
+    // group can hold several different items/colors.
+    const sourceColors = req.body.sourceColors || {};
+    const sourceColorFor = (row) => normalizeColor(sourceColors[row.id] ? String(sourceColors[row.id]) : null);
+
+    // Check every ready job's own chosen-color availability BEFORE writing
     // anything -- same reasoning as the single-job route's own check
     // (including excluding each job's own source reservation line -- see
     // getAvailableToReserve's own comment), just done as one pre-pass so a
     // shortfall on item 3 of 5 doesn't leave the first 2 already sent while
     // the rest silently fail.
     for (const row of ready) {
-        const available = await getAvailableToReserve(row.storeId, row.itemId, null, undefined, row.sourceReservationItemId);
+        const available = await getAvailableToReserve(row.storeId, row.itemId, sourceColorFor(row), undefined, row.sourceReservationItemId);
         if (Number(row.qtySent) > available) {
             return res.status(409).json({
                 message: `Only ${available} available to send for item ${row.itemId} -- adjust that job's quantity first`,
@@ -1283,15 +1317,15 @@ router.post('/external-processing/group/:requestNo/confirm-send', requireIssue, 
         }
     }
 
-    // Barcode confirmation, required -- same narrow scope and same
-    // mill-finish expectation as the single-job route, just one barcode
+    // Barcode confirmation, required -- same narrow scope as the single-job
+    // route, now checked against each job's own chosen color, one barcode
     // per job since a group can hold several different items. Same
     // pre-pass-before-writing-anything reasoning as the availability
     // check above -- req.body.barcodes is keyed by job id.
     const barcodes = req.body.barcodes || {};
     for (const row of ready) {
         try {
-            await requireVariantBarcode(row.itemId, null, row.lengthMm, barcodes[row.id], 'send it');
+            await requireVariantBarcode(row.itemId, sourceColorFor(row), row.lengthMm, barcodes[row.id], 'send it');
         } catch (err) {
             return res.status(err.status || 500).json({
                 message: `Item ${row.itemId}: ${err.message || 'Failed to confirm and send'}`,
@@ -1303,13 +1337,14 @@ router.post('/external-processing/group/:requestNo/confirm-send', requireIssue, 
     const t = await sequelizeUtf8.transaction();
     try {
         for (const row of ready) {
+            const sourceColor = sourceColorFor(row);
             await postLedgerMovement({
                 storeId: row.storeId, itemId: row.itemId, qty: Number(row.qtySent), direction: 'out',
                 docType: 'external_send', refType: 'external_processing', refId: row.id,
-                performedBy: req.user.userId, color: null, lengthMm: row.lengthMm ?? null,
+                performedBy: req.user.userId, color: sourceColor, lengthMm: row.lengthMm ?? null,
             }, t);
             await row.update({
-                status: 'sent', processVendorId,
+                status: 'sent', processVendorId, sourceColor,
                 sentBy: req.user.userId, sentDate: new Date(),
             }, { transaction: t });
             // See the single-job confirm-send route's own comment -- the

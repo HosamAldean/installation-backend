@@ -48,6 +48,17 @@ export const MatWhExternalProcessing = sequelizeUtf8.define('MatWhExternalProces
     // null for an ordinary (non-coating) external-processing job. Set
     // alongside sourceReservationItemId below when auto-created.
     targetColor: { type: DataTypes.STRING(50), allowNull: true },
+    // What color is actually being sent out -- null (mill-finish) for
+    // every job created before this field existed, and still the default
+    // for a new one unless the storekeeper explicitly picks a different
+    // already-in-stock color at confirm-send time (routes/
+    // materialsWarehouseOperations.js's POST /confirm-send, restricted
+    // there to colors this item actually has available stock of at that
+    // store -- per direct request, re-coating existing painted stock to a
+    // new targetColor instead of always assuming mill). Only ever set at
+    // send time, alongside status -> 'sent'; stays null on a still-draft
+    // job since nothing's been sent yet.
+    sourceColor: { type: DataTypes.STRING(50), allowNull: true },
     // Set only on an auto-created draft job -- which reservation line it
     // exists to eventually fulfill (via the separate, explicit
     // POST /reservations/:id/items/:lineId/fulfill-shortfall action once

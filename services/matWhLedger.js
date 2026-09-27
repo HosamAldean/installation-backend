@@ -179,6 +179,33 @@ export async function getPendingQty(storeId, itemId, excludeLineId, color, lengt
         .reduce((sum, r) => sum + r.qtyRequested, 0);
 }
 
+// Every distinct color this item has ever moved through at this store,
+// each with its own real available-to-reserve figure -- what the coating
+// send action's color picker offers, restricted (by the caller) to only
+// those with available > 0. lengthMm optional, same "omitted = pooled,
+// explicit = narrowed" convention as everywhere else -- a coating job's
+// own fixed length should almost always be passed, since sending a
+// different length's stock under this item code would be wrong even if
+// some other length shows a real balance. Distinct colors come from the
+// ledger itself (already write-normalized -- see postLedgerMovement),
+// so 'MILL' never shows up as a separate row from null; querying with
+// undefined lets a genuinely uncolored (non-ALM) item's single null
+// bucket through too.
+export async function getAvailableColorsForItem(storeId, itemId, lengthMm) {
+    const where = { storeId, itemId };
+    if (lengthMm !== undefined) where.lengthMm = lengthMm;
+    const rows = await MatWhStockLedger.findAll({
+        where, attributes: ['color'], group: ['color'],
+    });
+    const colors = rows.map((r) => r.color ?? null);
+    const results = [];
+    for (const color of colors) {
+        const available = await getAvailableToReserve(storeId, itemId, color, lengthMm);
+        results.push({ color, available });
+    }
+    return results;
+}
+
 // WH.4. Feeds matWhItemCost's running valuation -- called only from a
 // goods-receipt posting (the actual acquisition/cost event), matching
 // Alpha's own real precedent (Ord_GetItemUnitCost only concerns itself
