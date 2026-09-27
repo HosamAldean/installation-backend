@@ -124,6 +124,58 @@ router.get("/", authenticateToken, async (req, res) => {
             return res.status(404).json({ success: false, message: "No payslip found for the current month" });
         }
 
+        // Pay_MonthCalc itself has no hours column at all -- only a PayAmt.
+        // Hours for the two line types that are actually hour-based (real
+        // codes verified live against this ERP's own data, not guessed)
+        // live in their own separate tables:
+        //   - Overtime ("Overt" / "العمل الاضافي", Trs_type 1): dbo.
+        //     Pay_OverTDaily.Ovt_Hours(+Ovt_Mints), one row per approved
+        //     overtime entry for the CURRENT/not-yet-closed period --
+        //     verified against a real employee whose Sept entry (12h,
+        //     entered 2026-09-23) lines up with their "Overt" PayAmt this
+        //     same month.
+        //   - Hourly absence deduction ("ABSNH"/legacy "4", "خصم ساعات" /
+        //     "Absence Deduction- Hours", Trs_type 2): dbo.
+        //     Pay_EmpAbsncDeds.Aldd_amount for the current period.
+        //     UNVERIFIED interpretation -- this column is typed `money` and
+        //     no employee currently has both a pending entry and an already
+        //     -processed payslip line to cross-check directly, but its
+        //     values for pending (not yet payroll-run) rows are suspicious
+        //     -ly round (24, 8) versus the historized version of the same
+        //     table's own values once processed (1.41, 5.66 -- JOD-looking
+        //     decimals), consistent with "hours pre-processing, money
+        //     post-processing". Flagged in the response as
+        //     hoursUnverified: true on that line so the UI can visually
+        //     mark it until confirmed against Alpha's own report.
+        const periodDate = new Date(rows[0].PayDate);
+        const periodStart = new Date(Date.UTC(periodDate.getUTCFullYear(), periodDate.getUTCMonth(), 1));
+        const periodEnd = new Date(Date.UTC(periodDate.getUTCFullYear(), periodDate.getUTCMonth() + 1, 1));
+
+        const overtResult = await withSqlRetry("erp", (pool) => pool.request()
+            .input("compNo", emp.Comp_num).input("empNo", empNo)
+            .input("periodStart", periodStart).input("periodEnd", periodEnd)
+            .query(`
+                SELECT SUM(Ovt_Hours + Ovt_Mints / 60.0) AS totalHours
+                FROM dbo.Pay_OverTDaily
+                WHERE CompNo = @compNo AND EmpNo = @empNo
+                  AND Ovt_Start_date >= @periodStart AND Ovt_Start_date < @periodEnd
+            `));
+        const overtimeHours = overtResult.recordset[0]?.totalHours != null
+            ? Number(overtResult.recordset[0].totalHours) : null;
+
+        const absResult = await withSqlRetry("erp", (pool) => pool.request()
+            .input("compNo", emp.Comp_num).input("empNo", empNo)
+            .input("periodStart", periodStart).input("periodEnd", periodEnd)
+            .query(`
+                SELECT SUM(Aldd_amount) AS totalHours
+                FROM dbo.Pay_EmpAbsncDeds
+                WHERE CompNo = @compNo AND EmpNo = @empNo
+                  AND Aldd_code IN ('4', 'ABSNH')
+                  AND Aldd_start_date >= @periodStart AND Aldd_start_date < @periodEnd
+            `));
+        const absenceHours = absResult.recordset[0]?.totalHours != null
+            ? Number(absResult.recordset[0].totalHours) : null;
+
         const SUMMARY_CODES = new Set(["CASH", "BANK", "DAYS"]);
         const allowances = [];
         const deductions = [];
@@ -135,11 +187,19 @@ router.get("/", authenticateToken, async (req, res) => {
             if (codeUpper === "CASH") { netCash = amount; continue; }
             if (codeUpper === "BANK") { bankTransfer = amount; continue; }
             if (SUMMARY_CODES.has(codeUpper)) continue;
+
+            const descEng = (row.Aldd_DescEng || "").toLowerCase();
+            const descAr = row.Aldd_Desc || "";
+            const isOvertimeLine = /over\s*time/.test(descEng) || descAr.includes("اضاف");
+            const isAbsenceHoursLine = (descEng.includes("hour") && descEng.includes("absen")) || descAr.includes("ساع");
+
             const item = {
                 code: row.PayCode,
                 label: row.Aldd_Desc?.trim() || row.PayCode,
                 labelEn: row.Aldd_DescEng?.trim() || row.PayCode,
                 amount,
+                hours: isOvertimeLine ? overtimeHours : (isAbsenceHoursLine ? absenceHours : null),
+                hoursUnverified: isAbsenceHoursLine,
             };
             if (row.Trs_type === 1) allowances.push(item);
             else deductions.push(item);
