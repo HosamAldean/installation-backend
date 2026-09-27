@@ -33,7 +33,7 @@ import { MatWhStore } from '../models/MatWhStore.js';
 import { MatWhItemStore } from '../models/MatWhItemStore.js';
 import { Vendor } from '../models/Vendor.js';
 import { User } from '../models/User.js';
-import { postLedgerMovement, applyReceiptCost } from '../services/matWhLedger.js';
+import { postLedgerMovement, applyReceiptCost, normalizeColor } from '../services/matWhLedger.js';
 import { createCoatingJob, requireVariantBarcode } from '../services/matWhReservations.js';
 import { MatWhReservationItem } from '../models/MatWhReservationItem.js';
 
@@ -316,6 +316,17 @@ router.post('/purchase-orders/:id/items', requirePurchaseOrders, async (req, res
 // defensively anyway: a job that's somehow already sent/received (or has
 // qtySent > 0) is left alone and reported back rather than silently
 // deleted.
+//
+// The incoming color is run through normalizeColor before that decision:
+// the real AL color master (isValidPoLineColor's own colorInfo table) has
+// its own literal 'MILL' entry alongside the frontend's plain null
+// "Mill (standard)" shortcut, and picking that master-data entry is the
+// same real-world choice as leaving color blank -- still mill-finish,
+// nothing to buy pre-painted. Treating the literal string 'MILL' as "a
+// genuine distinct color" here wiped a perfectly valid pending coating
+// job for no reason (caught live on reservation 26-1050 -- the storekeeper
+// picked master-data 'MILL' meaning to confirm the mill-finish buy, and it
+// silently deleted the coating request instead).
 router.patch('/purchase-orders/:id/items/:itemId/color', requireReserve, async (req, res) => {
     const po = await MatWhPurchaseOrder.findByPk(req.params.id);
     if (!po) return res.status(404).json({ message: 'Purchase order not found' });
@@ -327,10 +338,11 @@ router.patch('/purchase-orders/:id/items/:itemId/color', requireReserve, async (
     });
     if (!line) return res.status(404).json({ message: 'Line not found' });
 
-    const { color } = req.body;
-    if (color && !(await isValidPoLineColor(color))) {
-        return res.status(400).json({ message: `Unrecognized color: ${color}` });
+    const { color: rawColor } = req.body;
+    if (rawColor && !(await isValidPoLineColor(rawColor))) {
+        return res.status(400).json({ message: `Unrecognized color: ${rawColor}` });
     }
+    const color = normalizeColor(rawColor || null);
 
     const t = await sequelizeUtf8.transaction();
     try {
