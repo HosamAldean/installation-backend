@@ -1132,23 +1132,41 @@ router.get('/external-processing', requireAnyOf(
     res.json({ items });
 });
 
+// Ad-hoc manual send (ExternalProcessing.tsx's own "Send Out" dialog) --
+// the one path into this table that isn't auto-generated from a
+// reservation shortfall. Per the module-wide color+length scoping audit
+// (same class of bug caught in the cutover opening-balance guard): this
+// used to check availability pooled across ALL colors (color/lengthMm
+// omitted from getAvailableToReserve) but always WROTE the ledger
+// movement as mill-finish (color always null, never threaded through) --
+// an item with real painted stock alongside mill could pass the check on
+// the strength of a color this movement never touches, then still drive
+// the mill-only balance negative once posted. Now accepts optional
+// color/lengthMm (defaults to mill, byte-identical to before for any
+// non-ALM item, which never has a real color to begin with), scoped
+// consistently through the check, the ledger write, and the job's own
+// stamped sourceColor/lengthMm.
 router.post('/external-processing', requireIssue, async (req, res) => {
     const { itemId, storeId, processVendorId, qtySent } = req.body;
     if (!itemId || !storeId || !qtySent) {
         return res.status(400).json({ message: 'itemId, storeId and qtySent are required' });
     }
-    const available = await getAvailableToReserve(storeId, itemId);
+    const sourceColor = normalizeColor(req.body.color ? String(req.body.color) : null);
+    const lengthMm = req.body.lengthMm ? Number(req.body.lengthMm) : null;
+    const available = await getAvailableToReserve(storeId, itemId, sourceColor, lengthMm ?? undefined);
     if (Number(qtySent) > available) {
         return res.status(409).json({ message: `Only ${available} available to send`, available });
     }
 
     const row = await createWithGeneratedNo(MatWhExternalProcessing, 'requestNo', 'COAT', {
         itemId, storeId, processVendorId: processVendorId ?? null, qtySent,
+        lengthMm, sourceColor,
         sentDate: new Date(), sentBy: req.user.userId,
     });
     await postLedgerMovement({
         storeId, itemId, qty: qtySent, direction: 'out', docType: 'external_send',
         refType: 'external_processing', refId: row.id, performedBy: req.user.userId,
+        color: sourceColor, lengthMm,
     });
     res.status(201).json(row);
 });
