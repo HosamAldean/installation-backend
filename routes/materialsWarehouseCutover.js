@@ -11,33 +11,45 @@ import { authenticateToken } from '../middleware/auth.js';
 import { requirePermission } from '../middleware/permissions.js';
 import { PERMISSIONS } from '../constants/permissions.js';
 import { MatWhStockLedger } from '../models/MatWhStockLedger.js';
-import { postLedgerMovement, applyReceiptCost, getPhysicalBalance } from '../services/matWhLedger.js';
+import { postLedgerMovement, applyReceiptCost, getPhysicalBalance, normalizeColor } from '../services/matWhLedger.js';
 
 const router = express.Router();
 router.use(authenticateToken, requirePermission(PERMISSIONS.MATERIALS_WAREHOUSE_MASTER_DATA));
 
-// Seeds starting physical stock for one item+store as of go-live. Guarded
-// against re-seeding: once any real movement exists for that item+store,
-// this refuses -- opening balances are a one-time, before-go-live action,
-// not a way to silently adjust stock later (that's what a write-off/
-// adjustment movement type would be, not built in this pass).
+// Seeds starting physical stock for one item+store(+color+length) as of
+// go-live. Guarded against re-seeding: once any real movement exists for
+// that EXACT combination, this refuses -- opening balances are a one-time,
+// before-go-live action, not a way to silently adjust stock later (that's
+// what a write-off/adjustment movement type would be, not built in this
+// pass). Scoped to color+length, not just item+store -- an ALM item's
+// opening balance is entered once per real color+length combination it
+// carries (mirrors how every other ledger query -- getPhysicalBalance,
+// getAvailableToReserve -- already scopes to this same granularity).
+// Checking item+store alone rejected a second color's/length's own
+// first-ever entry just because an earlier, different color already
+// posted one (caught live: item E8592, MILL/6300 entered fine, then
+// 8022/6300 on the same item wrongly refused as "already has ledger
+// activity").
 router.post('/opening-balance', async (req, res) => {
     const { storeId, itemId, qty, unitCost, note, color, lengthMm } = req.body;
     if (!storeId || !itemId || qty === undefined) {
         return res.status(400).json({ message: 'storeId, itemId and qty are required' });
     }
 
-    const existing = await MatWhStockLedger.count({ where: { storeId, itemId } });
+    const normalizedColor = normalizeColor(color || null);
+    const existing = await MatWhStockLedger.count({
+        where: { storeId, itemId, color: normalizedColor, lengthMm: lengthMm ?? null },
+    });
     if (existing > 0) {
         return res.status(409).json({
-            message: 'This item/store already has ledger activity -- opening balance can only be entered before go-live for a given item/store',
+            message: 'This item/store/color/length already has ledger activity -- opening balance can only be entered before go-live for a given combination',
         });
     }
 
     const ledgerRow = await postLedgerMovement({
         storeId, itemId, qty, direction: 'in', docType: 'opening_balance',
         refType: 'cutover', refId: null, unitCost, performedBy: req.user.userId,
-        color: color || null, lengthMm: lengthMm ?? null,
+        color: normalizedColor, lengthMm: lengthMm ?? null,
     });
 
     if (unitCost != null) {
