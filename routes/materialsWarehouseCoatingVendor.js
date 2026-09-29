@@ -32,13 +32,21 @@ router.use(authenticateToken, requirePermission(PERMISSIONS.MATERIALS_WAREHOUSE_
 // per-query, since a misconfigured account (role granted before an admin
 // assigned a vendor) should 403 cleanly instead of silently returning an
 // empty list that reads like "no jobs yet".
+//
+// admin gets `null` -- a sentinel meaning "every vendor", per direct
+// request ("first admin full access for it"). admin already bypasses the
+// router-level requirePermission check above, so it would otherwise hit
+// this portal with zero MatWhUserVendorAssignment rows of its own and
+// 403 out of every route; treated as full access instead, same as the
+// requirePermission bypass itself.
 async function getMyVendorIds(req) {
+    if (req.user.role === 'admin') return null;
     const rows = await MatWhUserVendorAssignment.findAll({ where: { userId: req.user.userId } });
     return rows.map((r) => r.vendorId);
 }
 
 function requireVendorIds(res, vendorIds) {
-    if (vendorIds.length === 0) {
+    if (vendorIds !== null && vendorIds.length === 0) {
         res.status(403).json({ message: 'No vendor assigned to this account yet -- contact an admin' });
         return false;
     }
@@ -81,8 +89,10 @@ router.get('/requests', async (req, res) => {
     const vendorIds = await getMyVendorIds(req);
     if (!requireVendorIds(res, vendorIds)) return;
 
+    const where = { status: { [Op.ne]: 'draft' } };
+    if (vendorIds !== null) where.processVendorId = { [Op.in]: vendorIds };
     const rows = await MatWhExternalProcessing.findAll({
-        where: { processVendorId: { [Op.in]: vendorIds }, status: { [Op.ne]: 'draft' } },
+        where,
         order: [['id', 'DESC']],
     });
     const itemIds = [...new Set(rows.map((r) => r.itemId))];
@@ -104,7 +114,8 @@ async function getMyGroupRows(req, res) {
     const rows = await MatWhExternalProcessing.findAll({
         where: { requestNo, status: { [Op.ne]: 'draft' } },
     });
-    if (rows.length === 0 || !rows.every((r) => vendorIds.includes(r.processVendorId))) {
+    const inScope = vendorIds === null || rows.every((r) => vendorIds.includes(r.processVendorId));
+    if (rows.length === 0 || !inScope) {
         res.status(404).json({ message: 'Not found' });
         return null;
     }

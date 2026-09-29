@@ -1067,10 +1067,16 @@ router.get('/feasibility-checks', requireReserve, async (req, res) => {
 router.get('/external-processing', requireAnyOf(
     PERMISSIONS.MATERIALS_WAREHOUSE_ISSUE,
     PERMISSIONS.MATERIALS_WAREHOUSE_RECEIVE,
+    // Added alongside the new admin/accounting coating-vendor management
+    // list (frontend's CoatingVendorsOverview.tsx) -- an invoices-only
+    // holder needs to reach this same list to review/manage every
+    // vendor's requests, not just storekeepers who can also send/receive.
+    PERMISSIONS.MATERIALS_WAREHOUSE_INVOICES,
 ), async (req, res) => {
     const where = {};
     if (req.query.status) where.status = req.query.status;
     if (req.query.storeId) where.storeId = req.query.storeId;
+    if (req.query.processVendorId) where.processVendorId = req.query.processVendorId;
     // Lets ReceiveByItem.tsx pull a scanned item's own sent-but-not-yet-
     // received-back coating jobs alongside its PO candidates, per direct
     // request ("so all received in on place") -- one item-first receiving
