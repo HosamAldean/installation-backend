@@ -1351,16 +1351,45 @@ router.post('/external-processing/:id/confirm-send', requireIssue, async (req, r
 // awaiting its own mill-finish material (qtySent === 0) is silently
 // skipped rather than blocking the rest of the group -- it can be sent on
 // its own, later, once material for it actually arrives.
-router.post('/external-processing/group/:requestNo/confirm-send', requireIssue, async (req, res) => {
+// Names Mix as the vendor for this request WITHOUT physically sending
+// anything -- per direct request, Mix must be able to acknowledge the
+// request and schedule a painting date before the warehouse actually
+// dispatches material (see routes/materialsWarehouseCoatingVendor.js's
+// own POST .../acknowledge-request, which only becomes reachable once
+// processVendorId is set here). No ledger movement, no status change --
+// the rows stay 'draft' until the group is later actually sent via
+// POST .../confirm-send below, at which point that route just reuses
+// whatever vendor was already named here rather than requiring it again.
+router.post('/external-processing/group/:requestNo/request-vendor', requireIssue, async (req, res) => {
     const { requestNo } = req.params;
     const { processVendorId } = req.body;
     if (!processVendorId) {
         return res.status(400).json({ message: 'processVendorId is required' });
     }
+    const rows = await MatWhExternalProcessing.findAll({ where: { requestNo, status: 'draft' } });
+    if (rows.length === 0) {
+        return res.status(404).json({ message: 'No draft coating jobs found for this request number' });
+    }
+    await MatWhExternalProcessing.update({ processVendorId }, { where: { requestNo, status: 'draft' } });
+    res.json({ updated: rows.map((r) => r.id) });
+});
+
+router.post('/external-processing/group/:requestNo/confirm-send', requireIssue, async (req, res) => {
+    const { requestNo } = req.params;
 
     const rows = await MatWhExternalProcessing.findAll({ where: { requestNo, status: 'draft' } });
     if (rows.length === 0) {
         return res.status(404).json({ message: 'No draft coating jobs found for this request number' });
+    }
+
+    // A vendor named earlier via POST .../request-vendor (Mix already
+    // acknowledged/scheduled against it) takes precedence -- the body's
+    // own processVendorId is only required as a fallback for a group that
+    // skipped that step entirely, matching the pre-existing behavior for
+    // every group that doesn't use the new request/acknowledge flow.
+    const processVendorId = rows[0].processVendorId || req.body.processVendorId;
+    if (!processVendorId) {
+        return res.status(400).json({ message: 'processVendorId is required' });
     }
 
     const ready = rows.filter((row) => Number(row.qtySent) > 0);
@@ -1541,7 +1570,7 @@ router.post('/external-processing/group/:requestNo/invoices', requireInvoices, a
     const exists = await MatWhExternalProcessing.count({ where: { requestNo } });
     if (!exists) return res.status(404).json({ message: 'Coating request not found' });
 
-    const { processVendorId, vendorInvoiceNo, invDate, invDueDate, netAmt, notes, invReceivedDate } = req.body;
+    const { processVendorId, vendorInvoiceNo, invDate, invDueDate, paintingCost, notes, invReceivedDate } = req.body;
     if (!vendorInvoiceNo) {
         return res.status(400).json({ message: 'vendorInvoiceNo is required' });
     }
@@ -1549,10 +1578,49 @@ router.post('/external-processing/group/:requestNo/invoices', requireInvoices, a
         requestNo, processVendorId: processVendorId ?? null, vendorInvoiceNo,
         invDate: invDate || null, invDueDate: invDueDate || null,
         invReceivedDate: invReceivedDate ? new Date(invReceivedDate) : new Date(),
-        netAmt: netAmt !== undefined && netAmt !== '' ? Number(netAmt) : null,
+        paintingCost: paintingCost !== undefined && paintingCost !== '' ? Number(paintingCost) : null,
         notes: notes || null, enteredBy: req.user.userId,
     });
     res.status(201).json(row);
+});
+
+// Warehouse verifying and approving one of Mix's invoices -- "the final
+// cost must reflect the price of the original material plus the actual
+// painting cost, retaining the original invoice details" (direct
+// request): materialCost is entered here, by the warehouse, alongside
+// (never overwriting) Mix's own already-submitted paintingCost/
+// vendorInvoiceNo/dates -- totalCost is computed and stored as a stable
+// snapshot rather than re-derived on every read.
+router.post('/external-processing/group/:requestNo/invoices/:invoiceId/approve', requireInvoices, async (req, res) => {
+    const inv = await MatWhCoatingInvoice.findOne({ where: { id: req.params.invoiceId, requestNo: req.params.requestNo } });
+    if (!inv) return res.status(404).json({ message: 'Not found' });
+
+    const materialCost = req.body.materialCost !== undefined && req.body.materialCost !== ''
+        ? Number(req.body.materialCost)
+        : (inv.materialCost ?? 0);
+    const paintingCost = Number(inv.paintingCost ?? 0);
+    await inv.update({
+        materialCost,
+        totalCost: materialCost + paintingCost,
+        approvalStatus: 'approved',
+        approvedBy: req.user.userId,
+        approvedAt: new Date(),
+        rejectionReason: null,
+    });
+    res.json(inv);
+});
+
+router.post('/external-processing/group/:requestNo/invoices/:invoiceId/reject', requireInvoices, async (req, res) => {
+    const inv = await MatWhCoatingInvoice.findOne({ where: { id: req.params.invoiceId, requestNo: req.params.requestNo } });
+    if (!inv) return res.status(404).json({ message: 'Not found' });
+
+    await inv.update({
+        approvalStatus: 'rejected',
+        approvedBy: req.user.userId,
+        approvedAt: new Date(),
+        rejectionReason: req.body.rejectionReason || null,
+    });
+    res.json(inv);
 });
 
 export default router;

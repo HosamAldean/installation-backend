@@ -104,6 +104,11 @@ export const PERMISSIONS = Object.freeze({
     // alone only says "may use the coating-vendor portal at all", not
     // "may see any particular vendor's data".
     MATERIALS_WAREHOUSE_COATING_VENDOR: 'materials_warehouse.coating_vendor',
+    // Invoice creation/management inside that same portal -- mix_manager
+    // only, per direct request ("Mix Employee"/"Mix Manager" as distinct
+    // roles). A mix_employee holds the base key above (request ack,
+    // scheduling, materials-received, ready-for-return) but not this one.
+    MATERIALS_WAREHOUSE_COATING_VENDOR_INVOICE: 'materials_warehouse.coating_vendor_invoice',
 
     // HR self-service on mobile (Leave/Attendance/Transport request forms,
     // My HR Requests) -- distinct from HR_REQUESTS_QUEUE below, which gates
@@ -268,7 +273,7 @@ export const PERMISSION_GROUPS = [
         // owning phase (WH.2/WH.3) ships the actual routes.
         module: 'materialsWarehouse',
         label: 'Materials Warehouse',
-        roles: ['material_user', 'accounting', 'accounting_manager', 'coating_vendor'],
+        roles: ['material_user', 'accounting', 'accounting_manager', 'mix_employee', 'mix_manager'],
         items: [
             { key: PERMISSIONS.MATERIALS_WAREHOUSE_LANDING, labelKey: 'materialsWarehouseLanding' },
             { key: PERMISSIONS.MATERIALS_WAREHOUSE_RECEIVE, labelKey: 'materialsWarehouseReceive' },
@@ -287,6 +292,7 @@ export const PERMISSION_GROUPS = [
             { key: PERMISSIONS.MATERIALS_WAREHOUSE_PROFILE_TRANSFER, labelKey: 'materialsWarehouseProfileTransfer' },
             { key: PERMISSIONS.MATERIALS_WAREHOUSE_PROFILE_CATALOG, labelKey: 'materialsWarehouseProfileCatalog' },
             { key: PERMISSIONS.MATERIALS_WAREHOUSE_COATING_VENDOR, labelKey: 'materialsWarehouseCoatingVendor' },
+            { key: PERMISSIONS.MATERIALS_WAREHOUSE_COATING_VENDOR_INVOICE, labelKey: 'materialsWarehouseCoatingVendorInvoice' },
         ],
     },
     {
