@@ -43,7 +43,10 @@ const requireManageUsers = requirePermission(PERMISSIONS.USERS_MANAGE);
 // hr_factory/hr_ittihad are the 2 other HR-tier roles split out of the old
 // blanket 'hr' (see utils/hrScope.js) -- same admin-only grant/touch
 // restriction applies to both.
-const PRIVILEGED_ROLES = ['admin', 'hr', 'hr_manager', 'hr_factory', 'hr_ittihad'];
+// coating_vendor added alongside the HR tiers -- a real external-company
+// login (Mix), same sensitivity tier as admin/hr: only an actual admin
+// may grant it or touch an existing coating_vendor account.
+const PRIVILEGED_ROLES = ['admin', 'hr', 'hr_manager', 'hr_factory', 'hr_ittihad', 'coating_vendor'];
 
 // Further restricts which roles specific manager roles may assign, on top
 // of the PRIVILEGED_ROLES block above -- e.g. installation_manager can

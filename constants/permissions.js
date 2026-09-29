@@ -97,6 +97,14 @@ export const PERMISSIONS = Object.freeze({
     MATERIALS_WAREHOUSE_PROFILE_TRANSFER: 'materials_warehouse.profile_transfer',
     MATERIALS_WAREHOUSE_PROFILE_CATALOG: 'materials_warehouse.profile_catalog',
 
+    // Mix's (the coating vendor's) own scoped portal -- a real external
+    // login, not an internal staff role. Gates routes/
+    // materialsWarehouseCoatingVendor.js, which further scopes every query
+    // to the caller's own MatWhUserVendorAssignment row(s) -- this key
+    // alone only says "may use the coating-vendor portal at all", not
+    // "may see any particular vendor's data".
+    MATERIALS_WAREHOUSE_COATING_VENDOR: 'materials_warehouse.coating_vendor',
+
     // HR self-service on mobile (Leave/Attendance/Transport request forms,
     // My HR Requests) -- distinct from HR_REQUESTS_QUEUE below, which gates
     // HR *staff* reviewing everyone else's requests, not a worker's own.
@@ -260,7 +268,7 @@ export const PERMISSION_GROUPS = [
         // owning phase (WH.2/WH.3) ships the actual routes.
         module: 'materialsWarehouse',
         label: 'Materials Warehouse',
-        roles: ['material_user', 'accounting', 'accounting_manager'],
+        roles: ['material_user', 'accounting', 'accounting_manager', 'coating_vendor'],
         items: [
             { key: PERMISSIONS.MATERIALS_WAREHOUSE_LANDING, labelKey: 'materialsWarehouseLanding' },
             { key: PERMISSIONS.MATERIALS_WAREHOUSE_RECEIVE, labelKey: 'materialsWarehouseReceive' },
@@ -278,6 +286,7 @@ export const PERMISSION_GROUPS = [
             { key: PERMISSIONS.MATERIALS_WAREHOUSE_PROFILE_COATING, labelKey: 'materialsWarehouseProfileCoating' },
             { key: PERMISSIONS.MATERIALS_WAREHOUSE_PROFILE_TRANSFER, labelKey: 'materialsWarehouseProfileTransfer' },
             { key: PERMISSIONS.MATERIALS_WAREHOUSE_PROFILE_CATALOG, labelKey: 'materialsWarehouseProfileCatalog' },
+            { key: PERMISSIONS.MATERIALS_WAREHOUSE_COATING_VENDOR, labelKey: 'materialsWarehouseCoatingVendor' },
         ],
     },
     {

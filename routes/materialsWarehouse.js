@@ -22,6 +22,7 @@ import { sequelizeUtf8 } from '../config/db.js';
 import { MatWhStore } from '../models/MatWhStore.js';
 import { MatWhItem } from '../models/MatWhItem.js';
 import { MatWhUserStoreAssignment } from '../models/MatWhUserStoreAssignment.js';
+import { MatWhUserVendorAssignment } from '../models/MatWhUserVendorAssignment.js';
 import { MatWhQcCategory } from '../models/MatWhQcCategory.js';
 import { MatWhCategory } from '../models/MatWhCategory.js';
 import { MatWhSubCategory } from '../models/MatWhSubCategory.js';
@@ -198,6 +199,7 @@ function crudRoutes(path, model, pkField, searchFields = []) {
 crudRoutes('stores', MatWhStore, 'id', ['storeCode', 'storeName', 'storeNameAr']);
 crudRoutes('items', MatWhItem, 'id', ['itemCode', 'itemName', 'itemNameAr', 'barcode']);
 crudRoutes('user-store-assignments', MatWhUserStoreAssignment, 'id');
+crudRoutes('user-vendor-assignments', MatWhUserVendorAssignment, 'id');
 crudRoutes('qc-categories', MatWhQcCategory, 'id', ['categoryCode', 'categoryName', 'categoryNameAr']);
 crudRoutes('categories', MatWhCategory, 'id', ['categoryCode', 'categoryName', 'categoryNameAr']);
 crudRoutes('sub-categories', MatWhSubCategory, 'id', ['subCategoryCode', 'subCategoryName', 'subCategoryNameAr']);

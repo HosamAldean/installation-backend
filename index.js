@@ -49,6 +49,7 @@ import materialsWarehouseReportingRouter from "./routes/materialsWarehouseReport
 import materialsWarehouseCutoverRouter from "./routes/materialsWarehouseCutover.js";
 import materialsWarehouseWriteoffRouter from "./routes/materialsWarehouseWriteoff.js";
 import materialsWarehouseProfileStoreRouter from "./routes/materialsWarehouseProfileStore.js";
+import materialsWarehouseCoatingVendorRouter from "./routes/materialsWarehouseCoatingVendor.js";
 import petraErpOrdersRouter from "./routes/petraErpOrders.js";
 import cashFlowRouter from "./routes/cashFlow.js";
 import offersRouter from "./routes/offers.js";
@@ -263,6 +264,14 @@ app.use("/api/materials-warehouse", materialsWarehouseReportingRouter);
 app.use("/api/materials-warehouse", materialsWarehouseCutoverRouter);
 app.use("/api/materials-warehouse", materialsWarehouseWriteoffRouter);
 app.use("/api/materials-warehouse/profile-store", materialsWarehouseProfileStoreRouter);
+// Deliberately its own top-level path, NOT nested under
+// /api/materials-warehouse -- every router already mounted there (see
+// materialsWarehouse.js) applies its own router.use(...) permission gate
+// unconditionally to every request whose path starts with that prefix,
+// regardless of which specific route actually matches, so nesting this
+// vendor-scoped router underneath it would have those internal-staff
+// gates 403 every coating-vendor request before it ever reached here.
+app.use("/api/coating-vendor", materialsWarehouseCoatingVendorRouter);
 app.use("/api/petra-erp/orders", petraErpOrdersRouter);
 app.use("/api/cash-flow", cashFlowRouter);
 app.use("/api/offers", offersRouter);
