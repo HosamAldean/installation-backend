@@ -19,6 +19,7 @@ import { MatWhItemStore } from '../models/MatWhItemStore.js';
 import { MatWhItemVariant } from '../models/MatWhItemVariant.js';
 import { MatWhFeasibilityCheck } from '../models/MatWhFeasibilityCheck.js';
 import { MatWhExternalProcessing } from '../models/MatWhExternalProcessing.js';
+import { MatWhCoatingInvoice } from '../models/MatWhCoatingInvoice.js';
 import { MatWhPurchaseOrder } from '../models/MatWhPurchaseOrder.js';
 import { MatWhPurchaseOrderItem } from '../models/MatWhPurchaseOrderItem.js';
 import { MatWhStockLedger } from '../models/MatWhStockLedger.js';
@@ -38,6 +39,7 @@ const requireReserve = requirePermission(PERMISSIONS.MATERIALS_WAREHOUSE_RESERVE
 const requireIssue = requirePermission(PERMISSIONS.MATERIALS_WAREHOUSE_ISSUE);
 const requireReceive = requirePermission(PERMISSIONS.MATERIALS_WAREHOUSE_RECEIVE);
 const requireReports = requirePermission(PERMISSIONS.MATERIALS_WAREHOUSE_REPORTS);
+const requireInvoices = requirePermission(PERMISSIONS.MATERIALS_WAREHOUSE_INVOICES);
 
 // A handful of read endpoints here are legitimately needed by more than
 // one role (checking availability before reserving vs. before issuing).
@@ -1455,6 +1457,96 @@ router.post('/external-processing/group/:requestNo/confirm-send', requireIssue, 
         updated: toSend.map((row) => row.id),
         skipped: [...skipped, ...heldBack].map((row) => row.id),
     });
+});
+
+// ============================================================
+// Mix (the coating vendor)'s own progress reporting -- separate from the
+// physical send/receive-back above. Staff log what Mix tells them by
+// phone/paper: they got the batch, an ETA + notes, then it's actually
+// done. Operates on the whole requestNo group at once (excludes 'draft'
+// jobs -- nothing's been sent to Mix for those yet, so there's nothing for
+// them to have received).
+// ============================================================
+
+router.post('/external-processing/group/:requestNo/confirm-received', requireAnyOf(
+    PERMISSIONS.MATERIALS_WAREHOUSE_ISSUE,
+    PERMISSIONS.MATERIALS_WAREHOUSE_RECEIVE,
+), async (req, res) => {
+    const { requestNo } = req.params;
+    const where = { requestNo, status: { [Op.ne]: 'draft' } };
+    const rows = await MatWhExternalProcessing.findAll({ where });
+    if (rows.length === 0) {
+        return res.status(404).json({ message: 'No sent coating jobs found for this request number' });
+    }
+    const { notes, estimatedDeliveryDate } = req.body;
+    const updates = {};
+    // Idempotent -- calling this again later (e.g. only to update notes/
+    // ETA) doesn't re-stamp confirmedReceivedAt/By if it's already set.
+    if (!rows[0].confirmedReceivedAt) {
+        updates.confirmedReceivedAt = new Date();
+        updates.confirmedReceivedBy = req.user.userId;
+    }
+    if (notes !== undefined) updates.notes = notes || null;
+    if (estimatedDeliveryDate !== undefined) updates.estimatedDeliveryDate = estimatedDeliveryDate || null;
+    await MatWhExternalProcessing.update(updates, { where });
+    const updated = await MatWhExternalProcessing.findAll({ where: { requestNo } });
+    res.json({ items: updated });
+});
+
+// Mix reporting the coating is actually finished -- distinct from the
+// storekeeper's own physical receive-back (POST /:id/receive), which can
+// trail this by days since the batch still has to physically travel back.
+// Requires confirm-received to have already happened -- can't be
+// "finished" before Mix even confirmed getting the batch.
+router.post('/external-processing/group/:requestNo/actual-finish', requireAnyOf(
+    PERMISSIONS.MATERIALS_WAREHOUSE_ISSUE,
+    PERMISSIONS.MATERIALS_WAREHOUSE_RECEIVE,
+), async (req, res) => {
+    const { requestNo } = req.params;
+    const where = { requestNo, status: { [Op.ne]: 'draft' } };
+    const rows = await MatWhExternalProcessing.findAll({ where });
+    if (rows.length === 0) {
+        return res.status(404).json({ message: 'No sent coating jobs found for this request number' });
+    }
+    if (!rows.every((r) => r.confirmedReceivedAt)) {
+        return res.status(409).json({ message: 'Confirm that Mix received the batch before marking it finished' });
+    }
+    const actualFinishDate = req.body.actualFinishDate ? new Date(req.body.actualFinishDate) : new Date();
+    await MatWhExternalProcessing.update({ actualFinishDate }, { where });
+    const updated = await MatWhExternalProcessing.findAll({ where: { requestNo } });
+    res.json({ items: updated });
+});
+
+// ============================================================
+// Coating invoices -- accounting territory only, same gate as
+// MatWhSupplierInvoice's own routes. Keyed by requestNo rather than a
+// purchaseOrderId, since a coating job doesn't have one (see
+// models/MatWhCoatingInvoice.js's own comment).
+// ============================================================
+
+router.get('/external-processing/group/:requestNo/invoices', requireInvoices, async (req, res) => {
+    const { requestNo } = req.params;
+    const rows = await MatWhCoatingInvoice.findAll({ where: { requestNo }, order: [['id', 'DESC']] });
+    res.json({ items: rows });
+});
+
+router.post('/external-processing/group/:requestNo/invoices', requireInvoices, async (req, res) => {
+    const { requestNo } = req.params;
+    const exists = await MatWhExternalProcessing.count({ where: { requestNo } });
+    if (!exists) return res.status(404).json({ message: 'Coating request not found' });
+
+    const { processVendorId, vendorInvoiceNo, invDate, invDueDate, netAmt, notes, invReceivedDate } = req.body;
+    if (!vendorInvoiceNo) {
+        return res.status(400).json({ message: 'vendorInvoiceNo is required' });
+    }
+    const row = await MatWhCoatingInvoice.create({
+        requestNo, processVendorId: processVendorId ?? null, vendorInvoiceNo,
+        invDate: invDate || null, invDueDate: invDueDate || null,
+        invReceivedDate: invReceivedDate ? new Date(invReceivedDate) : new Date(),
+        netAmt: netAmt !== undefined && netAmt !== '' ? Number(netAmt) : null,
+        notes: notes || null, enteredBy: req.user.userId,
+    });
+    res.status(201).json(row);
 });
 
 export default router;
