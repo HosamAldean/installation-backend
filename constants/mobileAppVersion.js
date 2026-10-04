@@ -46,3 +46,17 @@ export const DOWNLOAD_URL = "https://github.com/HosamAldean/petra-mobile-release
 // points at GET /update instead, a small friendly HTML page (see index.js)
 // that explains what's happening and links to DOWNLOAD_URL itself.
 export const UPDATE_PAGE_URL = "https://petralu.duckdns.org:4000/update";
+
+// Drafted "What's new" copy for the v1.0.7 release (see mobile/CHANGELOG.md),
+// matching the inline <strong>What's new:</strong> paragraph style GET
+// /update (index.js) already uses for v1.0.6. Deliberately NOT referenced
+// by that route yet -- prepared and ready, not live. Going live for real
+// means, all together in one change: (1) bump LATEST_VERSION_CODE/
+// LATEST_VERSION_NAME/MIN_SUPPORTED_VERSION_CODE above, (2) point
+// DOWNLOAD_URL at the real published v1.0.7 release asset, (3) swap GET
+// /update's hardcoded English/Arabic "What's new" lines to these two
+// strings. Until then this sits unused and changes nothing live.
+export const PENDING_V107_WHATS_NEW_EN =
+    "Materials Warehouse (scan to issue, receive, and send/receive with the coating company, browse reservations, and register new items by barcode), fuller detail in My HR Requests, and sorting in Manager Approvals.";
+export const PENDING_V107_WHATS_NEW_AR =
+    "مستودع المواد (مسح لإصدار واستلام المواد، والإرسال والاستلام من شركة الطلاء، وتصفح الحجوزات، وتسجيل أصناف جديدة عبر الباركود)، وتفاصيل أوفى في طلباتي للموارد البشرية، وفرز في موافقات المدير.";
