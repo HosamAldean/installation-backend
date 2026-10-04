@@ -13,7 +13,7 @@ import cookieParser from 'cookie-parser';
 import { monitorLog } from './middleware/monitorLog.js';
 import { blockIpMiddleware } from './middleware/ipBlock.js';
 import { startSecurityMonitor } from './services/securityMonitor.js';
-import { LATEST_VERSION_CODE, LATEST_VERSION_NAME, MIN_SUPPORTED_VERSION_CODE, DOWNLOAD_URL, UPDATE_PAGE_URL } from './constants/mobileAppVersion.js';
+import { LATEST_VERSION_CODE, LATEST_VERSION_NAME, MIN_SUPPORTED_VERSION_CODE, DOWNLOAD_URL, UPDATE_PAGE_URL, WHATS_NEW_EN, WHATS_NEW_AR } from './constants/mobileAppVersion.js';
 
 // import routes
 import followUpRouter from "./routes/followUp.js";
@@ -215,7 +215,7 @@ app.get('/update', (req, res) => {
     <p>Get the Petra Mobile app for field ops and HR self-service — or update it if you already have it installed.</p>
     <a class="btn" href="${DOWNLOAD_URL}">Download v${LATEST_VERSION_NAME}</a>
     <div class="version">Version ${LATEST_VERSION_NAME}</div>
-    <p><strong>What's new:</strong> Payslip (view your monthly salary breakdown, when enabled by HR).</p>
+    <p><strong>What's new:</strong> ${WHATS_NEW_EN}</p>
     <ol class="steps">
       <li>Tap "Download" above.</li>
       <li>Open the downloaded file from your notifications or Downloads folder.</li>
@@ -226,7 +226,7 @@ app.get('/update', (req, res) => {
       <h1>تطبيق بترا موبايل</h1>
       <p>حمّل تطبيق بترا موبايل للعمل الميداني والخدمة الذاتية للموارد البشرية — أو حدّثه إذا كان مثبتًا لديك بالفعل.</p>
       <a class="btn" href="${DOWNLOAD_URL}">تحميل الإصدار ${LATEST_VERSION_NAME}</a>
-      <p><strong>الجديد في هذا الإصدار:</strong> قسيمة الراتب (عرض تفاصيل راتبك الشهري، عند تفعيلها من قبل الموارد البشرية).</p>
+      <p><strong>الجديد في هذا الإصدار:</strong> ${WHATS_NEW_AR}</p>
       <ol class="steps">
         <li>اضغط على زر "تحميل" أعلاه.</li>
         <li>افتح الملف الذي تم تحميله من الإشعارات أو مجلد التنزيلات.</li>
