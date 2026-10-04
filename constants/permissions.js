@@ -149,6 +149,17 @@ export const PERMISSIONS = Object.freeze({
     // on/off control on top of that existing scoping, same pattern as
     // every other module.
     USERS_MANAGE: 'users.manage',
+    // Split out of USERS_MANAGE on direct request -- a role can view/edit
+    // the users within its scope (USERS_MANAGE, still required to reach
+    // the page at all) without also being able to create brand-new
+    // accounts. Checked in ADDITION to USERS_MANAGE on POST /users, not
+    // instead of it.
+    USERS_CREATE: 'users.create',
+    // Previously hardcoded admin-only (authorizeRoles('admin') on POST
+    // /users/:id/reset-password) with no grant path at all. Opened up on
+    // direct request, scoped the same way PATCH /:id already is (own
+    // reports only, never a privileged account) -- see routes/users.js.
+    USERS_RESET_PASSWORD: 'users.reset_password',
 });
 
 // Every role that can be granted a permission. `admin` is deliberately
@@ -335,7 +346,11 @@ export const PERMISSION_GROUPS = [
             'hr',
             'hr_manager',
         ],
-        items: [{ key: PERMISSIONS.USERS_MANAGE, labelKey: 'usersManage' }],
+        items: [
+            { key: PERMISSIONS.USERS_MANAGE, labelKey: 'usersManage' },
+            { key: PERMISSIONS.USERS_CREATE, labelKey: 'usersCreate' },
+            { key: PERMISSIONS.USERS_RESET_PASSWORD, labelKey: 'usersResetPassword' },
+        ],
     },
 ];
 

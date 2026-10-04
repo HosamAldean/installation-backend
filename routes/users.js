@@ -28,6 +28,16 @@ const requireAdmin = authorizeRoles('admin');
 // still decides *whose* accounts a manager can touch; this decides
 // whether they can reach these endpoints at all.
 const requireManageUsers = requirePermission(PERMISSIONS.USERS_MANAGE);
+// Checked IN ADDITION to requireManageUsers on POST / (create) -- a role
+// can hold USERS_MANAGE (reach the page, view/edit its own scope) without
+// also being able to create brand-new accounts, per direct request.
+const requireCreateUsers = requirePermission(PERMISSIONS.USERS_CREATE);
+// Replaces the old hardcoded requireAdmin on POST /:id/reset-password --
+// admin still always passes (requirePermission's own bypass), but this
+// now also admits whichever roles an admin grants it to. The route itself
+// still re-checks manager/HR scope the same way PATCH /:id does, since
+// this key alone only says "may reset *some* password", not "any".
+const requireResetPassword = requirePermission(PERMISSIONS.USERS_RESET_PASSWORD);
 
 // Privileged roles that only an actual admin account may grant, revoke, or
 // touch at all -- CORRECTED: this whole file used to gate every write
@@ -211,7 +221,7 @@ router.get('/', requireAuth, requireManageUsers, async (req, res) => {
    own reports; only an actual admin may assign an hr/admin role --
    see PRIVILEGED_ROLES/hasCompanyWideScope above)
 ---------------------------------- */
-router.post('/', requireAuth, requireManageUsers, async (req, res) => {
+router.post('/', requireAuth, requireManageUsers, requireCreateUsers, async (req, res) => {
     try {
         const { empNo, role = 'installation_employee', teamId: bodyTeamId, password: bodyPassword, assignedStore } = req.body;
         const isAdmin = req.user.role === 'admin';
@@ -442,7 +452,7 @@ router.patch('/:id', requireAuth, async (req, res) => {
 /* ----------------------------------
    RESET password (Admin)
 ---------------------------------- */
-router.post('/:id/reset-password', requireAuth, requireAdmin, async (req, res) => {
+router.post('/:id/reset-password', requireAuth, requireResetPassword, async (req, res) => {
     try {
         const { password } = req.body;
         if (!password || password.length < 6) {
@@ -451,6 +461,23 @@ router.post('/:id/reset-password', requireAuth, requireAdmin, async (req, res) =
         const user = await User.findByPk(req.params.id);
         if (!user)
             return res.status(404).json({ success: false, message: 'User not found' });
+
+        // Non-admin grant holders only reach their own scope, mirroring
+        // PATCH /:id above -- a privileged account (admin/HR/Mix) is
+        // always off-limits, and anyone without company-wide scope needs
+        // a real supervisor/HR relationship to the target.
+        if (req.user.role !== 'admin') {
+            if (PRIVILEGED_ROLES.includes(user.role)) {
+                return res.status(403).json({ success: false, message: 'Forbidden' });
+            }
+            if (!hasCompanyWideScope(req.user.role)) {
+                const targetEmpNo = Number(user.username);
+                const inScope = !isNaN(targetEmpNo) && await isInManagerScope(req, targetEmpNo);
+                if (!inScope) {
+                    return res.status(403).json({ success: false, message: 'Forbidden' });
+                }
+            }
+        }
 
         user.password = await bcrypt.hash(password, 10);
         await user.save();
