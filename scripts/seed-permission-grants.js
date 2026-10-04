@@ -174,6 +174,38 @@ const SEED_GRANTS = [
         "hr",
         "hr_manager",
     ]],
+    // USERS_CREATE split out of USERS_MANAGE (constants/permissions.js) --
+    // POST /users now checks both, so every role that could already create
+    // accounts today needs this seeded alongside USERS_MANAGE, or this
+    // split would silently take away working functionality the moment the
+    // route starts checking it.
+    [PERMISSIONS.USERS_CREATE, [
+        "installation_manager",
+        "shipping_manager",
+        "sales_manager",
+        "accounting_manager",
+        "project_manager",
+        "hr_factory",
+        "hr_ittihad",
+        "hr",
+        "hr_manager",
+    ]],
+    // USERS_RESET_PASSWORD -- was hardcoded admin-only with zero grant
+    // path before this key existed. Opened up to the same roles as
+    // USERS_MANAGE/USERS_CREATE per explicit request, scoped the same way
+    // PATCH /:id already is (own reports only, never a privileged
+    // account -- see routes/users.js).
+    [PERMISSIONS.USERS_RESET_PASSWORD, [
+        "installation_manager",
+        "shipping_manager",
+        "sales_manager",
+        "accounting_manager",
+        "project_manager",
+        "hr_factory",
+        "hr_ittihad",
+        "hr",
+        "hr_manager",
+    ]],
 ];
 
 const run = async () => {
