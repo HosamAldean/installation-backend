@@ -52,6 +52,6 @@ export const UPDATE_PAGE_URL = "https://petralu.duckdns.org:4000/update";
 // <strong>What's new:</strong> paragraph. Update both strings together
 // with the version bump above every time a new release goes live.
 export const WHATS_NEW_EN =
-    "Materials Warehouse (scan to issue, receive, and send/receive with the coating company, browse reservations, and register new items by barcode), fuller detail in My HR Requests, and sorting in Manager Approvals.";
+    "My HR Requests now show full request detail, including reviewer notes and hours for overtime/absence entries.";
 export const WHATS_NEW_AR =
-    "مستودع المواد (مسح لإصدار واستلام المواد، والإرسال والاستلام من شركة الطلاء، وتصفح الحجوزات، وتسجيل أصناف جديدة عبر الباركود)، وتفاصيل أوفى في طلباتي للموارد البشرية، وفرز في موافقات المدير.";
+    "طلبات الموارد البشرية الخاصة بي تعرض الآن تفاصيل الطلب كاملة، بما فيها ملاحظات المراجع وساعات العمل الإضافي والغياب.";
