@@ -48,6 +48,7 @@ import materialsWarehouseCostingRouter from "./routes/materialsWarehouseCosting.
 import materialsWarehouseReportingRouter from "./routes/materialsWarehouseReporting.js";
 import materialsWarehouseCutoverRouter from "./routes/materialsWarehouseCutover.js";
 import materialsWarehouseWriteoffRouter from "./routes/materialsWarehouseWriteoff.js";
+import materialsWarehouseStockCountRouter from "./routes/materialsWarehouseStockCount.js";
 import materialsWarehouseProfileStoreRouter from "./routes/materialsWarehouseProfileStore.js";
 import materialsWarehouseCoatingVendorRouter from "./routes/materialsWarehouseCoatingVendor.js";
 import petraErpOrdersRouter from "./routes/petraErpOrders.js";
@@ -263,6 +264,7 @@ app.use("/api/materials-warehouse", materialsWarehouseCostingRouter);
 app.use("/api/materials-warehouse", materialsWarehouseReportingRouter);
 app.use("/api/materials-warehouse", materialsWarehouseCutoverRouter);
 app.use("/api/materials-warehouse", materialsWarehouseWriteoffRouter);
+app.use("/api/materials-warehouse", materialsWarehouseStockCountRouter);
 app.use("/api/materials-warehouse/profile-store", materialsWarehouseProfileStoreRouter);
 // Deliberately its own top-level path, NOT nested under
 // /api/materials-warehouse -- every router already mounted there (see

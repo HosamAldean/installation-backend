@@ -77,6 +77,12 @@ export const PERMISSIONS = Object.freeze({
     MATERIALS_WAREHOUSE_WRITEOFF: 'materials_warehouse.writeoff',
     MATERIALS_WAREHOUSE_WRITEOFF_APPROVE: 'materials_warehouse.writeoff_approve',
 
+    // Stock Count (جرد) -- same split again: .stock_count is the counters
+    // (create a sheet, count blind, submit); .stock_count_approve sees the
+    // system qty/variance and approves, which posts the adjustments.
+    MATERIALS_WAREHOUSE_STOCK_COUNT: 'materials_warehouse.stock_count',
+    MATERIALS_WAREHOUSE_STOCK_COUNT_APPROVE: 'materials_warehouse.stock_count_approve',
+
     // Store Manager dashboard (reservation status/dates overview) and the
     // internal storekeeper->manager->purchasing review chain an auto-
     // generated shortfall PO now goes through before purchasing acts on it
@@ -297,6 +303,8 @@ export const PERMISSION_GROUPS = [
             { key: PERMISSIONS.MATERIALS_WAREHOUSE_REPORTS, labelKey: 'materialsWarehouseReports' },
             { key: PERMISSIONS.MATERIALS_WAREHOUSE_WRITEOFF, labelKey: 'materialsWarehouseWriteoff' },
             { key: PERMISSIONS.MATERIALS_WAREHOUSE_WRITEOFF_APPROVE, labelKey: 'materialsWarehouseWriteoffApprove' },
+            { key: PERMISSIONS.MATERIALS_WAREHOUSE_STOCK_COUNT, labelKey: 'materialsWarehouseStockCount' },
+            { key: PERMISSIONS.MATERIALS_WAREHOUSE_STOCK_COUNT_APPROVE, labelKey: 'materialsWarehouseStockCountApprove' },
             { key: PERMISSIONS.MATERIALS_WAREHOUSE_STORE_MANAGER, labelKey: 'materialsWarehouseStoreManager' },
             { key: PERMISSIONS.MATERIALS_WAREHOUSE_PURCHASING, labelKey: 'materialsWarehousePurchasing' },
             { key: PERMISSIONS.MATERIALS_WAREHOUSE_PROFILE_COATING, labelKey: 'materialsWarehouseProfileCoating' },
