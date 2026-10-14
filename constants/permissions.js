@@ -83,6 +83,11 @@ export const PERMISSIONS = Object.freeze({
     MATERIALS_WAREHOUSE_STOCK_COUNT: 'materials_warehouse.stock_count',
     MATERIALS_WAREHOUSE_STOCK_COUNT_APPROVE: 'materials_warehouse.stock_count_approve',
 
+    // Store-to-store transfer -- one key for both steps (send from the
+    // source store, receive at the destination). No approval step by
+    // design; the receiving store's confirmation is the control.
+    MATERIALS_WAREHOUSE_TRANSFER: 'materials_warehouse.transfer',
+
     // Store Manager dashboard (reservation status/dates overview) and the
     // internal storekeeper->manager->purchasing review chain an auto-
     // generated shortfall PO now goes through before purchasing acts on it
@@ -305,6 +310,7 @@ export const PERMISSION_GROUPS = [
             { key: PERMISSIONS.MATERIALS_WAREHOUSE_WRITEOFF_APPROVE, labelKey: 'materialsWarehouseWriteoffApprove' },
             { key: PERMISSIONS.MATERIALS_WAREHOUSE_STOCK_COUNT, labelKey: 'materialsWarehouseStockCount' },
             { key: PERMISSIONS.MATERIALS_WAREHOUSE_STOCK_COUNT_APPROVE, labelKey: 'materialsWarehouseStockCountApprove' },
+            { key: PERMISSIONS.MATERIALS_WAREHOUSE_TRANSFER, labelKey: 'materialsWarehouseTransfer' },
             { key: PERMISSIONS.MATERIALS_WAREHOUSE_STORE_MANAGER, labelKey: 'materialsWarehouseStoreManager' },
             { key: PERMISSIONS.MATERIALS_WAREHOUSE_PURCHASING, labelKey: 'materialsWarehousePurchasing' },
             { key: PERMISSIONS.MATERIALS_WAREHOUSE_PROFILE_COATING, labelKey: 'materialsWarehouseProfileCoating' },
