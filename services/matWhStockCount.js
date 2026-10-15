@@ -12,7 +12,7 @@ import { MatWhItem } from '../models/MatWhItem.js';
 import { MatWhItemVariant } from '../models/MatWhItemVariant.js';
 import { MatWhItemCost } from '../models/MatWhItemCost.js';
 import {
-    postLedgerMovement, applyReceiptCost, getPhysicalBalance, getAlreadyReserved, normalizeColor,
+    postLedgerMovement, applyReceiptCost, getPhysicalBalance, getAlreadyReserved, normalizeColor, lockRow,
 } from './matWhLedger.js';
 import { MatWhStoreTransfer } from '../models/MatWhStoreTransfer.js';
 import { MatWhStoreTransferLine } from '../models/MatWhStoreTransferLine.js';
@@ -334,6 +334,8 @@ export async function approveStockCount(stockCountId, decidedBy, { unitCosts, no
 
     const t = await sequelizeUtf8.transaction();
     try {
+        const locked = await lockRow(MatWhStockCount, count.id, t);
+        if (locked.status !== 'submitted') throw httpError(409, `Not allowed while the count is '${locked.status}'`);
         for (const line of lines) {
             const variance = line.varianceQty ?? 0;
             if (Math.abs(variance) < 0.000001) continue;

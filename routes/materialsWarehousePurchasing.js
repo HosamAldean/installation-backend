@@ -33,7 +33,7 @@ import { MatWhStore } from '../models/MatWhStore.js';
 import { MatWhItemStore } from '../models/MatWhItemStore.js';
 import { Vendor } from '../models/Vendor.js';
 import { User } from '../models/User.js';
-import { postLedgerMovement, applyReceiptCost, normalizeColor } from '../services/matWhLedger.js';
+import { postLedgerMovement, applyReceiptCost, normalizeColor, lockRow } from '../services/matWhLedger.js';
 import { createCoatingJob, requireVariantBarcode } from '../services/matWhReservations.js';
 import { MatWhReservationItem } from '../models/MatWhReservationItem.js';
 
@@ -655,6 +655,10 @@ router.post('/goods-receipts', requireReceive, async (req, res) => {
 
     const t = await sequelizeUtf8.transaction();
     try {
+        // PO row lock first (see lockRow): serializes receipts against the
+        // same PO so the received-so-far cap below can't be passed twice by
+        // a double submit.
+        await lockRow(MatWhPurchaseOrder, po.id, t);
         const gr = await MatWhGoodsReceipt.create({
             purchaseOrderId, shipmentRef, landCost, locExpenses, othExpenses,
             receivedDate: receivedDate ? new Date(receivedDate) : new Date(),

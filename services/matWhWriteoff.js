@@ -8,7 +8,7 @@ import { MatWhWriteoffRequest } from '../models/MatWhWriteoffRequest.js';
 import { MatWhWriteoffRequestItem } from '../models/MatWhWriteoffRequestItem.js';
 import { MatWhWriteoffReport } from '../models/MatWhWriteoffReport.js';
 import { MatWhWriteoffReportItem } from '../models/MatWhWriteoffReportItem.js';
-import { postLedgerMovement, getPhysicalBalance, normalizeColor } from './matWhLedger.js';
+import { postLedgerMovement, getPhysicalBalance, normalizeColor, lockRow } from './matWhLedger.js';
 
 const EPS = 0.000001;
 
@@ -139,6 +139,12 @@ export async function createWriteoffReport({ writeoffRequestId, reportNo, destro
 
     const t = await sequelizeUtf8.transaction();
     try {
+        const locked = await lockRow(MatWhWriteoffRequest, request.id, t);
+        if (locked.status !== 'approved') {
+            const err = new Error(`Cannot file a report against a request in status '${locked.status}'`);
+            err.status = 409;
+            throw err;
+        }
         const report = await MatWhWriteoffReport.create({
             writeoffRequestId, reportNo, destroyedDate,
             createdBy: createdBy ?? null, status: 'recorded',

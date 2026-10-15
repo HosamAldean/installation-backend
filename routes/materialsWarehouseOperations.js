@@ -23,7 +23,7 @@ import { MatWhCoatingInvoice } from '../models/MatWhCoatingInvoice.js';
 import { MatWhPurchaseOrder } from '../models/MatWhPurchaseOrder.js';
 import { MatWhPurchaseOrderItem } from '../models/MatWhPurchaseOrderItem.js';
 import { MatWhStockLedger } from '../models/MatWhStockLedger.js';
-import { postLedgerMovement, getAvailableToReserve, getAlreadyReserved, getPendingQty, getPhysicalBalance, normalizeColor, getAvailableColorsForItem } from '../services/matWhLedger.js';
+import { postLedgerMovement, getAvailableToReserve, getAlreadyReserved, getPendingQty, getPhysicalBalance, normalizeColor, getAvailableColorsForItem, lockRow } from '../services/matWhLedger.js';
 import {
     createReservationHeader, submitReservation,
     confirmReservation, rejectReservation,
@@ -930,10 +930,11 @@ router.post('/reservation-items/:lineId/issue', requireIssue, async (req, res) =
 // materialsWarehousePurchasing.js's own getReceivedSoFar for goods
 // receipts. Used to stop a project from "returning" more than it was
 // actually issued.
-async function getReturnedSoFar(lineId) {
+async function getReturnedSoFar(lineId, transaction) {
     const rows = await MatWhStockLedger.findAll({
         where: { refType: 'reservation_item_return', refId: lineId },
         attributes: ['qty'],
+        transaction,
     });
     return rows.reduce((sum, r) => sum + Number(r.qty), 0);
 }
@@ -958,21 +959,32 @@ router.post('/reservation-items/:lineId/return', requireReceive, async (req, res
     if (!Number.isFinite(qty) || qty <= 0) {
         return res.status(400).json({ message: 'qty must be a positive number' });
     }
-    const returnedSoFar = await getReturnedSoFar(line.id);
-    if (returnedSoFar + qty > Number(line.qtyReserved) + 0.0001) {
-        return res.status(409).json({
-            message: `Only ${Number(line.qtyReserved) - returnedSoFar} still returnable on this line (issued ${line.qtyReserved}, already returned ${returnedSoFar})`,
-        });
-    }
-
     const header = await MatWhReservationHeader.findByPk(line.reservationHeaderId);
-    const ledgerRow = await postLedgerMovement({
-        storeId: line.storeId, itemId: line.itemId, projectId: header?.projectId ?? null,
-        qty, direction: 'in', docType: 'return',
-        refType: 'reservation_item_return', refId: line.id,
-        performedBy: req.user.userId, color: line.color ?? null, lengthMm: line.lengthMm ?? null,
-    });
-    res.status(201).json({ ledgerRow, returnedSoFar: returnedSoFar + qty, qtyReserved: line.qtyReserved });
+    // Lock + re-sum inside the transaction (see lockRow) so two concurrent
+    // returns can't both pass the "still returnable" check.
+    const t = await sequelizeUtf8.transaction();
+    try {
+        await lockRow(MatWhReservationItem, line.id, t);
+        const returnedSoFar = await getReturnedSoFar(line.id, t);
+        if (returnedSoFar + qty > Number(line.qtyReserved) + 0.0001) {
+            await t.rollback();
+            return res.status(409).json({
+                message: `Only ${Number(line.qtyReserved) - returnedSoFar} still returnable on this line (issued ${line.qtyReserved}, already returned ${returnedSoFar})`,
+            });
+        }
+        const ledgerRow = await postLedgerMovement({
+            storeId: line.storeId, itemId: line.itemId, projectId: header?.projectId ?? null,
+            qty, direction: 'in', docType: 'return',
+            refType: 'reservation_item_return', refId: line.id,
+            performedBy: req.user.userId, color: line.color ?? null, lengthMm: line.lengthMm ?? null,
+        }, t);
+        await t.commit();
+        res.status(201).json({ ledgerRow, returnedSoFar: returnedSoFar + qty, qtyReserved: line.qtyReserved });
+    } catch (err) {
+        await t.rollback();
+        console.error('Return failed:', err);
+        res.status(500).json({ message: 'Failed to record return' });
+    }
 });
 
 // Releases every held line on a confirmed reservation -- e.g. the project
@@ -1161,22 +1173,34 @@ router.post('/external-processing', requireIssue, async (req, res) => {
     }
     const sourceColor = normalizeColor(req.body.color ? String(req.body.color) : null);
     const lengthMm = req.body.lengthMm ? Number(req.body.lengthMm) : null;
-    const available = await getAvailableToReserve(storeId, itemId, sourceColor, lengthMm ?? undefined);
-    if (Number(qtySent) > available) {
-        return res.status(409).json({ message: `Only ${available} available to send`, available });
-    }
+    // Item row lock first (see lockRow), so two concurrent sends of the
+    // same item can't both pass the availability check.
+    const t = await sequelizeUtf8.transaction();
+    try {
+        await lockRow(MatWhItem, itemId, t);
+        const available = await getAvailableToReserve(storeId, itemId, sourceColor, lengthMm ?? undefined);
+        if (Number(qtySent) > available) {
+            await t.rollback();
+            return res.status(409).json({ message: `Only ${available} available to send`, available });
+        }
 
-    const row = await createWithGeneratedNo(MatWhExternalProcessing, 'requestNo', 'COAT', {
-        itemId, storeId, processVendorId: processVendorId ?? null, qtySent,
-        lengthMm, sourceColor,
-        sentDate: new Date(), sentBy: req.user.userId,
-    });
-    await postLedgerMovement({
-        storeId, itemId, qty: qtySent, direction: 'out', docType: 'external_send',
-        refType: 'external_processing', refId: row.id, performedBy: req.user.userId,
-        color: sourceColor, lengthMm,
-    });
-    res.status(201).json(row);
+        const row = await createWithGeneratedNo(MatWhExternalProcessing, 'requestNo', 'COAT', {
+            itemId, storeId, processVendorId: processVendorId ?? null, qtySent,
+            lengthMm, sourceColor,
+            sentDate: new Date(), sentBy: req.user.userId,
+        }, t);
+        await postLedgerMovement({
+            storeId, itemId, qty: qtySent, direction: 'out', docType: 'external_send',
+            refType: 'external_processing', refId: row.id, performedBy: req.user.userId,
+            color: sourceColor, lengthMm,
+        }, t);
+        await t.commit();
+        res.status(201).json(row);
+    } catch (err) {
+        await t.rollback();
+        console.error('External send failed:', err);
+        res.status(500).json({ message: 'Failed to send for processing' });
+    }
 });
 
 router.post('/external-processing/:id/receive', requireReceive, async (req, res) => {
@@ -1201,13 +1225,29 @@ router.post('/external-processing/:id/receive', requireReceive, async (req, res)
         return res.status(err.status || 500).json({ message: err.message || 'Failed to receive' });
     }
 
-    await row.update({ qtyReceived, status: 'received', receivedDate: new Date(), receivedBy: req.user.userId });
-    if (qtyReceived > 0) {
-        await postLedgerMovement({
-            storeId: row.storeId, itemId: row.itemId, qty: qtyReceived, direction: 'in',
-            docType: 'external_receive', refType: 'external_processing', refId: row.id,
-            performedBy: req.user.userId, color: row.targetColor ?? null, lengthMm: row.lengthMm ?? null,
-        });
+    // Lock + re-check status inside the transaction (see lockRow) so a
+    // double submit can't post external_receive twice.
+    const t = await sequelizeUtf8.transaction();
+    try {
+        const locked = await lockRow(MatWhExternalProcessing, row.id, t);
+        if (locked.status !== 'sent') {
+            await t.rollback();
+            return res.status(409).json({ message: `Cannot receive a job in status '${locked.status}'` });
+        }
+        await locked.update({ qtyReceived, status: 'received', receivedDate: new Date(), receivedBy: req.user.userId }, { transaction: t });
+        if (qtyReceived > 0) {
+            await postLedgerMovement({
+                storeId: row.storeId, itemId: row.itemId, qty: qtyReceived, direction: 'in',
+                docType: 'external_receive', refType: 'external_processing', refId: row.id,
+                performedBy: req.user.userId, color: row.targetColor ?? null, lengthMm: row.lengthMm ?? null,
+            }, t);
+        }
+        await t.commit();
+        await row.reload();
+    } catch (err) {
+        await t.rollback();
+        console.error('External receive failed:', err);
+        return res.status(500).json({ message: 'Failed to receive' });
     }
 
     // Optional -- per direct request, where the now-coated material was put
@@ -1303,6 +1343,11 @@ router.post('/external-processing/:id/confirm-send', requireIssue, async (req, r
     // matches targetColor, a check this change doesn't touch.
     const t = await sequelizeUtf8.transaction();
     try {
+        const locked = await lockRow(MatWhExternalProcessing, row.id, t);
+        if (locked.status !== 'draft') {
+            await t.rollback();
+            return res.status(409).json({ message: `Cannot confirm-send a job in status '${locked.status}'` });
+        }
         await splitOffRemainder(row, qtySent, t);
         await postLedgerMovement({
             storeId: row.storeId, itemId: row.itemId, qty: qtySent, direction: 'out',
@@ -1450,6 +1495,15 @@ router.post('/external-processing/group/:requestNo/confirm-send', requireIssue, 
     // matches targetColor, a check this change doesn't touch.
     const t = await sequelizeUtf8.transaction();
     try {
+        // Lock every job first, in id order, and make sure none was sent
+        // by a concurrent submit since the list above was read.
+        for (const row of [...toSend].sort((a, b) => a.id - b.id)) {
+            const locked = await lockRow(MatWhExternalProcessing, row.id, t);
+            if (locked.status !== 'draft') {
+                await t.rollback();
+                return res.status(409).json({ message: `Job ${row.requestNo} is already '${locked.status}' -- reload and try again` });
+            }
+        }
         for (const row of toSend) {
             const sourceColor = sourceColorFor(row);
             const sendQty = sendQtyFor(row);
