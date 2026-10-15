@@ -459,25 +459,37 @@ async function resolveTeamId(stepId) {
 // Resolves a logged-in user's real team_id. `req.user.teamId` from the JWT
 // is always absent by design (InsUser.teamId is stale/unreliable — see the
 // comment in auth.js login), so the real team is looked up via
-// instTeams.leader_emp_no = assignedEmpNo, same as every write path that
-// needs a team_id (checkpoints, step updates, etc.).
+// assignedEmpNo, same as every write path that needs a team_id
+// (checkpoints, step updates, location pings, etc.).
 //
-// Deliberately leader-only, not "any member of instTeamMembers" — per
-// explicit direction (2026-09-09) this stays restricted to the team
-// leader for now; broader per-employee site-access/tracking is a future
-// task, not this fix. A regular (non-leader) team member's calls into
-// this always resolve null, and the routes that depend on it correctly
-// reject them -- see POST /location's NO_TEAM_ASSIGNED code, which exists
-// specifically so the mobile client can stop retrying that permanent
-// condition instead of hammering this endpoint.
+// Any member of a team resolves to it, not just the leader (opened up
+// 2026-10-15; was leader-only since 2026-09-09). The leader match on
+// instTeams.leader_emp_no comes first since a leader can lack an
+// instTeamMembers row (seen live: team 19). Otherwise the newest
+// instTeamMembers row wins -- a member moved between teams can leave a
+// stale old row behind. An employee on no team still resolves null, and
+// POST /location's NO_TEAM_ASSIGNED code still tells the mobile client to
+// stop retrying.
+//
+// services/selfAssignUnit.js keeps its own leader-only copy on purpose:
+// self-assigning a scanned unit to a team is a leader-only business rule.
 async function resolveTeamIdForUser(reqUser) {
     if (reqUser.teamId) return reqUser.teamId;
     if (!reqUser.assignedEmpNo) return null;
-    const rows = await sequelize.query(
+    const replacements = { assignedEmpNo: reqUser.assignedEmpNo };
+    const led = await sequelize.query(
         `SELECT id FROM IIT_Petra.instTeams WHERE leader_emp_no = :assignedEmpNo LIMIT 1`,
-        { replacements: { assignedEmpNo: reqUser.assignedEmpNo }, type: QueryTypes.SELECT }
+        { replacements, type: QueryTypes.SELECT }
     );
-    return rows[0]?.id || null;
+    if (led[0]?.id) return led[0].id;
+    const member = await sequelize.query(
+        `SELECT m.team_id FROM IIT_Petra.instTeamMembers m
+         JOIN IIT_Petra.instTeams t ON t.id = m.team_id
+         WHERE m.emp_no = :assignedEmpNo
+         ORDER BY m.assigned_at DESC, m.id DESC LIMIT 1`,
+        { replacements, type: QueryTypes.SELECT }
+    );
+    return member[0]?.team_id || null;
 }
 
 // Workers hit /order-step/* with a client-supplied stepId and nothing
@@ -1819,10 +1831,9 @@ router.post("/location", authenticateToken, async (req, res) => {
         const teamId = await resolveTeamIdForUser(req.user);
         if (!teamId) {
             // Distinct `code` (not just the message) so the mobile client can
-            // reliably tell "this account will never resolve a team" (a
-            // regular, non-leader team member -- resolveTeamIdForUser only
-            // matches instTeams.leader_emp_no, a deliberate restriction, see
-            // that function's own comment) apart from a transient failure
+            // reliably tell "this account will never resolve a team" (an
+            // employee on no team at all -- see resolveTeamIdForUser)
+            // apart from a transient failure
             // worth a normal retry. Without this, mobile/tasks/locationTask.ts
             // has no way to distinguish the two and keeps retrying a call
             // that can never succeed for that account -- confirmed live
