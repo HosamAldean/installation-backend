@@ -35,6 +35,7 @@ import { Vendor } from '../models/Vendor.js';
 import { User } from '../models/User.js';
 import { postLedgerMovement, applyReceiptCost, normalizeColor, lockRow } from '../services/matWhLedger.js';
 import { denyStore } from '../services/matWhStoreAccess.js';
+import { normalizeRequestKey, findRequestKey, claimRequestKey } from '../services/matWhRequestKeys.js';
 import { createCoatingJob, requireVariantBarcode } from '../services/matWhReservations.js';
 import { MatWhReservationItem } from '../models/MatWhReservationItem.js';
 
@@ -654,6 +655,13 @@ router.post('/goods-receipts', requireReceive, async (req, res) => {
     if (!po) return res.status(404).json({ message: 'Purchase order not found' });
     if (await denyStore(req, res, po.destinationStoreId)) return;
 
+    // The phone's per-tap key (see services/matWhRequestKeys.js): a replay of
+    // a receipt already saved answers with that receipt instead of receiving
+    // the same goods again.
+    const requestKey = normalizeRequestKey(req.body.requestKey);
+    const applied = await findRequestKey(requestKey);
+    if (applied) return res.status(200).json({ id: applied.refId, alreadyApplied: true });
+
     const poItems = await MatWhPurchaseOrderItem.findAll({ where: { purchaseOrderId } });
     const poItemById = new Map(poItems.map((i) => [i.id, i]));
 
@@ -670,6 +678,11 @@ router.post('/goods-receipts', requireReceive, async (req, res) => {
             qcCheckedDate: qcCheckedDate ? new Date(qcCheckedDate) : new Date(),
             receivedBy: req.user.userId,
         }, { transaction: t });
+        if (!(await claimRequestKey(requestKey, { action: 'goods_receipt', refId: gr.id, userId: req.user.userId }, t))) {
+            await t.rollback();
+            const existing = await findRequestKey(requestKey);
+            return res.status(200).json({ id: existing?.refId ?? null, alreadyApplied: true });
+        }
 
         for (const line of items) {
             // A poItemId that doesn't resolve to a line on THIS purchase

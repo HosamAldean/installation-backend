@@ -14,6 +14,7 @@ import { MatWhItem } from '../models/MatWhItem.js';
 import { MatWhItemVariant } from '../models/MatWhItemVariant.js';
 import { getAvailableToReserve } from '../services/matWhLedger.js';
 import { denyStore } from '../services/matWhStoreAccess.js';
+import { normalizeRequestKey } from '../services/matWhRequestKeys.js';
 import {
     createTransfer, addLine, updateLine, removeLine, cancelTransfer, sendTransfer,
     receiveLines, lookupBarcode, loadTransfer,
@@ -262,7 +263,7 @@ router.post('/store-transfers/:id/send', requireTransfer, requireTransferStore('
 
 router.post('/store-transfers/:id/receive', requireTransfer, requireTransferStore('to'), async (req, res) => {
     try {
-        res.json(await receiveLines(Number(req.params.id), req.body?.lines, req.user.userId));
+        res.json(await receiveLines(Number(req.params.id), req.body?.lines, req.user.userId, normalizeRequestKey(req.body?.requestKey)));
     } catch (err) {
         sendError(res, err, 'Failed to receive transfer');
     }
