@@ -15,6 +15,7 @@ import { MatWhItemStore } from '../models/MatWhItemStore.js';
 import {
     postLedgerMovement, applyReceiptCost, getAvailableToReserve, normalizeColor, lockItems,
 } from './matWhLedger.js';
+import { findRequestKey, claimRequestKey } from './matWhRequestKeys.js';
 
 const EPS = 0.000001;
 
@@ -259,7 +260,11 @@ async function linkItemsToStore(itemIds, storeId, transaction) {
 // receipts: [{ lineId, qty, barcode }]. Each qty is capped at what's still
 // outstanding on its line; posts transfer_in at the destination and carries
 // the snapshotted cost into the destination store's cost.
-export async function receiveLines(transferId, receipts, receivedBy) {
+// requestKey (optional): the phone's per-tap key (see
+// services/matWhRequestKeys.js) -- a replay of an already-applied receive
+// returns the transfer as it is now instead of receiving again.
+export async function receiveLines(transferId, receipts, receivedBy, requestKey = null) {
+    if (await findRequestKey(requestKey)) return MatWhStoreTransfer.findByPk(transferId);
     const transfer = await loadTransfer(transferId, ['sent', 'partially_received']);
     if (!Array.isArray(receipts) || receipts.length === 0) throw httpError(400, 'Nothing to receive');
 
@@ -285,7 +290,15 @@ export async function receiveLines(transferId, receipts, receivedBy) {
 
     const t = await sequelizeUtf8.transaction();
     try {
-        await lockTransfer(transfer.id, ['sent', 'partially_received'], t);
+        // Lock whatever the status, so a replay racing the original (which
+        // may have just completed the transfer) reaches the key check and
+        // answers "done" instead of failing on 'received'.
+        const locked = await lockTransfer(transfer.id, ['sent', 'partially_received', 'received'], t);
+        if (!(await claimRequestKey(requestKey, { action: 'transfer_receive', refId: transfer.id, userId: receivedBy }, t))) {
+            await t.rollback();
+            return MatWhStoreTransfer.findByPk(transferId);
+        }
+        if (locked.status === 'received') throw httpError(409, "Not allowed while the transfer is 'received'");
         // Fresh qtyReceived under the lock -- the check above ran on a read
         // another receive may have overtaken since.
         const fresh = await MatWhStoreTransferLine.findAll({ where: { storeTransferId: transferId }, transaction: t });
