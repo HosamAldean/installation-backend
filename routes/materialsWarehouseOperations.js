@@ -871,6 +871,14 @@ router.post('/reservations/:id/items/:lineId/issue', requireIssue, async (req, r
     }
 });
 
+// The caller's own store access (see services/matWhStoreAccess.js), so a
+// client can hide actions it would only get a 403 for. Any signed-in user:
+// it only reveals their own assignments.
+router.get('/my-store-access', async (req, res) => {
+    const allowed = await getAllowedStoreIds(req.user);
+    res.json({ allStores: allowed === null, storeIds: allowed ? [...allowed] : [] });
+});
+
 // GET /issue-candidates?itemId=X -- the item-first entry point into
 // issuing, mirroring goods-receipt-candidates' reasoning on the receiving
 // side (materialsWarehousePurchasing.js): a storekeeper who knows the item
