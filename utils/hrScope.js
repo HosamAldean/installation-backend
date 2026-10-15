@@ -14,9 +14,12 @@ const SQL_DB = process.env.MSSQL1_DB;
 
 // "المجمع الصناعي" (Industrial Complex) is a Petra (Comp_num=1) department
 // spanning Work_place 6000-6999 -- confirmed live against Pay_CompTree,
-// NOT a separate company. Ittihad (Comp_num=10) is a genuinely separate
-// company with its own employee-numbering scheme.
-const FACTORY_WHERE = "Comp_num = 1 AND Work_place BETWEEN 6000 AND 6999";
+// NOT a separate company. Factory HR also covers "إنتاج الحديد" (Iron
+// Production, Work_place 8001 -- the 3xxxxx employees), per explicit
+// direction 2026-10-15; it used to fall to general hr. Ittihad
+// (Comp_num=10) is a genuinely separate company with its own employee-
+// numbering scheme.
+const FACTORY_WHERE = "Comp_num = 1 AND (Work_place BETWEEN 6000 AND 6999 OR Work_place = 8001)";
 const ITTIHAD_WHERE = "Comp_num = 10";
 // Everyone not in either of the above two.
 const GENERAL_WHERE = `NOT (${FACTORY_WHERE}) AND Comp_num <> 10`;
