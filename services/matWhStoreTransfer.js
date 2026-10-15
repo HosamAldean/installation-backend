@@ -11,6 +11,7 @@ import { MatWhStore } from '../models/MatWhStore.js';
 import { MatWhItem } from '../models/MatWhItem.js';
 import { MatWhItemVariant } from '../models/MatWhItemVariant.js';
 import { MatWhItemCost } from '../models/MatWhItemCost.js';
+import { MatWhItemStore } from '../models/MatWhItemStore.js';
 import {
     postLedgerMovement, applyReceiptCost, getAvailableToReserve, normalizeColor,
 } from './matWhLedger.js';
@@ -219,6 +220,23 @@ async function assertBarcodeMatches(line, barcode, variantItemIds) {
     }
 }
 
+// Once stock lands in the destination store, that store must count as one
+// the item "lives in" (MatWhItemStore.js) -- otherwise a reservation from
+// it is rejected for an item whose known stores don't include it. Only for
+// items that already have known stores: an item with none is store-
+// flexible (any store accepted), and a first link would wrongly narrow it
+// to this one store.
+async function linkItemsToStore(itemIds, storeId, transaction) {
+    if (!itemIds.length) return;
+    const links = await MatWhItemStore.findAll({ where: { itemId: itemIds }, attributes: ['itemId', 'storeId'], transaction });
+    const linkedItems = new Set(links.map((l) => l.itemId));
+    const alreadyHere = new Set(links.filter((l) => l.storeId === storeId).map((l) => l.itemId));
+    for (const itemId of itemIds) {
+        if (!linkedItems.has(itemId) || alreadyHere.has(itemId)) continue;
+        await MatWhItemStore.create({ itemId, storeId }, { transaction });
+    }
+}
+
 // receipts: [{ lineId, qty, barcode }]. Each qty is capped at what's still
 // outstanding on its line; posts transfer_in at the destination and carries
 // the snapshotted cost into the destination store's cost.
@@ -269,6 +287,7 @@ export async function receiveLines(transferId, receipts, receivedBy) {
             if (line.unitCost != null) await applyReceiptCost(line.itemId, transfer.toStoreId, qty, line.unitCost, t);
             await line.update({ qtyReceived: line.qtyReceived + qty }, { transaction: t });
         }
+        await linkItemsToStore([...new Set([...planned.keys()].map((id) => lineById.get(id).itemId))], transfer.toStoreId, t);
         const fullyReceived = lines.every((l) => l.qtySent - l.qtyReceived <= EPS);
         await transfer.update({
             status: fullyReceived ? 'received' : 'partially_received',
