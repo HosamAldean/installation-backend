@@ -14,6 +14,8 @@ import { MatWhItemCost } from '../models/MatWhItemCost.js';
 import {
     postLedgerMovement, applyReceiptCost, getPhysicalBalance, getAlreadyReserved, normalizeColor,
 } from './matWhLedger.js';
+import { MatWhStoreTransfer } from '../models/MatWhStoreTransfer.js';
+import { MatWhStoreTransferLine } from '../models/MatWhStoreTransferLine.js';
 
 const OPEN_STATUSES = ['counting', 'submitted'];
 
@@ -281,12 +283,53 @@ export async function reservationWarnings(count, lines) {
     return warnings;
 }
 
+// Store-transfer lines still in transit to or from this count's store, for
+// items on the count. The ledger already moved them (transfer_out at send,
+// transfer_in only at receive), so goods sitting on the destination's shelf
+// before they're received -- or still on the source's shelf after send --
+// get counted as a variance and then moved again by the transfer. Shown to
+// counters and approvers; approving requires an explicit acknowledgement.
+// A warning rather than a block, since a shortage line can stay open
+// indefinitely (see MatWhStoreTransfer.js).
+export async function inTransitForCount(count, lines) {
+    const transfers = await MatWhStoreTransfer.findAll({
+        where: {
+            status: ['sent', 'partially_received'],
+            [Op.or]: [{ fromStoreId: count.storeId }, { toStoreId: count.storeId }],
+        },
+    });
+    if (!transfers.length) return [];
+    const byId = new Map(transfers.map((t) => [t.id, t]));
+    const poolKey = (l) => `${l.itemId}|${normalizeColor(l.color ?? null) ?? null}|${l.lengthMm ?? null}`;
+    const countLineByPool = new Map(lines.map((l) => [poolKey(l), l.id]));
+    const transferLines = await MatWhStoreTransferLine.findAll({ where: { storeTransferId: [...byId.keys()] } });
+    return transferLines
+        .filter((l) => l.qtySent - l.qtyReceived > 0.000001 && countLineByPool.has(poolKey(l)))
+        .map((l) => {
+            const t = byId.get(l.storeTransferId);
+            return {
+                countLineId: countLineByPool.get(poolKey(l)),
+                transferId: t.id, transferNo: t.transferNo,
+                direction: t.toStoreId === count.storeId ? 'in' : 'out',
+                itemId: l.itemId, color: l.color, lengthMm: l.lengthMm,
+                qtyOutstanding: l.qtySent - l.qtyReceived,
+            };
+        });
+}
+
 // The real stock event: one ledger movement per non-zero variance, all or
 // nothing. unitCosts is { [lineId]: cost } -- the approver's cost for
 // positive variances on items with no known cost (a store's first count).
-export async function approveStockCount(stockCountId, decidedBy, { unitCosts, notes } = {}) {
+export async function approveStockCount(stockCountId, decidedBy, { unitCosts, notes, acknowledgeInTransit } = {}) {
     const count = await loadCount(stockCountId, 'submitted');
     const lines = await MatWhStockCountLine.findAll({ where: { stockCountId } });
+    const inTransit = await inTransitForCount(count, lines);
+    if (inTransit.length && !acknowledgeInTransit) {
+        const err = httpError(409, `${inTransit.length} counted item(s) have store transfers still in transit -- confirm they were not counted, or receive those transfers and recount`);
+        err.code = 'IN_TRANSIT';
+        err.details = inTransit;
+        throw err;
+    }
     const warnings = await reservationWarnings(count, lines);
 
     const t = await sequelizeUtf8.transaction();

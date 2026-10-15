@@ -8,7 +8,9 @@ import { MatWhWriteoffRequest } from '../models/MatWhWriteoffRequest.js';
 import { MatWhWriteoffRequestItem } from '../models/MatWhWriteoffRequestItem.js';
 import { MatWhWriteoffReport } from '../models/MatWhWriteoffReport.js';
 import { MatWhWriteoffReportItem } from '../models/MatWhWriteoffReportItem.js';
-import { postLedgerMovement } from './matWhLedger.js';
+import { postLedgerMovement, getPhysicalBalance, normalizeColor } from './matWhLedger.js';
+
+const EPS = 0.000001;
 
 export async function createWriteoffRequest({ requestNo, storeId, projectId, projectNo, projectName, reason, requestedBy }) {
     return MatWhWriteoffRequest.create({
@@ -73,6 +75,46 @@ export async function decideWriteoffRequest(requestId, decision, decidedBy, note
 // One report per request (the model's own unique index on
 // writeoffRequestId is the real guard; the status check here just gives a
 // clean error before hitting it).
+function badRequest(message) {
+    const err = new Error(message);
+    err.status = 400;
+    return err;
+}
+
+// Every destroyed qty must be > 0 and within what was approved (approval is
+// per request, so a line's approved qty is its qtyRequested), and the total
+// destroyed per item/color/length can't exceed the store's physical balance
+// -- otherwise the writeoff posting drives stock negative.
+async function assertDestroyedQtys(request, items, requestItemById) {
+    const perRequestItem = new Map();
+    for (const { writeoffRequestItemId, qtyDestroyed } of items) {
+        const requestItem = requestItemById.get(writeoffRequestItemId);
+        if (!requestItem) throw badRequest(`Request item ${writeoffRequestItemId} does not belong to this request`);
+        const qty = Number(qtyDestroyed);
+        if (!Number.isFinite(qty) || qty <= 0) throw badRequest('Each destroyed qty must be a number greater than 0');
+        perRequestItem.set(requestItem.id, (perRequestItem.get(requestItem.id) || 0) + qty);
+    }
+    const perPool = new Map();
+    for (const [requestItemId, qty] of perRequestItem) {
+        const ri = requestItemById.get(requestItemId);
+        if (qty > ri.qtyRequested + EPS) {
+            throw badRequest(`Destroyed qty ${qty} exceeds the approved qty ${ri.qtyRequested} for item ${ri.itemId}`);
+        }
+        const color = normalizeColor(ri.color ?? null) ?? null;
+        const lengthMm = ri.lengthMm ?? null;
+        const key = `${ri.itemId}|${color}|${lengthMm}`;
+        const pool = perPool.get(key) || { itemId: ri.itemId, color, lengthMm, qty: 0 };
+        pool.qty += qty;
+        perPool.set(key, pool);
+    }
+    for (const pool of perPool.values()) {
+        const physical = await getPhysicalBalance(request.storeId, pool.itemId, pool.color, pool.lengthMm);
+        if (pool.qty > physical + EPS) {
+            throw badRequest(`Item ${pool.itemId}: only ${physical} in stock at this store -- cannot destroy ${pool.qty}`);
+        }
+    }
+}
+
 export async function createWriteoffReport({ writeoffRequestId, reportNo, destroyedDate, items, createdBy }) {
     const request = await MatWhWriteoffRequest.findByPk(writeoffRequestId);
     if (!request) {
@@ -93,6 +135,7 @@ export async function createWriteoffReport({ writeoffRequestId, reportNo, destro
 
     const requestItems = await MatWhWriteoffRequestItem.findAll({ where: { writeoffRequestId } });
     const requestItemById = new Map(requestItems.map((ri) => [ri.id, ri]));
+    await assertDestroyedQtys(request, items, requestItemById);
 
     const t = await sequelizeUtf8.transaction();
     try {
