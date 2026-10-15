@@ -20,7 +20,7 @@ import { MatWhPurchaseOrderItem } from '../models/MatWhPurchaseOrderItem.js';
 import { MatWhItem } from '../models/MatWhItem.js';
 import { MatWhExternalProcessing } from '../models/MatWhExternalProcessing.js';
 import { MatWhItemVariant } from '../models/MatWhItemVariant.js';
-import { getAvailableToReserve, postLedgerMovement, normalizeColor, lockRow } from './matWhLedger.js';
+import { getAvailableToReserve, postLedgerMovement, normalizeColor, lockRow, lockItems } from './matWhLedger.js';
 
 // Derives the header's overall status from its lines -- but only once no
 // line is still 'pending' (the caller's job: while any line remains
@@ -176,8 +176,10 @@ export async function splitOffRemainder(row, sentQty, t) {
 async function earmarkTiersOneAndTwo(line, item, qtyToDecide, t) {
     const needsCoating = item?.category === 'ALM' && !!line.color && line.color !== 'MILL';
 
+    // Read inside t: the caller already holds this item's lock (lockItems),
+    // and a bulk confirm's earlier lines' earmarks must count too.
     const availableExactColor = await getAvailableToReserve(
-        line.storeId, line.itemId, line.color ?? undefined, line.lengthMm ?? undefined,
+        line.storeId, line.itemId, line.color ?? undefined, line.lengthMm ?? undefined, undefined, t,
     );
     const qtyReserved = Math.max(0, Math.min(qtyToDecide, availableExactColor));
     let remaining = qtyToDecide - qtyReserved;
@@ -185,7 +187,7 @@ async function earmarkTiersOneAndTwo(line, item, qtyToDecide, t) {
     let qtyPendingCoating = 0;
     if (needsCoating && remaining > 0) {
         const availableMill = await getAvailableToReserve(
-            line.storeId, line.itemId, null, line.lengthMm ?? undefined,
+            line.storeId, line.itemId, null, line.lengthMm ?? undefined, undefined, t,
         );
         qtyPendingCoating = Math.max(0, Math.min(remaining, availableMill));
         remaining -= qtyPendingCoating;
@@ -326,9 +328,19 @@ export async function confirmReservationLine(lineId, confirmedBy, requestedQtyTo
         throw err;
     }
 
+    // Item lock first, then the line (see lockItems): serializes this
+    // against any other confirm of the same item, and the re-check stops a
+    // double-click confirming the same line twice.
     const t = await sequelizeUtf8.transaction();
     try {
-        await confirmOneLine(line, header, confirmedBy, t, requestedQtyToReserve, buyExactColor);
+        await lockItems([line.itemId], t);
+        const locked = await lockRow(MatWhReservationItem, line.id, t);
+        if (locked.status !== 'pending') {
+            const err = new Error(`Cannot confirm a line in status '${locked.status}'`);
+            err.status = 409;
+            throw err;
+        }
+        await confirmOneLine(locked, header, confirmedBy, t, requestedQtyToReserve, buyExactColor);
         const siblings = await MatWhReservationItem.findAll({ where: { reservationHeaderId: header.id }, transaction: t });
         if (!siblings.some((l) => l.status === 'pending')) {
             await header.update({ status: computeHeaderStatus(siblings), confirmedBy, confirmedDate: new Date() }, { transaction: t });
@@ -400,10 +412,10 @@ export async function confirmReservation(headerId, confirmedBy, allowedStoreIds 
         throw err;
     }
 
-    const lines = (await MatWhReservationItem.findAll({ where: { reservationHeaderId: headerId } }))
+    const candidates = (await MatWhReservationItem.findAll({ where: { reservationHeaderId: headerId } }))
         .filter((l) => l.status === 'pending')
         .filter((l) => allowedStoreIds === null || allowedStoreIds.has(l.storeId));
-    if (lines.length === 0) {
+    if (candidates.length === 0) {
         const err = new Error(allowedStoreIds ? 'No pending items left to confirm in your stores' : 'No pending items left to confirm');
         err.status = 400;
         throw err;
@@ -411,6 +423,21 @@ export async function confirmReservation(headerId, confirmedBy, allowedStoreIds 
 
     const t = await sequelizeUtf8.transaction();
     try {
+        // Every involved item locked first (ascending, see lockItems), then
+        // each line re-read under lock -- any line another confirm/reject
+        // decided meanwhile drops out instead of being decided twice.
+        await lockItems(candidates.map((l) => l.itemId), t);
+        const lines = [];
+        for (const c of [...candidates].sort((a, b) => a.id - b.id)) {
+            const locked = await lockRow(MatWhReservationItem, c.id, t);
+            if (locked.status === 'pending') lines.push(locked);
+        }
+        if (lines.length === 0) {
+            const err = new Error('No pending items left to confirm');
+            err.status = 409;
+            throw err;
+        }
+
         // Shortfalls grouped by (vendor, destination store) -- a null
         // vendor (item has no preferredVendorId) is its own group, one
         // draft PO per confirm action for someone to assign a vendor to

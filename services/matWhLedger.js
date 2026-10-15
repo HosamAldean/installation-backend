@@ -8,6 +8,7 @@ import { Op } from 'sequelize';
 import { MatWhStockLedger } from '../models/MatWhStockLedger.js';
 import { MatWhReservationItem } from '../models/MatWhReservationItem.js';
 import { MatWhItemCost } from '../models/MatWhItemCost.js';
+import { MatWhItem } from '../models/MatWhItem.js';
 
 // Lines that count against availability: confirmed in full, or confirmed
 // for whatever was available with the rest covered by an auto-PO. A
@@ -39,6 +40,17 @@ export function normalizeColor(color) {
 // it would pin an older snapshot for the rest of the transaction.
 export async function lockRow(model, id, transaction) {
     return model.findByPk(id, { transaction, lock: transaction.LOCK.UPDATE });
+}
+
+// Item-level lock for anything that hands out "available to reserve"
+// (reservation confirm, substitute, fulfill-shortfall): two of those for
+// the same item would otherwise both read the same free stock and both
+// earmark it. Ascending id order so two multi-item callers can't deadlock;
+// callers that also lock reservation lines take the item locks FIRST.
+export async function lockItems(itemIds, transaction) {
+    for (const id of [...new Set(itemIds.map(Number))].sort((a, b) => a - b)) {
+        await lockRow(MatWhItem, id, transaction);
+    }
 }
 
 // matWhStockLedger.color is always write-normalized (see
@@ -105,11 +117,14 @@ export async function postLedgerMovement({
 // convention as `color` -- omit it entirely for today's exact behavior
 // (every existing color-only caller is unaffected), pass a real number to
 // scope the balance to that one length specifically.
-export async function getPhysicalBalance(storeId, itemId, color, lengthMm) {
+// `transaction` (optional, every balance helper below): read inside the
+// caller's transaction so its own uncommitted earmarks count, and -- after
+// a lockItems -- so the read reflects whatever the lock waited for.
+export async function getPhysicalBalance(storeId, itemId, color, lengthMm, transaction) {
     const where = { storeId, itemId };
     if (color !== undefined) where.color = normalizeColor(color);
     if (lengthMm !== undefined) where.lengthMm = lengthMm;
-    const rows = await MatWhStockLedger.findAll({ where });
+    const rows = await MatWhStockLedger.findAll({ where, transaction });
     let balance = 0;
     for (const r of rows) balance += r.direction === 'in' ? r.qty : -r.qty;
     return balance;
@@ -130,9 +145,9 @@ export async function getPhysicalBalance(storeId, itemId, color, lengthMm) {
 // it from the reserved-elsewhere sum, same as every other caller of
 // getAlreadyReserved already does for its own line. Omitted (the default,
 // every other caller) keeps today's behavior unchanged.
-export async function getAvailableToReserve(storeId, itemId, color, lengthMm, excludeLineId) {
-    const physical = await getPhysicalBalance(storeId, itemId, color, lengthMm);
-    const reserved = await getAlreadyReserved(storeId, itemId, excludeLineId, color, lengthMm);
+export async function getAvailableToReserve(storeId, itemId, color, lengthMm, excludeLineId, transaction) {
+    const physical = await getPhysicalBalance(storeId, itemId, color, lengthMm, transaction);
+    const reserved = await getAlreadyReserved(storeId, itemId, excludeLineId, color, lengthMm, transaction);
     return physical - reserved;
 }
 
@@ -141,7 +156,7 @@ export async function getAvailableToReserve(storeId, itemId, color, lengthMm, ex
 // reserve figure is competing against. Exposed separately from
 // getAvailableToReserve so the reservation UI can show "already reserved: N"
 // alongside "available: N" on the same line, not just the net figure.
-export async function getAlreadyReserved(storeId, itemId, excludeLineId, color, lengthMm) {
+export async function getAlreadyReserved(storeId, itemId, excludeLineId, color, lengthMm, transaction) {
     const where = { storeId, itemId, status: HELD_STATUSES, ...reservationItemColorWhere(color) };
     // Same "omitted = pooled, explicit = narrowed" convention as color --
     // see getPhysicalBalance. Deliberately NOT applied to the
@@ -149,7 +164,7 @@ export async function getAlreadyReserved(storeId, itemId, excludeLineId, color, 
     // pool by color alone today; scoping it to length too is real future
     // work, out of scope for this pass (adding the variant/barcode layer).
     if (lengthMm !== undefined) where.lengthMm = lengthMm;
-    const rows = await MatWhReservationItem.findAll({ where });
+    const rows = await MatWhReservationItem.findAll({ where, transaction });
     let total = rows
         .filter((r) => r.id !== excludeLineId)
         .reduce((sum, r) => sum + r.qtyReserved, 0);
@@ -167,6 +182,7 @@ export async function getAlreadyReserved(storeId, itemId, excludeLineId, color, 
     if (color !== undefined && normalizeColor(color) === null) {
         const pendingRows = await MatWhReservationItem.findAll({
             where: { storeId, itemId, status: HELD_STATUSES },
+            transaction,
         });
         total += pendingRows
             .filter((r) => r.id !== excludeLineId)
@@ -218,28 +234,35 @@ export async function getAvailableColorsForItem(storeId, itemId, lengthMm) {
     return results;
 }
 
-// WH.4. Feeds matWhItemCost's running valuation -- called only from a
-// goods-receipt posting (the actual acquisition/cost event), matching
-// Alpha's own real precedent (Ord_GetItemUnitCost only concerns itself
-// with purchase receipts, §05). NOT called for transfer/external-
-// processing/other ledger movements -- those change physical balance
-// (tracked by getPhysicalBalance/getAvailableToReserve above) without
-// being a new cost-bearing acquisition. This is a deliberate scope
-// boundary, not an oversight: onHandQty here is a cost-basis quantity for
-// the weighted-average calculation, not a live mirror of physical balance
-// -- keeping the two fully reconciled across every movement type (issues,
-// write-offs, transfer cost carry-forward) is real future work.
+// WH.4. Feeds matWhItemCost's running valuation (one row per item+store,
+// all colors/lengths pooled) from every cost-bearing inflow: goods
+// receipt, opening balance, transfer receive (carrying the source cost),
+// and a stock-count gain.
+//
+// The quantity already on hand comes from the ledger itself, not a stored
+// counter: issues, write-offs, transfers out etc. never touched the old
+// counter, so after stock went out the previous average kept far too much
+// weight. Every caller posts this receipt's ledger movement first in the
+// same transaction, so the balance read here already includes it.
+// onHandQty is kept as the stock level at the last cost update (nothing
+// reads it as live stock).
+//
+// The cost row is locked so two receipts at once can't lose an update; a
+// receipt committed by another transaction while this one waited may be
+// missing from this transaction's balance read, which only slightly
+// under-weights the old average -- acceptable for a valuation figure.
 export async function applyReceiptCost(itemId, storeId, qtyAccepted, unitCost, transaction) {
     if (!qtyAccepted || unitCost == null) return;
 
-    const [row] = await MatWhItemCost.findOrCreate({
+    const [created] = await MatWhItemCost.findOrCreate({
         where: { itemId, storeId },
         defaults: { lastCost: null, weightedAvgCost: null, onHandQty: 0 },
         transaction,
     });
+    const row = await lockRow(MatWhItemCost, created.id, transaction);
 
-    const oldOnHand = row.onHandQty || 0;
-    const newOnHand = oldOnHand + qtyAccepted;
+    const newOnHand = await getPhysicalBalance(storeId, itemId, undefined, undefined, transaction);
+    const oldOnHand = Math.max(0, newOnHand - qtyAccepted);
     const newWeightedAvg = oldOnHand > 0 && row.weightedAvgCost != null
         ? (oldOnHand * row.weightedAvgCost + qtyAccepted * unitCost) / newOnHand
         : unitCost;
