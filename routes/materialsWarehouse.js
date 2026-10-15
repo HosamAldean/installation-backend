@@ -22,6 +22,7 @@ import { sequelizeUtf8 } from '../config/db.js';
 import { MatWhStore } from '../models/MatWhStore.js';
 import { MatWhItem } from '../models/MatWhItem.js';
 import { MatWhUserStoreAssignment } from '../models/MatWhUserStoreAssignment.js';
+import { User } from '../models/User.js';
 import { MatWhUserVendorAssignment } from '../models/MatWhUserVendorAssignment.js';
 import { MatWhQcCategory } from '../models/MatWhQcCategory.js';
 import { MatWhCategory } from '../models/MatWhCategory.js';
@@ -198,8 +199,78 @@ function crudRoutes(path, model, pkField, searchFields = []) {
 
 crudRoutes('stores', MatWhStore, 'id', ['storeCode', 'storeName', 'storeNameAr']);
 crudRoutes('items', MatWhItem, 'id', ['itemCode', 'itemName', 'itemNameAr', 'barcode']);
-crudRoutes('user-store-assignments', MatWhUserStoreAssignment, 'id');
 crudRoutes('user-vendor-assignments', MatWhUserVendorAssignment, 'id');
+
+// Store access (see services/matWhStoreAccess.js). Deliberately NOT a
+// generic crudRoutes table: master_data is held by the storekeepers being
+// scoped, and since "no rows = every store", letting them edit this table
+// would let anyone un-scope themselves by deleting their own rows. Admin
+// only, both read and write.
+function requireAdmin(req, res, next) {
+    if (req.user?.role !== 'admin') return res.status(403).json({ message: 'Only an admin can manage store access' });
+    next();
+}
+
+// Every non-admin user whose role holds any Materials Warehouse permission,
+// plus anyone who already has an assignment row, with their store ids.
+router.get('/store-access', requireAdmin, async (req, res) => {
+    const grants = await sequelizeUtf8.query(
+        "SELECT DISTINCT role FROM PermissionGrants WHERE permissionKey LIKE 'materials_warehouse.%'",
+        { type: QueryTypes.SELECT },
+    );
+    const assignments = await MatWhUserStoreAssignment.findAll();
+    const assignedUserIds = [...new Set(assignments.map((a) => a.userId))];
+    const users = await User.findAll({
+        where: {
+            role: { [Op.ne]: 'admin' },
+            [Op.or]: [
+                { role: grants.map((g) => g.role) },
+                ...(assignedUserIds.length ? [{ userId: assignedUserIds }] : []),
+            ],
+        },
+        attributes: ['userId', 'username', 'firstName', 'lastName', 'role'],
+        order: [['role', 'ASC'], ['username', 'ASC']],
+    });
+    const storeIdsByUser = new Map();
+    for (const a of assignments) {
+        if (!storeIdsByUser.has(a.userId)) storeIdsByUser.set(a.userId, []);
+        storeIdsByUser.get(a.userId).push(a.storeId);
+    }
+    res.json({
+        items: users.map((u) => ({
+            userId: u.userId, username: u.username, role: u.role,
+            name: [u.firstName, u.lastName].filter(Boolean).join(' ') || null,
+            storeIds: storeIdsByUser.get(u.userId) || [],
+        })),
+    });
+});
+
+// Replace one user's whole store set; an empty list means every store
+// again (the default).
+router.put('/store-access/:userId', requireAdmin, async (req, res) => {
+    const userId = Number(req.params.userId);
+    const storeIds = [...new Set((req.body?.storeIds || []).map(Number))];
+    if (storeIds.some((id) => !Number.isInteger(id))) return res.status(400).json({ message: 'storeIds must be store ids' });
+    const user = await User.findByPk(userId);
+    if (!user) return res.status(404).json({ message: 'User not found' });
+    if (storeIds.length) {
+        const found = await MatWhStore.count({ where: { id: storeIds } });
+        if (found !== storeIds.length) return res.status(400).json({ message: 'Unknown store id in storeIds' });
+    }
+    const t = await sequelizeUtf8.transaction();
+    try {
+        await MatWhUserStoreAssignment.destroy({ where: { userId }, transaction: t });
+        if (storeIds.length) {
+            await MatWhUserStoreAssignment.bulkCreate(storeIds.map((storeId) => ({ userId, storeId })), { transaction: t });
+        }
+        await t.commit();
+        res.json({ userId, storeIds });
+    } catch (err) {
+        await t.rollback();
+        console.error('Error saving store access:', err);
+        res.status(500).json({ message: 'Failed to save store access' });
+    }
+});
 crudRoutes('qc-categories', MatWhQcCategory, 'id', ['categoryCode', 'categoryName', 'categoryNameAr']);
 crudRoutes('categories', MatWhCategory, 'id', ['categoryCode', 'categoryName', 'categoryNameAr']);
 crudRoutes('sub-categories', MatWhSubCategory, 'id', ['subCategoryCode', 'subCategoryName', 'subCategoryNameAr']);

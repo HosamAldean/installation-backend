@@ -17,6 +17,7 @@ import { MatWhWriteoffRequest } from '../models/MatWhWriteoffRequest.js';
 import { MatWhWriteoffRequestItem } from '../models/MatWhWriteoffRequestItem.js';
 import { MatWhWriteoffReport } from '../models/MatWhWriteoffReport.js';
 import { MatWhWriteoffReportItem } from '../models/MatWhWriteoffReportItem.js';
+import { denyStore } from '../services/matWhStoreAccess.js';
 import {
     createWriteoffRequest, submitWriteoffRequest, decideWriteoffRequest,
     createWriteoffReport, signWriteoffReportCommittee, acknowledgeWriteoffReport,
@@ -27,6 +28,17 @@ router.use(authenticateToken);
 
 const requireWriteoff = requirePermission(PERMISSIONS.MATERIALS_WAREHOUSE_WRITEOFF);
 const requireWriteoffApprove = requirePermission(PERMISSIONS.MATERIALS_WAREHOUSE_WRITEOFF_APPROVE);
+
+// Store scoping (see services/matWhStoreAccess.js) for the storekeeper's
+// own steps on a request -- building, submitting, and filing the
+// destruction report. Management's decide/acknowledge and the committee
+// sign-off aren't store actions and stay unscoped.
+async function requireRequestStore(req, res, next) {
+    const request = await MatWhWriteoffRequest.findByPk(req.params.id);
+    if (!request) return res.status(404).json({ message: 'Write-off request not found' });
+    if (await denyStore(req, res, request.storeId)) return;
+    next();
+}
 
 // Read access is shared -- an approver needs to see the same request list/
 // detail a storekeeper does, just without the .writeoff actions.
@@ -82,6 +94,7 @@ router.post('/writeoff-requests', requireWriteoff, async (req, res) => {
         return res.status(400).json({ message: 'requestNo is required' });
     }
     if (!storeId) return res.status(400).json({ message: 'storeId is required' });
+    if (await denyStore(req, res, storeId)) return;
     if (!reason || !String(reason).trim()) {
         return res.status(400).json({ message: 'reason is required' });
     }
@@ -101,7 +114,7 @@ router.post('/writeoff-requests', requireWriteoff, async (req, res) => {
     }
 });
 
-router.post('/writeoff-requests/:id/items', requireWriteoff, async (req, res) => {
+router.post('/writeoff-requests/:id/items', requireWriteoff, requireRequestStore, async (req, res) => {
     const request = await MatWhWriteoffRequest.findByPk(req.params.id);
     if (!request) return res.status(404).json({ message: 'Write-off request not found' });
     if (request.status !== 'draft') {
@@ -122,7 +135,7 @@ router.post('/writeoff-requests/:id/items', requireWriteoff, async (req, res) =>
     res.status(201).json(line);
 });
 
-router.delete('/writeoff-requests/:id/items/:lineId', requireWriteoff, async (req, res) => {
+router.delete('/writeoff-requests/:id/items/:lineId', requireWriteoff, requireRequestStore, async (req, res) => {
     const request = await MatWhWriteoffRequest.findByPk(req.params.id);
     if (!request) return res.status(404).json({ message: 'Write-off request not found' });
     if (request.status !== 'draft') {
@@ -136,7 +149,7 @@ router.delete('/writeoff-requests/:id/items/:lineId', requireWriteoff, async (re
     res.json({ message: 'removed' });
 });
 
-router.post('/writeoff-requests/:id/submit', requireWriteoff, async (req, res) => {
+router.post('/writeoff-requests/:id/submit', requireWriteoff, requireRequestStore, async (req, res) => {
     try {
         const request = await submitWriteoffRequest(Number(req.params.id));
         res.json(request);
@@ -163,6 +176,8 @@ router.post('/writeoff-requests/:id/decide', requireWriteoffApprove, async (req,
 router.post('/writeoff-reports', requireWriteoff, async (req, res) => {
     const { writeoffRequestId, reportNo, destroyedDate, items } = req.body;
     if (!writeoffRequestId) return res.status(400).json({ message: 'writeoffRequestId is required' });
+    const request = await MatWhWriteoffRequest.findByPk(writeoffRequestId);
+    if (request && await denyStore(req, res, request.storeId)) return;
     if (!reportNo || !String(reportNo).trim()) {
         return res.status(400).json({ message: 'reportNo is required' });
     }

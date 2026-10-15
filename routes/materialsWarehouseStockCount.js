@@ -21,6 +21,7 @@ import { MatWhStockCountLine } from '../models/MatWhStockCountLine.js';
 import { MatWhStore } from '../models/MatWhStore.js';
 import { MatWhItem } from '../models/MatWhItem.js';
 import { MatWhItemVariant } from '../models/MatWhItemVariant.js';
+import { denyStore } from '../services/matWhStoreAccess.js';
 import {
     createStockCount, countLine, addExtraLine, lookupBarcode, submitStockCount, cancelStockCount,
     recountLines, rejectStockCount, approveStockCount, reservationWarnings, inTransitForCount, currentCosts,
@@ -54,6 +55,16 @@ function requireAnyStockCountAccess(req, res, next) {
         console.error('Permission check failed:', err);
         res.status(500).json({ success: false, message: 'Permission check failed' });
     });
+}
+
+// Store scoping (see services/matWhStoreAccess.js) for every action on an
+// existing count -- counting, submitting, cancelling and the approver's
+// decisions all act on that count's own store.
+async function requireCountStore(req, res, next) {
+    const count = await MatWhStockCount.findByPk(req.params.id);
+    if (!count) return res.status(404).json({ message: 'Stock count not found' });
+    if (await denyStore(req, res, count.storeId)) return;
+    next();
 }
 
 function sendError(res, err, fallback) {
@@ -202,6 +213,7 @@ router.get('/stock-counts/:id', requireAnyStockCountAccess, async (req, res) => 
 router.post('/stock-counts', requireCount, async (req, res) => {
     const { storeId, scopeCategory, scopeZone, notes } = req.body;
     if (!storeId) return res.status(400).json({ message: 'storeId is required' });
+    if (await denyStore(req, res, Number(storeId))) return;
     try {
         const count = await createStockCount({
             storeId: Number(storeId), scopeCategory, scopeZone, notes, createdBy: req.user.userId,
@@ -224,7 +236,7 @@ router.get('/stock-counts/:id/lookup', requireAnyStockCountAccess, async (req, r
     }
 });
 
-router.put('/stock-counts/:id/lines/:lineId', requireCount, async (req, res) => {
+router.put('/stock-counts/:id/lines/:lineId', requireCount, requireCountStore, async (req, res) => {
     try {
         const line = await countLine(Number(req.params.id), Number(req.params.lineId), req.body?.countedQty, req.user.userId);
         res.json(lineForCounter(line.toJSON()));
@@ -233,7 +245,7 @@ router.put('/stock-counts/:id/lines/:lineId', requireCount, async (req, res) => 
     }
 });
 
-router.post('/stock-counts/:id/lines', requireCount, async (req, res) => {
+router.post('/stock-counts/:id/lines', requireCount, requireCountStore, async (req, res) => {
     const { itemId } = req.body;
     if (!itemId) return res.status(400).json({ message: 'itemId is required' });
     try {
@@ -244,7 +256,7 @@ router.post('/stock-counts/:id/lines', requireCount, async (req, res) => {
     }
 });
 
-router.post('/stock-counts/:id/submit', requireCount, async (req, res) => {
+router.post('/stock-counts/:id/submit', requireCount, requireCountStore, async (req, res) => {
     try {
         res.json(await submitStockCount(Number(req.params.id), req.user.userId));
     } catch (err) {
@@ -252,7 +264,7 @@ router.post('/stock-counts/:id/submit', requireCount, async (req, res) => {
     }
 });
 
-router.post('/stock-counts/:id/cancel', requireAnyStockCountAccess, async (req, res) => {
+router.post('/stock-counts/:id/cancel', requireAnyStockCountAccess, requireCountStore, async (req, res) => {
     try {
         res.json(await cancelStockCount(Number(req.params.id)));
     } catch (err) {
@@ -260,7 +272,7 @@ router.post('/stock-counts/:id/cancel', requireAnyStockCountAccess, async (req, 
     }
 });
 
-router.post('/stock-counts/:id/recount', requireApprove, async (req, res) => {
+router.post('/stock-counts/:id/recount', requireApprove, requireCountStore, async (req, res) => {
     try {
         res.json(await recountLines(Number(req.params.id), req.body?.lineIds, req.user.userId, req.body?.notes));
     } catch (err) {
@@ -268,7 +280,7 @@ router.post('/stock-counts/:id/recount', requireApprove, async (req, res) => {
     }
 });
 
-router.post('/stock-counts/:id/reject', requireApprove, async (req, res) => {
+router.post('/stock-counts/:id/reject', requireApprove, requireCountStore, async (req, res) => {
     try {
         res.json(await rejectStockCount(Number(req.params.id), req.user.userId, req.body?.notes));
     } catch (err) {
@@ -276,7 +288,7 @@ router.post('/stock-counts/:id/reject', requireApprove, async (req, res) => {
     }
 });
 
-router.post('/stock-counts/:id/approve', requireApprove, async (req, res) => {
+router.post('/stock-counts/:id/approve', requireApprove, requireCountStore, async (req, res) => {
     try {
         const { count, warnings } = await approveStockCount(Number(req.params.id), req.user.userId, {
             unitCosts: req.body?.unitCosts, notes: req.body?.notes,

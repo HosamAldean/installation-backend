@@ -14,6 +14,7 @@ import { sequelizeUtf8 } from '../config/db.js';
 import { MatWhStockLedger } from '../models/MatWhStockLedger.js';
 import { MatWhItem } from '../models/MatWhItem.js';
 import { postLedgerMovement, applyReceiptCost, getPhysicalBalance, normalizeColor, lockRow } from '../services/matWhLedger.js';
+import { denyStore } from '../services/matWhStoreAccess.js';
 
 const router = express.Router();
 router.use(authenticateToken, requirePermission(PERMISSIONS.MATERIALS_WAREHOUSE_MASTER_DATA));
@@ -37,6 +38,7 @@ router.post('/opening-balance', async (req, res) => {
     if (!storeId || !itemId || qty === undefined) {
         return res.status(400).json({ message: 'storeId, itemId and qty are required' });
     }
+    if (await denyStore(req, res, storeId)) return;
 
     const normalizedColor = normalizeColor(color || null);
     // Item row lock first (see lockRow), so a double submit can't pass the
