@@ -29,6 +29,18 @@ export function normalizeColor(color) {
     return color === 'MILL' ? null : color;
 }
 
+// Double-post guard for every action that checks something (a status, an
+// already-received/returned total, "no movement yet") and then posts to
+// this ledger: re-read the deciding row with a row lock as the FIRST
+// statement of the transaction, then re-check against what it returns. A
+// second concurrent call (double-click, retried request, offline-queue
+// replay) waits on the lock and then sees the first one's committed
+// result. It must come first: under REPEATABLE READ a plain read before
+// it would pin an older snapshot for the rest of the transaction.
+export async function lockRow(model, id, transaction) {
+    return model.findByPk(id, { transaction, lock: transaction.LOCK.UPDATE });
+}
+
 // matWhStockLedger.color is always write-normalized (see
 // postLedgerMovement) -- a mill-finish movement is NEVER stored there as
 // the literal string 'MILL', only ever null, so a plain equality match on

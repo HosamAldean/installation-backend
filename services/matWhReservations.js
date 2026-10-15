@@ -20,7 +20,7 @@ import { MatWhPurchaseOrderItem } from '../models/MatWhPurchaseOrderItem.js';
 import { MatWhItem } from '../models/MatWhItem.js';
 import { MatWhExternalProcessing } from '../models/MatWhExternalProcessing.js';
 import { MatWhItemVariant } from '../models/MatWhItemVariant.js';
-import { getAvailableToReserve, postLedgerMovement, normalizeColor } from './matWhLedger.js';
+import { getAvailableToReserve, postLedgerMovement, normalizeColor, lockRow } from './matWhLedger.js';
 
 // Derives the header's overall status from its lines -- but only once no
 // line is still 'pending' (the caller's job: while any line remains
@@ -625,14 +625,20 @@ export async function issueReservationLine(lineId, issuedBy, issuedBarcode, issu
 
     const t = await sequelizeUtf8.transaction();
     try {
+        const locked = await lockRow(MatWhReservationItem, line.id, t);
+        if (!['confirmed', 'partially_confirmed'].includes(locked.status) || !(locked.qtyReserved > 0)) {
+            const err = new Error(`Cannot issue a line in status '${locked.status}'`);
+            err.status = 409;
+            throw err;
+        }
         await postLedgerMovement({
-            storeId: line.storeId, itemId: line.itemId, projectId: header.projectId,
-            qty: line.qtyReserved, direction: 'out', docType: 'issue',
-            refType: 'reservation_item', refId: line.id,
-            performedBy: issuedBy, color: line.color ?? null, lengthMm: line.lengthMm ?? null,
+            storeId: locked.storeId, itemId: locked.itemId, projectId: header.projectId,
+            qty: locked.qtyReserved, direction: 'out', docType: 'issue',
+            refType: 'reservation_item', refId: locked.id,
+            performedBy: issuedBy, color: locked.color ?? null, lengthMm: locked.lengthMm ?? null,
         }, t);
 
-        await line.update({
+        await locked.update({
             status: 'issued', issuedBy, issuedDate: new Date(),
             issuedBarcode: issuedBarcode || null, issuePurpose,
         }, { transaction: t });

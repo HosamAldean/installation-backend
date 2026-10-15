@@ -10,8 +10,10 @@ import express from 'express';
 import { authenticateToken } from '../middleware/auth.js';
 import { requirePermission } from '../middleware/permissions.js';
 import { PERMISSIONS } from '../constants/permissions.js';
+import { sequelizeUtf8 } from '../config/db.js';
 import { MatWhStockLedger } from '../models/MatWhStockLedger.js';
-import { postLedgerMovement, applyReceiptCost, getPhysicalBalance, normalizeColor } from '../services/matWhLedger.js';
+import { MatWhItem } from '../models/MatWhItem.js';
+import { postLedgerMovement, applyReceiptCost, getPhysicalBalance, normalizeColor, lockRow } from '../services/matWhLedger.js';
 
 const router = express.Router();
 router.use(authenticateToken, requirePermission(PERMISSIONS.MATERIALS_WAREHOUSE_MASTER_DATA));
@@ -37,23 +39,40 @@ router.post('/opening-balance', async (req, res) => {
     }
 
     const normalizedColor = normalizeColor(color || null);
-    const existing = await MatWhStockLedger.count({
-        where: { storeId, itemId, color: normalizedColor, lengthMm: lengthMm ?? null },
-    });
-    if (existing > 0) {
-        return res.status(409).json({
-            message: 'This item/store/color/length already has ledger activity -- opening balance can only be entered before go-live for a given combination',
+    // Item row lock first (see lockRow), so a double submit can't pass the
+    // "no activity yet" check twice and post two opening balances.
+    const t = await sequelizeUtf8.transaction();
+    let ledgerRow;
+    try {
+        if (!(await lockRow(MatWhItem, itemId, t))) {
+            await t.rollback();
+            return res.status(404).json({ message: 'Item not found' });
+        }
+        const existing = await MatWhStockLedger.count({
+            where: { storeId, itemId, color: normalizedColor, lengthMm: lengthMm ?? null },
+            transaction: t,
         });
-    }
+        if (existing > 0) {
+            await t.rollback();
+            return res.status(409).json({
+                message: 'This item/store/color/length already has ledger activity -- opening balance can only be entered before go-live for a given combination',
+            });
+        }
 
-    const ledgerRow = await postLedgerMovement({
-        storeId, itemId, qty, direction: 'in', docType: 'opening_balance',
-        refType: 'cutover', refId: null, unitCost, performedBy: req.user.userId,
-        color: normalizedColor, lengthMm: lengthMm ?? null,
-    });
+        ledgerRow = await postLedgerMovement({
+            storeId, itemId, qty, direction: 'in', docType: 'opening_balance',
+            refType: 'cutover', refId: null, unitCost, performedBy: req.user.userId,
+            color: normalizedColor, lengthMm: lengthMm ?? null,
+        }, t);
 
-    if (unitCost != null) {
-        await applyReceiptCost(itemId, storeId, qty, unitCost);
+        if (unitCost != null) {
+            await applyReceiptCost(itemId, storeId, qty, unitCost, t);
+        }
+        await t.commit();
+    } catch (err) {
+        await t.rollback();
+        console.error('Opening balance failed:', err);
+        return res.status(500).json({ message: 'Failed to post opening balance' });
     }
 
     res.status(201).json({
