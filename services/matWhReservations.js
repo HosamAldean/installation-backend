@@ -384,7 +384,10 @@ export async function rejectReservationLine(lineId, rejectedBy, reason) {
 // sense here, not on confirmReservationLine's genuinely isolated single
 // decision. All-or-nothing per call -- if any line's write fails, nothing
 // (including any PO already created earlier in this same call) is kept.
-export async function confirmReservation(headerId, confirmedBy) {
+// allowedStoreIds (null = every store, else a Set -- see matWhStoreAccess.js)
+// limits the bulk action to the caller's own stores' lines; other stores
+// keep deciding their own lines.
+export async function confirmReservation(headerId, confirmedBy, allowedStoreIds = null) {
     const header = await MatWhReservationHeader.findByPk(headerId);
     if (!header) {
         const err = new Error('Reservation not found');
@@ -398,9 +401,10 @@ export async function confirmReservation(headerId, confirmedBy) {
     }
 
     const lines = (await MatWhReservationItem.findAll({ where: { reservationHeaderId: headerId } }))
-        .filter((l) => l.status === 'pending');
+        .filter((l) => l.status === 'pending')
+        .filter((l) => allowedStoreIds === null || allowedStoreIds.has(l.storeId));
     if (lines.length === 0) {
-        const err = new Error('No pending items left to confirm');
+        const err = new Error(allowedStoreIds ? 'No pending items left to confirm in your stores' : 'No pending items left to confirm');
         err.status = 400;
         throw err;
     }
@@ -503,7 +507,7 @@ export async function confirmReservation(headerId, confirmedBy) {
 // Bulk convenience: rejects every still-pending line with one shared
 // reason -- for when the whole remaining request is being turned down at
 // once, not line by line.
-export async function rejectReservation(headerId, rejectedBy, reason) {
+export async function rejectReservation(headerId, rejectedBy, reason, allowedStoreIds = null) {
     const header = await MatWhReservationHeader.findByPk(headerId);
     if (!header) {
         const err = new Error('Reservation not found');
@@ -522,9 +526,10 @@ export async function rejectReservation(headerId, rejectedBy, reason) {
     }
 
     const lines = (await MatWhReservationItem.findAll({ where: { reservationHeaderId: headerId } }))
-        .filter((l) => l.status === 'pending');
+        .filter((l) => l.status === 'pending')
+        .filter((l) => allowedStoreIds === null || allowedStoreIds.has(l.storeId));
     if (lines.length === 0) {
-        const err = new Error('No pending items left to reject');
+        const err = new Error(allowedStoreIds ? 'No pending items left to reject in your stores' : 'No pending items left to reject');
         err.status = 400;
         throw err;
     }

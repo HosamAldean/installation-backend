@@ -24,6 +24,7 @@ import { MatWhPurchaseOrder } from '../models/MatWhPurchaseOrder.js';
 import { MatWhPurchaseOrderItem } from '../models/MatWhPurchaseOrderItem.js';
 import { MatWhStockLedger } from '../models/MatWhStockLedger.js';
 import { postLedgerMovement, getAvailableToReserve, getAlreadyReserved, getPendingQty, getPhysicalBalance, normalizeColor, getAvailableColorsForItem, lockRow } from '../services/matWhLedger.js';
+import { denyStore, getAllowedStoreIds } from '../services/matWhStoreAccess.js';
 import {
     createReservationHeader, submitReservation,
     confirmReservation, rejectReservation,
@@ -658,7 +659,7 @@ router.post('/reservations/:id/submit', requireReserve, async (req, res) => {
 // Bulk convenience: every still-pending line at once.
 router.post('/reservations/:id/confirm', requireReserve, async (req, res) => {
     try {
-        const result = await confirmReservation(Number(req.params.id), req.user.userId);
+        const result = await confirmReservation(Number(req.params.id), req.user.userId, await getAllowedStoreIds(req.user));
         res.json(result);
     } catch (err) {
         res.status(err.status || 500).json({ message: err.message || 'Failed to confirm reservation' });
@@ -669,7 +670,7 @@ router.post('/reservations/:id/confirm', requireReserve, async (req, res) => {
 // reason.
 router.post('/reservations/:id/reject', requireReserve, async (req, res) => {
     try {
-        const result = await rejectReservation(Number(req.params.id), req.user.userId, req.body?.reason);
+        const result = await rejectReservation(Number(req.params.id), req.user.userId, req.body?.reason, await getAllowedStoreIds(req.user));
         res.json(result);
     } catch (err) {
         res.status(err.status || 500).json({ message: err.message || 'Failed to reject reservation' });
@@ -683,6 +684,7 @@ router.post('/reservations/:id/items/:lineId/confirm', requireReserve, async (re
         where: { id: req.params.lineId, reservationHeaderId: req.params.id },
     });
     if (!line) return res.status(404).json({ message: 'Line not found' });
+    if (await denyStore(req, res, line.storeId)) return;
     try {
         // Optional -- the storekeeper's own manual cap on how much of this
         // line to actually decide on right now (e.g. correcting a real
@@ -709,6 +711,7 @@ router.post('/reservations/:id/items/:lineId/reject', requireReserve, async (req
         where: { id: req.params.lineId, reservationHeaderId: req.params.id },
     });
     if (!line) return res.status(404).json({ message: 'Line not found' });
+    if (await denyStore(req, res, line.storeId)) return;
     try {
         const result = await rejectReservationLine(line.id, req.user.userId, req.body?.reason);
         res.json(result);
@@ -732,6 +735,7 @@ router.post('/reservations/:id/items/:lineId/substitute', requireReserve, async 
         where: { id: req.params.lineId, reservationHeaderId: req.params.id },
     });
     if (!line) return res.status(404).json({ message: 'Line not found' });
+    if (await denyStore(req, res, line.storeId)) return;
     if (line.status !== 'partially_confirmed') {
         return res.status(409).json({ message: `Cannot substitute on a line in status '${line.status}' -- only a real shortfall can be covered this way` });
     }
@@ -799,6 +803,7 @@ router.post('/reservations/:id/items/:lineId/fulfill-shortfall', requireReserve,
         where: { id: req.params.lineId, reservationHeaderId: req.params.id },
     });
     if (!line) return res.status(404).json({ message: 'Line not found' });
+    if (await denyStore(req, res, line.storeId)) return;
     if (line.status !== 'partially_confirmed') {
         return res.status(409).json({ message: `Cannot fulfill shortfall on a line in status '${line.status}' -- only a real shortfall can be covered this way` });
     }
@@ -830,6 +835,7 @@ router.post('/reservations/:id/items/:lineId/issue', requireIssue, async (req, r
         where: { id: req.params.lineId, reservationHeaderId: req.params.id },
     });
     if (!line) return res.status(404).json({ message: 'Line not found' });
+    if (await denyStore(req, res, line.storeId)) return;
     try {
         const result = await issueReservationLine(line.id, req.user.userId, req.body?.issuedBarcode, req.body?.issuePurpose);
         res.json(result);
@@ -914,6 +920,9 @@ router.get('/issue-candidates', requireIssue, async (req, res) => {
 // up) which reservation a candidate line belongs to just to issue it;
 // issueReservationLine itself only ever needed the line id anyway.
 router.post('/reservation-items/:lineId/issue', requireIssue, async (req, res) => {
+    const line = await MatWhReservationItem.findByPk(req.params.lineId);
+    if (!line) return res.status(404).json({ message: 'Line not found' });
+    if (await denyStore(req, res, line.storeId)) return;
     try {
         const result = await issueReservationLine(
             Number(req.params.lineId), req.user.userId, req.body?.issuedBarcode, req.body?.issuePurpose,
@@ -952,6 +961,7 @@ async function getReturnedSoFar(lineId, transaction) {
 router.post('/reservation-items/:lineId/return', requireReceive, async (req, res) => {
     const line = await MatWhReservationItem.findByPk(req.params.lineId);
     if (!line) return res.status(404).json({ message: 'Line not found' });
+    if (await denyStore(req, res, line.storeId)) return;
     if (line.status !== 'issued') {
         return res.status(409).json({ message: `Cannot return a line in status '${line.status}' -- only an issued line has stock out to return` });
     }
@@ -1171,6 +1181,7 @@ router.post('/external-processing', requireIssue, async (req, res) => {
     if (!itemId || !storeId || !qtySent) {
         return res.status(400).json({ message: 'itemId, storeId and qtySent are required' });
     }
+    if (await denyStore(req, res, storeId)) return;
     const sourceColor = normalizeColor(req.body.color ? String(req.body.color) : null);
     const lengthMm = req.body.lengthMm ? Number(req.body.lengthMm) : null;
     // Item row lock first (see lockRow), so two concurrent sends of the
@@ -1206,6 +1217,7 @@ router.post('/external-processing', requireIssue, async (req, res) => {
 router.post('/external-processing/:id/receive', requireReceive, async (req, res) => {
     const row = await MatWhExternalProcessing.findByPk(req.params.id);
     if (!row) return res.status(404).json({ message: 'Not found' });
+    if (await denyStore(req, res, row.storeId)) return;
     if (row.status !== 'sent') {
         return res.status(409).json({ message: `Cannot receive a job in status '${row.status}'` });
     }
@@ -1284,6 +1296,7 @@ router.post('/external-processing/:id/receive', requireReceive, async (req, res)
 router.post('/external-processing/:id/confirm-send', requireIssue, async (req, res) => {
     const row = await MatWhExternalProcessing.findByPk(req.params.id);
     if (!row) return res.status(404).json({ message: 'Not found' });
+    if (await denyStore(req, res, row.storeId)) return;
     if (row.status !== 'draft') {
         return res.status(409).json({ message: `Cannot confirm-send a job in status '${row.status}'` });
     }
@@ -1415,6 +1428,7 @@ router.post('/external-processing/group/:requestNo/request-vendor', requireIssue
     if (rows.length === 0) {
         return res.status(404).json({ message: 'No draft coating jobs found for this request number' });
     }
+    if (await denyStore(req, res, ...new Set(rows.map((r) => r.storeId)))) return;
     await MatWhExternalProcessing.update({ processVendorId }, { where: { requestNo, status: 'draft' } });
     res.json({ updated: rows.map((r) => r.id) });
 });
@@ -1426,6 +1440,7 @@ router.post('/external-processing/group/:requestNo/confirm-send', requireIssue, 
     if (rows.length === 0) {
         return res.status(404).json({ message: 'No draft coating jobs found for this request number' });
     }
+    if (await denyStore(req, res, ...new Set(rows.map((r) => r.storeId)))) return;
 
     // A vendor named earlier via POST .../request-vendor (Mix already
     // acknowledged/scheduled against it) takes precedence -- the body's

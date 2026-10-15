@@ -13,6 +13,7 @@ import { MatWhStore } from '../models/MatWhStore.js';
 import { MatWhItem } from '../models/MatWhItem.js';
 import { MatWhItemVariant } from '../models/MatWhItemVariant.js';
 import { getAvailableToReserve } from '../services/matWhLedger.js';
+import { denyStore } from '../services/matWhStoreAccess.js';
 import {
     createTransfer, addLine, updateLine, removeLine, cancelTransfer, sendTransfer,
     receiveLines, lookupBarcode, loadTransfer,
@@ -22,6 +23,18 @@ const router = express.Router();
 router.use(authenticateToken);
 
 const requireTransfer = requirePermission(PERMISSIONS.MATERIALS_WAREHOUSE_TRANSFER);
+
+// Store scoping (see services/matWhStoreAccess.js): building, sending and
+// cancelling a transfer is the source store's action; receiving it is the
+// destination store's.
+function requireTransferStore(side) {
+    return async (req, res, next) => {
+        const transfer = await MatWhStoreTransfer.findByPk(req.params.id);
+        if (!transfer) return res.status(404).json({ message: 'Transfer not found' });
+        if (await denyStore(req, res, side === 'to' ? transfer.toStoreId : transfer.fromStoreId)) return;
+        next();
+    };
+}
 const OPEN_STATUSES = ['sent', 'partially_received'];
 
 function sendError(res, err, fallback) {
@@ -206,13 +219,14 @@ router.get('/store-transfers/:id', requireTransfer, async (req, res) => {
 router.post('/store-transfers', requireTransfer, async (req, res) => {
     try {
         const { fromStoreId, toStoreId, notes } = req.body || {};
+        if (fromStoreId && await denyStore(req, res, Number(fromStoreId))) return;
         res.status(201).json(await createTransfer({ fromStoreId, toStoreId, notes, createdBy: req.user.userId }));
     } catch (err) {
         sendError(res, err, 'Failed to create transfer');
     }
 });
 
-router.post('/store-transfers/:id/lines', requireTransfer, async (req, res) => {
+router.post('/store-transfers/:id/lines', requireTransfer, requireTransferStore('from'), async (req, res) => {
     if (!req.body?.itemId) return res.status(400).json({ message: 'itemId is required' });
     try {
         res.status(201).json(await addLine(Number(req.params.id), req.body));
@@ -221,7 +235,7 @@ router.post('/store-transfers/:id/lines', requireTransfer, async (req, res) => {
     }
 });
 
-router.put('/store-transfers/:id/lines/:lineId', requireTransfer, async (req, res) => {
+router.put('/store-transfers/:id/lines/:lineId', requireTransfer, requireTransferStore('from'), async (req, res) => {
     try {
         res.json(await updateLine(Number(req.params.id), Number(req.params.lineId), req.body?.qty));
     } catch (err) {
@@ -229,7 +243,7 @@ router.put('/store-transfers/:id/lines/:lineId', requireTransfer, async (req, re
     }
 });
 
-router.delete('/store-transfers/:id/lines/:lineId', requireTransfer, async (req, res) => {
+router.delete('/store-transfers/:id/lines/:lineId', requireTransfer, requireTransferStore('from'), async (req, res) => {
     try {
         await removeLine(Number(req.params.id), Number(req.params.lineId));
         res.json({ success: true });
@@ -238,7 +252,7 @@ router.delete('/store-transfers/:id/lines/:lineId', requireTransfer, async (req,
     }
 });
 
-router.post('/store-transfers/:id/send', requireTransfer, async (req, res) => {
+router.post('/store-transfers/:id/send', requireTransfer, requireTransferStore('from'), async (req, res) => {
     try {
         res.json(await sendTransfer(Number(req.params.id), req.user.userId));
     } catch (err) {
@@ -246,7 +260,7 @@ router.post('/store-transfers/:id/send', requireTransfer, async (req, res) => {
     }
 });
 
-router.post('/store-transfers/:id/receive', requireTransfer, async (req, res) => {
+router.post('/store-transfers/:id/receive', requireTransfer, requireTransferStore('to'), async (req, res) => {
     try {
         res.json(await receiveLines(Number(req.params.id), req.body?.lines, req.user.userId));
     } catch (err) {
@@ -254,7 +268,7 @@ router.post('/store-transfers/:id/receive', requireTransfer, async (req, res) =>
     }
 });
 
-router.post('/store-transfers/:id/cancel', requireTransfer, async (req, res) => {
+router.post('/store-transfers/:id/cancel', requireTransfer, requireTransferStore('from'), async (req, res) => {
     try {
         res.json(await cancelTransfer(Number(req.params.id)));
     } catch (err) {
