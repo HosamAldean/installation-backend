@@ -8,7 +8,7 @@ import { MatWhWriteoffRequest } from '../models/MatWhWriteoffRequest.js';
 import { MatWhWriteoffRequestItem } from '../models/MatWhWriteoffRequestItem.js';
 import { MatWhWriteoffReport } from '../models/MatWhWriteoffReport.js';
 import { MatWhWriteoffReportItem } from '../models/MatWhWriteoffReportItem.js';
-import { postLedgerMovement, getPhysicalBalance, normalizeColor, lockRow } from './matWhLedger.js';
+import { postLedgerMovement, getPhysicalBalance, normalizeColor, lockRow, lockItems } from './matWhLedger.js';
 
 const EPS = 0.000001;
 
@@ -85,7 +85,7 @@ function badRequest(message) {
 // per request, so a line's approved qty is its qtyRequested), and the total
 // destroyed per item/color/length can't exceed the store's physical balance
 // -- otherwise the writeoff posting drives stock negative.
-async function assertDestroyedQtys(request, items, requestItemById) {
+async function assertDestroyedQtys(request, items, requestItemById, transaction) {
     const perRequestItem = new Map();
     for (const { writeoffRequestItemId, qtyDestroyed } of items) {
         const requestItem = requestItemById.get(writeoffRequestItemId);
@@ -108,7 +108,7 @@ async function assertDestroyedQtys(request, items, requestItemById) {
         perPool.set(key, pool);
     }
     for (const pool of perPool.values()) {
-        const physical = await getPhysicalBalance(request.storeId, pool.itemId, pool.color, pool.lengthMm);
+        const physical = await getPhysicalBalance(request.storeId, pool.itemId, pool.color, pool.lengthMm, transaction);
         if (pool.qty > physical + EPS) {
             throw badRequest(`Item ${pool.itemId}: only ${physical} in stock at this store -- cannot destroy ${pool.qty}`);
         }
@@ -135,7 +135,6 @@ export async function createWriteoffReport({ writeoffRequestId, reportNo, destro
 
     const requestItems = await MatWhWriteoffRequestItem.findAll({ where: { writeoffRequestId } });
     const requestItemById = new Map(requestItems.map((ri) => [ri.id, ri]));
-    await assertDestroyedQtys(request, items, requestItemById);
 
     const t = await sequelizeUtf8.transaction();
     try {
@@ -145,6 +144,11 @@ export async function createWriteoffReport({ writeoffRequestId, reportNo, destro
             err.status = 409;
             throw err;
         }
+        // Item locks (see lockItems), then the stock check inside t, so a
+        // concurrent movement of the same items can't slip between the
+        // check and the posting.
+        await lockItems(requestItems.map((ri) => ri.itemId), t);
+        await assertDestroyedQtys(request, items, requestItemById, t);
         const report = await MatWhWriteoffReport.create({
             writeoffRequestId, reportNo, destroyedDate,
             createdBy: createdBy ?? null, status: 'recorded',

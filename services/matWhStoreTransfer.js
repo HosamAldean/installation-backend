@@ -13,7 +13,7 @@ import { MatWhItemVariant } from '../models/MatWhItemVariant.js';
 import { MatWhItemCost } from '../models/MatWhItemCost.js';
 import { MatWhItemStore } from '../models/MatWhItemStore.js';
 import {
-    postLedgerMovement, applyReceiptCost, getAvailableToReserve, normalizeColor,
+    postLedgerMovement, applyReceiptCost, getAvailableToReserve, normalizeColor, lockItems,
 } from './matWhLedger.js';
 
 const EPS = 0.000001;
@@ -138,25 +138,44 @@ export async function sendTransfer(transferId, sentBy) {
     const lines = await MatWhStoreTransferLine.findAll({ where: { storeTransferId: transferId } });
     if (lines.length === 0) throw httpError(400, 'Add at least one item before sending');
 
-    const short = [];
-    for (const line of lines) {
-        const available = await getAvailableToReserve(transfer.fromStoreId, line.itemId, line.color, line.lengthMm);
-        if (line.qtySent > available + EPS) short.push({ lineId: line.id, itemId: line.itemId, available, requested: line.qtySent });
-    }
-    if (short.length) {
-        const err = httpError(409, `${short.length} line(s) exceed the stock available in the source store`);
-        err.details = short;
-        throw err;
-    }
-
-    const costs = await MatWhItemCost.findAll({
-        where: { storeId: transfer.fromStoreId, itemId: [...new Set(lines.map((l) => l.itemId))] },
-    });
-    const costByItem = new Map(costs.map((c) => [c.itemId, c.currentCost]));
-
     const t = await sequelizeUtf8.transaction();
     try {
+        // Transfer, then its items (see lockItems), before any read: the
+        // availability check below runs under the same item locks that
+        // reservation confirms take, so the two can't both hand out the
+        // same free stock.
         await lockTransfer(transfer.id, ['draft'], t);
+        await lockItems(lines.map((l) => l.itemId), t);
+
+        // Same-pool lines share one available figure, so it's checked
+        // per pool against the pool's total being sent.
+        const pools = new Map();
+        for (const line of lines) {
+            const key = `${line.itemId}|${line.color ?? ''}|${line.lengthMm ?? ''}`;
+            const pool = pools.get(key) || { itemId: line.itemId, color: line.color, lengthMm: line.lengthMm, qty: 0, lineIds: [] };
+            pool.qty += Number(line.qtySent);
+            pool.lineIds.push(line.id);
+            pools.set(key, pool);
+        }
+        const short = [];
+        for (const pool of pools.values()) {
+            const available = await getAvailableToReserve(transfer.fromStoreId, pool.itemId, pool.color, pool.lengthMm, undefined, t);
+            if (pool.qty > available + EPS) {
+                for (const lineId of pool.lineIds) short.push({ lineId, itemId: pool.itemId, available, requested: pool.qty });
+            }
+        }
+        if (short.length) {
+            const err = httpError(409, `${short.length} line(s) exceed the stock available in the source store`);
+            err.details = short;
+            throw err;
+        }
+
+        const costs = await MatWhItemCost.findAll({
+            where: { storeId: transfer.fromStoreId, itemId: [...new Set(lines.map((l) => l.itemId))] },
+            transaction: t,
+        });
+        const costByItem = new Map(costs.map((c) => [c.itemId, c.currentCost]));
+
         for (const line of lines) {
             const unitCost = costByItem.get(line.itemId) ?? null;
             const entry = await postLedgerMovement({

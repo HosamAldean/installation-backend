@@ -1369,10 +1369,6 @@ router.post('/external-processing/:id/confirm-send', requireIssue, async (req, r
     // sourceColor normalizes to mill -- see getAvailableToReserve's own
     // comment on excludeLineId).
     const sourceColor = normalizeColor(req.body.sourceColor ? String(req.body.sourceColor) : null);
-    const available = await getAvailableToReserve(row.storeId, row.itemId, sourceColor, undefined, row.sourceReservationItemId);
-    if (qtySent > available) {
-        return res.status(409).json({ message: `Only ${available} available to send`, available });
-    }
 
     // No barcode gate here anymore -- per direct request. The explicit
     // color picker (validated server-side against GET /available-colors'
@@ -1387,6 +1383,14 @@ router.post('/external-processing/:id/confirm-send', requireIssue, async (req, r
         if (locked.status !== 'draft') {
             await t.rollback();
             return res.status(409).json({ message: `Cannot confirm-send a job in status '${locked.status}'` });
+        }
+        // Item lock (see lockItems), then availability read inside t -- so
+        // a reservation confirm can't earmark the same stock meanwhile.
+        await lockItems([row.itemId], t);
+        const available = await getAvailableToReserve(row.storeId, row.itemId, sourceColor, undefined, row.sourceReservationItemId, t);
+        if (qtySent > available) {
+            await t.rollback();
+            return res.status(409).json({ message: `Only ${available} available to send`, available });
         }
         await splitOffRemainder(row, qtySent, t);
         await postLedgerMovement({
@@ -1509,25 +1513,6 @@ router.post('/external-processing/group/:requestNo/confirm-send', requireIssue, 
     const toSend = ready.filter((row) => sendQtyFor(row) > 0);
     const heldBack = ready.filter((row) => !(sendQtyFor(row) > 0));
 
-    // Check every to-send job's own chosen-color availability BEFORE
-    // writing anything -- same reasoning as the single-job route's own
-    // check (including excluding each job's own source reservation line --
-    // see getAvailableToReserve's own comment), just done as one pre-pass
-    // so a shortfall on item 3 of 5 doesn't leave the first 2 already sent
-    // while the rest silently fail. Checked against the chosen send qty,
-    // not the job's full qtySent -- sending only part of it needs only
-    // that much available, never the whole thing.
-    for (const row of toSend) {
-        const available = await getAvailableToReserve(row.storeId, row.itemId, sourceColorFor(row), undefined, row.sourceReservationItemId);
-        const sendQty = sendQtyFor(row);
-        if (sendQty > available) {
-            return res.status(409).json({
-                message: `Only ${available} available to send for item ${row.itemId} -- adjust that job's quantity first`,
-                itemId: row.itemId, available,
-            });
-        }
-    }
-
     // No barcode gate here anymore -- per direct request. The explicit
     // color picker (validated server-side against GET /available-colors'
     // own real stock figures) already confirms what's being sent at least
@@ -1546,9 +1531,25 @@ router.post('/external-processing/group/:requestNo/confirm-send', requireIssue, 
                 return res.status(409).json({ message: `Job ${row.requestNo} is already '${locked.status}' -- reload and try again` });
             }
         }
+        // Then every involved item (see lockItems), so a reservation
+        // confirm can't earmark the same stock while this posts.
+        await lockItems(toSend.map((row) => row.itemId), t);
         for (const row of toSend) {
             const sourceColor = sourceColorFor(row);
             const sendQty = sendQtyFor(row);
+            // Each job's chosen-color availability, read inside t right
+            // before it posts -- so earlier jobs in this same group already
+            // count against it -- and excluding its own source reservation
+            // line (see getAvailableToReserve). Any shortfall rolls back the
+            // whole group: nothing is half-sent.
+            const available = await getAvailableToReserve(row.storeId, row.itemId, sourceColor, undefined, row.sourceReservationItemId, t);
+            if (sendQty > available) {
+                await t.rollback();
+                return res.status(409).json({
+                    message: `Only ${available} available to send for item ${row.itemId} -- adjust that job's quantity first`,
+                    itemId: row.itemId, available,
+                });
+            }
             await splitOffRemainder(row, sendQty, t);
             await postLedgerMovement({
                 storeId: row.storeId, itemId: row.itemId, qty: sendQty, direction: 'out',
