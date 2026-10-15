@@ -111,8 +111,12 @@ router.post('/writeoff-requests/:id/items', requireWriteoff, async (req, res) =>
     if (!itemId || !qtyRequested) {
         return res.status(400).json({ message: 'itemId and qtyRequested are required' });
     }
+    const qty = Number(qtyRequested);
+    if (!Number.isFinite(qty) || qty <= 0) {
+        return res.status(400).json({ message: 'qtyRequested must be a number greater than 0' });
+    }
     const line = await MatWhWriteoffRequestItem.create({
-        writeoffRequestId: request.id, itemId, qtyRequested, reason: reason || null,
+        writeoffRequestId: request.id, itemId, qtyRequested: qty, reason: reason || null,
         color: color || null, lengthMm: lengthMm ?? null,
     });
     res.status(201).json(line);

@@ -23,7 +23,7 @@ import { MatWhItem } from '../models/MatWhItem.js';
 import { MatWhItemVariant } from '../models/MatWhItemVariant.js';
 import {
     createStockCount, countLine, addExtraLine, lookupBarcode, submitStockCount, cancelStockCount,
-    recountLines, rejectStockCount, approveStockCount, reservationWarnings, currentCosts,
+    recountLines, rejectStockCount, approveStockCount, reservationWarnings, inTransitForCount, currentCosts,
 } from '../services/matWhStockCount.js';
 
 const router = express.Router();
@@ -58,7 +58,7 @@ function requireAnyStockCountAccess(req, res, next) {
 
 function sendError(res, err, fallback) {
     if (!err.status) console.error(fallback, err);
-    res.status(err.status || 500).json({ message: err.status ? err.message : fallback });
+    res.status(err.status || 500).json({ message: err.status ? err.message : fallback, code: err.code, details: err.details });
 }
 
 // Counters only ever get what they need to count.
@@ -195,7 +195,8 @@ router.get('/stock-counts/:id', requireAnyStockCountAccess, async (req, res) => 
     });
 
     const warnings = approver && count.status === 'submitted' ? await reservationWarnings(count, lines) : [];
-    res.json({ ...count.toJSON(), ...(stores.get(count.storeId) || {}), canApprove: approver, lines: shaped, warnings });
+    const inTransit = ['counting', 'submitted'].includes(count.status) ? await inTransitForCount(count, lines) : [];
+    res.json({ ...count.toJSON(), ...(stores.get(count.storeId) || {}), canApprove: approver, lines: shaped, warnings, inTransit });
 });
 
 router.post('/stock-counts', requireCount, async (req, res) => {
@@ -279,6 +280,7 @@ router.post('/stock-counts/:id/approve', requireApprove, async (req, res) => {
     try {
         const { count, warnings } = await approveStockCount(Number(req.params.id), req.user.userId, {
             unitCosts: req.body?.unitCosts, notes: req.body?.notes,
+            acknowledgeInTransit: req.body?.acknowledgeInTransit === true,
         });
         res.json({ ...count.toJSON(), warnings });
     } catch (err) {
