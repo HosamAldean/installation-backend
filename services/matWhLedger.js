@@ -8,6 +8,7 @@ import { Op } from 'sequelize';
 import { MatWhStockLedger } from '../models/MatWhStockLedger.js';
 import { MatWhReservationItem } from '../models/MatWhReservationItem.js';
 import { MatWhItemCost } from '../models/MatWhItemCost.js';
+import { MatWhItem } from '../models/MatWhItem.js';
 
 // Lines that count against availability: confirmed in full, or confirmed
 // for whatever was available with the rest covered by an auto-PO. A
@@ -39,6 +40,17 @@ export function normalizeColor(color) {
 // it would pin an older snapshot for the rest of the transaction.
 export async function lockRow(model, id, transaction) {
     return model.findByPk(id, { transaction, lock: transaction.LOCK.UPDATE });
+}
+
+// Item-level lock for anything that hands out "available to reserve"
+// (reservation confirm, substitute, fulfill-shortfall): two of those for
+// the same item would otherwise both read the same free stock and both
+// earmark it. Ascending id order so two multi-item callers can't deadlock;
+// callers that also lock reservation lines take the item locks FIRST.
+export async function lockItems(itemIds, transaction) {
+    for (const id of [...new Set(itemIds.map(Number))].sort((a, b) => a - b)) {
+        await lockRow(MatWhItem, id, transaction);
+    }
 }
 
 // matWhStockLedger.color is always write-normalized (see
@@ -105,11 +117,14 @@ export async function postLedgerMovement({
 // convention as `color` -- omit it entirely for today's exact behavior
 // (every existing color-only caller is unaffected), pass a real number to
 // scope the balance to that one length specifically.
-export async function getPhysicalBalance(storeId, itemId, color, lengthMm) {
+// `transaction` (optional, every balance helper below): read inside the
+// caller's transaction so its own uncommitted earmarks count, and -- after
+// a lockItems -- so the read reflects whatever the lock waited for.
+export async function getPhysicalBalance(storeId, itemId, color, lengthMm, transaction) {
     const where = { storeId, itemId };
     if (color !== undefined) where.color = normalizeColor(color);
     if (lengthMm !== undefined) where.lengthMm = lengthMm;
-    const rows = await MatWhStockLedger.findAll({ where });
+    const rows = await MatWhStockLedger.findAll({ where, transaction });
     let balance = 0;
     for (const r of rows) balance += r.direction === 'in' ? r.qty : -r.qty;
     return balance;
@@ -130,9 +145,9 @@ export async function getPhysicalBalance(storeId, itemId, color, lengthMm) {
 // it from the reserved-elsewhere sum, same as every other caller of
 // getAlreadyReserved already does for its own line. Omitted (the default,
 // every other caller) keeps today's behavior unchanged.
-export async function getAvailableToReserve(storeId, itemId, color, lengthMm, excludeLineId) {
-    const physical = await getPhysicalBalance(storeId, itemId, color, lengthMm);
-    const reserved = await getAlreadyReserved(storeId, itemId, excludeLineId, color, lengthMm);
+export async function getAvailableToReserve(storeId, itemId, color, lengthMm, excludeLineId, transaction) {
+    const physical = await getPhysicalBalance(storeId, itemId, color, lengthMm, transaction);
+    const reserved = await getAlreadyReserved(storeId, itemId, excludeLineId, color, lengthMm, transaction);
     return physical - reserved;
 }
 
@@ -141,7 +156,7 @@ export async function getAvailableToReserve(storeId, itemId, color, lengthMm, ex
 // reserve figure is competing against. Exposed separately from
 // getAvailableToReserve so the reservation UI can show "already reserved: N"
 // alongside "available: N" on the same line, not just the net figure.
-export async function getAlreadyReserved(storeId, itemId, excludeLineId, color, lengthMm) {
+export async function getAlreadyReserved(storeId, itemId, excludeLineId, color, lengthMm, transaction) {
     const where = { storeId, itemId, status: HELD_STATUSES, ...reservationItemColorWhere(color) };
     // Same "omitted = pooled, explicit = narrowed" convention as color --
     // see getPhysicalBalance. Deliberately NOT applied to the
@@ -149,7 +164,7 @@ export async function getAlreadyReserved(storeId, itemId, excludeLineId, color, 
     // pool by color alone today; scoping it to length too is real future
     // work, out of scope for this pass (adding the variant/barcode layer).
     if (lengthMm !== undefined) where.lengthMm = lengthMm;
-    const rows = await MatWhReservationItem.findAll({ where });
+    const rows = await MatWhReservationItem.findAll({ where, transaction });
     let total = rows
         .filter((r) => r.id !== excludeLineId)
         .reduce((sum, r) => sum + r.qtyReserved, 0);
@@ -167,6 +182,7 @@ export async function getAlreadyReserved(storeId, itemId, excludeLineId, color, 
     if (color !== undefined && normalizeColor(color) === null) {
         const pendingRows = await MatWhReservationItem.findAll({
             where: { storeId, itemId, status: HELD_STATUSES },
+            transaction,
         });
         total += pendingRows
             .filter((r) => r.id !== excludeLineId)

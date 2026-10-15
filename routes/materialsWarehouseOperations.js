@@ -23,7 +23,7 @@ import { MatWhCoatingInvoice } from '../models/MatWhCoatingInvoice.js';
 import { MatWhPurchaseOrder } from '../models/MatWhPurchaseOrder.js';
 import { MatWhPurchaseOrderItem } from '../models/MatWhPurchaseOrderItem.js';
 import { MatWhStockLedger } from '../models/MatWhStockLedger.js';
-import { postLedgerMovement, getAvailableToReserve, getAlreadyReserved, getPendingQty, getPhysicalBalance, normalizeColor, getAvailableColorsForItem, lockRow } from '../services/matWhLedger.js';
+import { postLedgerMovement, getAvailableToReserve, getAlreadyReserved, getPendingQty, getPhysicalBalance, normalizeColor, getAvailableColorsForItem, lockRow, lockItems } from '../services/matWhLedger.js';
 import { denyStore, getAllowedStoreIds } from '../services/matWhStoreAccess.js';
 import {
     createReservationHeader, submitReservation,
@@ -756,13 +756,24 @@ router.post('/reservations/:id/items/:lineId/substitute', requireReserve, async 
     const substituteItem = await MatWhItem.findByPk(itemId);
     if (!substituteItem) return res.status(400).json({ message: `Unknown item id: ${itemId}` });
 
-    const available = await getAvailableToReserve(line.storeId, itemId, color || undefined, lengthMm ?? undefined);
-    if (available < qty) {
-        return res.status(409).json({ message: `Only ${available} of the substitute item available at this store`, available });
-    }
-
+    // Substitute item locked first, then the line (see lockItems), and both
+    // the shortfall and availability re-checked under lock -- otherwise a
+    // double click or a concurrent confirm could hand out the same stock
+    // twice.
     const t = await sequelizeUtf8.transaction();
     try {
+        await lockItems([itemId], t);
+        const locked = await lockRow(MatWhReservationItem, line.id, t);
+        if (locked.status !== 'partially_confirmed' || qty > Number(locked.qtyShortfall) + 0.0001) {
+            await t.rollback();
+            return res.status(409).json({ message: `Only ${locked.status === 'partially_confirmed' ? locked.qtyShortfall : 0} still owed on this line -- cannot substitute more than that` });
+        }
+        const available = await getAvailableToReserve(line.storeId, itemId, color || undefined, lengthMm ?? undefined, undefined, t);
+        if (available < qty) {
+            await t.rollback();
+            return res.status(409).json({ message: `Only ${available} of the substitute item available at this store`, available });
+        }
+
         const substituteLine = await MatWhReservationItem.create({
             reservationHeaderId: line.reservationHeaderId, itemId, storeId: line.storeId,
             color: color || null, lengthMm: lengthMm ?? null,
@@ -771,14 +782,14 @@ router.post('/reservations/:id/items/:lineId/substitute', requireReserve, async 
             substitutesLineId: line.id,
         }, { transaction: t });
 
-        const remainingShortfall = Number(line.qtyShortfall) - qty;
-        await line.update({
+        const remainingShortfall = Number(locked.qtyShortfall) - qty;
+        await locked.update({
             qtyShortfall: Math.max(0, remainingShortfall),
             status: remainingShortfall > 0.0001 ? 'partially_confirmed' : 'confirmed',
         }, { transaction: t });
 
         await t.commit();
-        res.status(201).json({ originalLine: line, substituteLine });
+        res.status(201).json({ originalLine: locked, substituteLine });
     } catch (err) {
         await t.rollback();
         console.error('Error substituting reservation line:', err);
@@ -808,21 +819,37 @@ router.post('/reservations/:id/items/:lineId/fulfill-shortfall', requireReserve,
         return res.status(409).json({ message: `Cannot fulfill shortfall on a line in status '${line.status}' -- only a real shortfall can be covered this way` });
     }
 
-    const available = await getAvailableToReserve(
-        line.storeId, line.itemId, line.color ?? undefined, line.lengthMm ?? undefined,
-    );
-    if (!(available > 0)) {
-        return res.status(409).json({ message: 'No newly-available stock for this item/color yet', available });
-    }
+    // Same item-then-line lock + re-check as confirm (see lockItems).
+    const t = await sequelizeUtf8.transaction();
+    try {
+        await lockItems([line.itemId], t);
+        const locked = await lockRow(MatWhReservationItem, line.id, t);
+        if (locked.status !== 'partially_confirmed') {
+            await t.rollback();
+            return res.status(409).json({ message: `Cannot fulfill shortfall on a line in status '${locked.status}' -- only a real shortfall can be covered this way` });
+        }
+        const available = await getAvailableToReserve(
+            locked.storeId, locked.itemId, locked.color ?? undefined, locked.lengthMm ?? undefined, undefined, t,
+        );
+        if (!(available > 0)) {
+            await t.rollback();
+            return res.status(409).json({ message: 'No newly-available stock for this item/color yet', available });
+        }
 
-    const qtyToApply = Math.min(Number(line.qtyShortfall), available);
-    const remainingShortfall = Number(line.qtyShortfall) - qtyToApply;
-    await line.update({
-        qtyReserved: Number(line.qtyReserved) + qtyToApply,
-        qtyShortfall: Math.max(0, remainingShortfall),
-        status: remainingShortfall > 0.0001 ? 'partially_confirmed' : 'confirmed',
-    });
-    res.json(line);
+        const qtyToApply = Math.min(Number(locked.qtyShortfall), available);
+        const remainingShortfall = Number(locked.qtyShortfall) - qtyToApply;
+        await locked.update({
+            qtyReserved: Number(locked.qtyReserved) + qtyToApply,
+            qtyShortfall: Math.max(0, remainingShortfall),
+            status: remainingShortfall > 0.0001 ? 'partially_confirmed' : 'confirmed',
+        }, { transaction: t });
+        await t.commit();
+        res.json(locked);
+    } catch (err) {
+        await t.rollback();
+        console.error('Error fulfilling shortfall:', err);
+        res.status(500).json({ message: 'Failed to fulfill shortfall' });
+    }
 });
 
 // Storekeeper's physical hand-over of one confirmed line (WM 10-22) --
