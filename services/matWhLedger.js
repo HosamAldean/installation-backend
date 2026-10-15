@@ -234,28 +234,35 @@ export async function getAvailableColorsForItem(storeId, itemId, lengthMm) {
     return results;
 }
 
-// WH.4. Feeds matWhItemCost's running valuation -- called only from a
-// goods-receipt posting (the actual acquisition/cost event), matching
-// Alpha's own real precedent (Ord_GetItemUnitCost only concerns itself
-// with purchase receipts, §05). NOT called for transfer/external-
-// processing/other ledger movements -- those change physical balance
-// (tracked by getPhysicalBalance/getAvailableToReserve above) without
-// being a new cost-bearing acquisition. This is a deliberate scope
-// boundary, not an oversight: onHandQty here is a cost-basis quantity for
-// the weighted-average calculation, not a live mirror of physical balance
-// -- keeping the two fully reconciled across every movement type (issues,
-// write-offs, transfer cost carry-forward) is real future work.
+// WH.4. Feeds matWhItemCost's running valuation (one row per item+store,
+// all colors/lengths pooled) from every cost-bearing inflow: goods
+// receipt, opening balance, transfer receive (carrying the source cost),
+// and a stock-count gain.
+//
+// The quantity already on hand comes from the ledger itself, not a stored
+// counter: issues, write-offs, transfers out etc. never touched the old
+// counter, so after stock went out the previous average kept far too much
+// weight. Every caller posts this receipt's ledger movement first in the
+// same transaction, so the balance read here already includes it.
+// onHandQty is kept as the stock level at the last cost update (nothing
+// reads it as live stock).
+//
+// The cost row is locked so two receipts at once can't lose an update; a
+// receipt committed by another transaction while this one waited may be
+// missing from this transaction's balance read, which only slightly
+// under-weights the old average -- acceptable for a valuation figure.
 export async function applyReceiptCost(itemId, storeId, qtyAccepted, unitCost, transaction) {
     if (!qtyAccepted || unitCost == null) return;
 
-    const [row] = await MatWhItemCost.findOrCreate({
+    const [created] = await MatWhItemCost.findOrCreate({
         where: { itemId, storeId },
         defaults: { lastCost: null, weightedAvgCost: null, onHandQty: 0 },
         transaction,
     });
+    const row = await lockRow(MatWhItemCost, created.id, transaction);
 
-    const oldOnHand = row.onHandQty || 0;
-    const newOnHand = oldOnHand + qtyAccepted;
+    const newOnHand = await getPhysicalBalance(storeId, itemId, undefined, undefined, transaction);
+    const oldOnHand = Math.max(0, newOnHand - qtyAccepted);
     const newWeightedAvg = oldOnHand > 0 && row.weightedAvgCost != null
         ? (oldOnHand * row.weightedAvgCost + qtyAccepted * unitCost) / newOnHand
         : unitCost;
