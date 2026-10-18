@@ -29,7 +29,7 @@ import {
     HrOvertimeRequest,
 } from "../models/index.js";
 import { isSupervisorOf, getSupervisedEmpNos, hasRealSupervisor, getEmpNosWithoutRealSupervisor, getSupervisorUserId, getFallbackManagerUserIds, isGeneralManager } from "../utils/supervisorLookup.js";
-import { isHrScopedRole, getHrQueueEmpNos, isInHrQueueScope, getHrReviewerUserIds, getFinanceReviewerUserIds, getGmReviewerUserIds } from "../utils/hrScope.js";
+import { isHrScopedRole, getHrQueueEmpNos, isInHrQueueScope, getHrReviewerUserIds, getFinanceReviewerUserIds, getGmReviewerUserIds, getFactoryManagerUserIds, needsFactoryManagerStep, FACTORY_MANAGER_EMP_NO } from "../utils/hrScope.js";
 import { resolveEmployeeNames, resolveVacationBalances } from "../utils/employeeLookup.js";
 import { resolveUserNames } from "../utils/userLookup.js";
 import { resolveProjectLabels, withProjectDisplay } from "../utils/projectLookup.js";
@@ -101,6 +101,24 @@ async function notifyGmReviewers({ title, body }) {
     }
 }
 
+// A manager just moved this request to pending_factory_mgr -- tell the
+// requester where it stands and the factory manager that it's his turn.
+async function notifyAwaitingFactoryManager(request, { title, noun }) {
+    sendPushToUser(request.requesterUserId, {
+        title,
+        body: `Your manager approved your ${noun} — now awaiting the factory manager.`,
+    });
+    try {
+        const ids = await getFactoryManagerUserIds();
+        ids.forEach((id) => sendPushToUser(id, {
+            title: `${noun.charAt(0).toUpperCase() + noun.slice(1)} awaiting factory manager approval`,
+            body: `A manager-approved ${noun} needs your review.`,
+        }));
+    } catch (err) {
+        console.error("❌ Failed to notify factory manager:", err);
+    }
+}
+
 // Authorization for the overtime gm-decision stage -- same shape as
 // isAuthorizedManagerDecision below (check the caller's own assignedEmpNo,
 // admin bypass), except there's no Supervisor_No chain to walk: it's a
@@ -137,6 +155,59 @@ async function isAuthorizedManagerDecision(req, requesterEmpNo) {
     if (await isSupervisorOf(callerEmpNo, requesterEmpNo)) return true;
     if (req.user.role === "hr_manager" && !(await hasRealSupervisor(requesterEmpNo))) return true;
     return false;
+}
+
+// The factory-manager stage (pending_factory_mgr, see
+// needsFactoryManagerStep in utils/hrScope.js) -- decided by employee
+// FACTORY_MANAGER_EMP_NO himself, or admin.
+function isFactoryManagerCaller(req) {
+    if (req.user.role === "admin") return true;
+    return parseInt(req.user.assignedEmpNo) === FACTORY_MANAGER_EMP_NO;
+}
+
+// Shared by all 4 .../manager-decision endpoints. Covers both
+// pending_manager and pending_factory_mgr on the same URL, so the existing
+// web/mobile Approvals screens act on the factory-manager stage without a
+// client change. nextStatus is where an approval at the last of these two
+// stages goes (pending_hr, pending_hr_audit, or pending_gm). Returns the
+// stage decided ("manager" | "factory_mgr"), or null after already
+// sending an error response.
+async function applyManagerStageDecision(req, res, request, decision, note, nextStatus) {
+    const callerEmpNo = req.user.assignedEmpNo ? parseInt(req.user.assignedEmpNo) : null;
+    if (request.status === "pending_factory_mgr") {
+        if (!isFactoryManagerCaller(req)) {
+            res.status(403).json({ success: false, message: "Only the factory manager can act on this stage" });
+            return null;
+        }
+        await request.update({
+            factoryMgrApproverEmpNo: callerEmpNo,
+            factoryMgrDecision: decision,
+            factoryMgrDecidedAt: new Date(),
+            factoryMgrNote: note || null,
+            status: decision === "approved" ? nextStatus : "rejected",
+        });
+        return "factory_mgr";
+    }
+    if (request.status !== "pending_manager") {
+        res.status(400).json({ success: false, message: "This request is not awaiting manager review" });
+        return null;
+    }
+    if (!(await isAuthorizedManagerDecision(req, request.requesterEmpNo))) {
+        res.status(403).json({ success: false, message: "You are not this employee's supervisor" });
+        return null;
+    }
+    let status = "rejected";
+    if (decision === "approved") {
+        status = (await needsFactoryManagerStep(request.requesterEmpNo, callerEmpNo)) ? "pending_factory_mgr" : nextStatus;
+    }
+    await request.update({
+        managerApproverEmpNo: callerEmpNo,
+        managerDecision: decision,
+        managerDecidedAt: new Date(),
+        managerNote: note || null,
+        status,
+    });
+    return "manager";
 }
 
 // Sick-note / death-certificate attachment on a leave request -- mandatory
@@ -473,24 +544,16 @@ router.put("/leave-requests/:id/manager-decision", authenticateToken, async (req
     try {
         const request = await HrLeaveRequest.findByPk(req.params.id);
         if (!request) return res.status(404).json({ success: false, message: "Request not found" });
-        if (request.status !== "pending_manager") {
-            return res.status(400).json({ success: false, message: "This request is not awaiting manager review" });
+        const stage = await applyManagerStageDecision(req, res, request, decision, note, "pending_hr");
+        if (!stage) return;
+        if (request.status === "pending_factory_mgr") {
+            notifyAwaitingFactoryManager(request, { title: "Leave request update", noun: "leave request" });
+            return res.json({ success: true });
         }
-        const callerEmpNo = req.user.assignedEmpNo ? parseInt(req.user.assignedEmpNo) : null;
-        if (!(await isAuthorizedManagerDecision(req, request.requesterEmpNo))) {
-            return res.status(403).json({ success: false, message: "You are not this employee's supervisor" });
-        }
-
-        await request.update({
-            managerApproverEmpNo: callerEmpNo,
-            managerDecision: decision,
-            managerDecidedAt: new Date(),
-            managerNote: note || null,
-            status: decision === "approved" ? "pending_hr" : "rejected",
-        });
+        const by = stage === "factory_mgr" ? "The factory manager" : "Your manager";
         sendPushToUser(request.requesterUserId, {
             title: "Leave request update",
-            body: decision === "approved" ? "Your manager approved your leave request — now awaiting HR." : "Your manager rejected your leave request.",
+            body: decision === "approved" ? `${by} approved your leave request — now awaiting HR.` : `${by} rejected your leave request.`,
         });
         if (decision === "approved") {
             notifyHrReviewers(request.requesterEmpNo, {
@@ -578,24 +641,16 @@ router.put("/attendance-corrections/:id/manager-decision", authenticateToken, as
     try {
         const request = await HrAttendanceCorrectionRequest.findByPk(req.params.id);
         if (!request) return res.status(404).json({ success: false, message: "Request not found" });
-        if (request.status !== "pending_manager") {
-            return res.status(400).json({ success: false, message: "This request is not awaiting manager review" });
+        const stage = await applyManagerStageDecision(req, res, request, decision, note, "pending_hr");
+        if (!stage) return;
+        if (request.status === "pending_factory_mgr") {
+            notifyAwaitingFactoryManager(request, { title: "Attendance correction update", noun: "attendance correction" });
+            return res.json({ success: true });
         }
-        const callerEmpNo = req.user.assignedEmpNo ? parseInt(req.user.assignedEmpNo) : null;
-        if (!(await isAuthorizedManagerDecision(req, request.requesterEmpNo))) {
-            return res.status(403).json({ success: false, message: "You are not this employee's supervisor" });
-        }
-
-        await request.update({
-            managerApproverEmpNo: callerEmpNo,
-            managerDecision: decision,
-            managerDecidedAt: new Date(),
-            managerNote: note || null,
-            status: decision === "approved" ? "pending_hr" : "rejected",
-        });
+        const by = stage === "factory_mgr" ? "The factory manager" : "Your manager";
         sendPushToUser(request.requesterUserId, {
             title: "Attendance correction update",
-            body: decision === "approved" ? "Your manager approved your attendance correction — now awaiting HR." : "Your manager rejected your attendance correction.",
+            body: decision === "approved" ? `${by} approved your attendance correction — now awaiting HR.` : `${by} rejected your attendance correction.`,
         });
         if (decision === "approved") {
             notifyHrReviewers(request.requesterEmpNo, {
@@ -729,24 +784,16 @@ router.put("/transport-requests/:id/manager-decision", authenticateToken, async 
     try {
         const request = await HrTransportRequest.findByPk(req.params.id);
         if (!request) return res.status(404).json({ success: false, message: "Request not found" });
-        if (request.status !== "pending_manager") {
-            return res.status(400).json({ success: false, message: "This request is not awaiting manager review" });
+        const stage = await applyManagerStageDecision(req, res, request, decision, note, "pending_hr_audit");
+        if (!stage) return;
+        if (request.status === "pending_factory_mgr") {
+            notifyAwaitingFactoryManager(request, { title: "Transportation request update", noun: "transportation request" });
+            return res.json({ success: true });
         }
-        const callerEmpNo = req.user.assignedEmpNo ? parseInt(req.user.assignedEmpNo) : null;
-        if (!(await isAuthorizedManagerDecision(req, request.requesterEmpNo))) {
-            return res.status(403).json({ success: false, message: "You are not this employee's supervisor" });
-        }
-
-        await request.update({
-            managerApproverEmpNo: callerEmpNo,
-            managerDecision: decision,
-            managerDecidedAt: new Date(),
-            managerNote: note || null,
-            status: decision === "approved" ? "pending_hr_audit" : "rejected",
-        });
+        const by = stage === "factory_mgr" ? "The factory manager" : "Your manager";
         sendPushToUser(request.requesterUserId, {
             title: "Transportation request update",
-            body: decision === "approved" ? "Your manager approved your transportation request — now awaiting HR audit." : "Your manager rejected your transportation request.",
+            body: decision === "approved" ? `${by} approved your transportation request — now awaiting HR audit.` : `${by} rejected your transportation request.`,
         });
         if (decision === "approved") {
             notifyHrReviewers(request.requesterEmpNo, {
@@ -924,24 +971,16 @@ router.put("/overtime-requests/:id/manager-decision", authenticateToken, async (
     try {
         const request = await HrOvertimeRequest.findByPk(req.params.id);
         if (!request) return res.status(404).json({ success: false, message: "Request not found" });
-        if (request.status !== "pending_manager") {
-            return res.status(400).json({ success: false, message: "This request is not awaiting manager review" });
+        const stage = await applyManagerStageDecision(req, res, request, decision, note, "pending_gm");
+        if (!stage) return;
+        if (request.status === "pending_factory_mgr") {
+            notifyAwaitingFactoryManager(request, { title: "Overtime request update", noun: "overtime request" });
+            return res.json({ success: true });
         }
-        const callerEmpNo = req.user.assignedEmpNo ? parseInt(req.user.assignedEmpNo) : null;
-        if (!(await isAuthorizedManagerDecision(req, request.requesterEmpNo))) {
-            return res.status(403).json({ success: false, message: "You are not this employee's supervisor" });
-        }
-
-        await request.update({
-            managerApproverEmpNo: callerEmpNo,
-            managerDecision: decision,
-            managerDecidedAt: new Date(),
-            managerNote: note || null,
-            status: decision === "approved" ? "pending_gm" : "rejected",
-        });
+        const by = stage === "factory_mgr" ? "The factory manager" : "Your manager";
         sendPushToUser(request.requesterUserId, {
             title: "Overtime request update",
-            body: decision === "approved" ? "Your manager approved your overtime request — now awaiting GM approval." : "Your manager rejected your overtime request.",
+            body: decision === "approved" ? `${by} approved your overtime request — now awaiting GM approval.` : `${by} rejected your overtime request.`,
         });
         if (decision === "approved") {
             notifyGmReviewers({
@@ -1339,9 +1378,13 @@ router.get("/my-requests", authenticateToken, async (req, res) => {
         const [empNames, userNames, projectNames] = await Promise.all([
             resolveEmployeeNames([
                 ...leave.map(r => r.managerApproverEmpNo),
+                ...leave.map(r => r.factoryMgrApproverEmpNo),
                 ...attendance.map(r => r.managerApproverEmpNo),
+                ...attendance.map(r => r.factoryMgrApproverEmpNo),
                 ...transport.map(r => r.managerApproverEmpNo),
+                ...transport.map(r => r.factoryMgrApproverEmpNo),
                 ...overtime.map(r => r.managerApproverEmpNo),
+                ...overtime.map(r => r.factoryMgrApproverEmpNo),
             ]),
             resolveUserNames([
                 ...leave.map(r => r.hrReviewerUserId),
@@ -1356,6 +1399,7 @@ router.get("/my-requests", authenticateToken, async (req, res) => {
         ]);
         const approvers = (r, hrField) => ({
             managerApprover: r.managerApproverEmpNo ? (empNames[r.managerApproverEmpNo] || null) : null,
+            factoryMgrApprover: r.factoryMgrApproverEmpNo ? (empNames[r.factoryMgrApproverEmpNo] || null) : null,
             hrApprover: r[hrField] ? (userNames[r[hrField]] || null) : null,
         });
 
@@ -1394,24 +1438,35 @@ router.get("/manager-approvals", authenticateToken, async (req, res) => {
         const supervisedEmpNos = await getSupervisedEmpNosForCaller(req);
         const skipManagerStage = supervisedEmpNos && supervisedEmpNos.length === 0;
         const isGm = await isAuthorizedGmDecision(req);
-        if (skipManagerStage && !isGm) {
+        const isFactoryMgr = isFactoryManagerCaller(req);
+        if (skipManagerStage && !isGm && !isFactoryMgr) {
             return res.json({ success: true, leave: [], attendance: [], transport: [], overtime: [] });
         }
         const where = supervisedEmpNos
             ? { status: "pending_manager", requesterEmpNo: supervisedEmpNos }
             : { status: "pending_manager" };
 
-        const [leave, attendance, transport, overtime, overtimeGm] = await Promise.all([
+        // pending_factory_mgr isn't Supervisor_No-scoped either -- the
+        // factory manager sees every request waiting at his stage.
+        const fmWhere = { status: "pending_factory_mgr" };
+        const [leaveMgr, attendanceMgr, transportMgr, overtimeMgr, leaveFm, attendanceFm, transportFm, overtimeFm, overtimeGm] = await Promise.all([
             skipManagerStage ? [] : HrLeaveRequest.findAll({ where, order: [["createdAt", "ASC"]] }),
             skipManagerStage ? [] : HrAttendanceCorrectionRequest.findAll({ where, order: [["createdAt", "ASC"]], include: [{ model: HrAttendanceCorrectionRow, as: "rows" }] }),
             skipManagerStage ? [] : HrTransportRequest.findAll({ where, order: [["createdAt", "ASC"]], include: [{ model: HrTransportAccompanier, as: "accompaniers" }] }),
             skipManagerStage ? [] : HrOvertimeRequest.findAll({ where, order: [["createdAt", "ASC"]] }),
+            isFactoryMgr ? HrLeaveRequest.findAll({ where: fmWhere, order: [["createdAt", "ASC"]] }) : [],
+            isFactoryMgr ? HrAttendanceCorrectionRequest.findAll({ where: fmWhere, order: [["createdAt", "ASC"]], include: [{ model: HrAttendanceCorrectionRow, as: "rows" }] }) : [],
+            isFactoryMgr ? HrTransportRequest.findAll({ where: fmWhere, order: [["createdAt", "ASC"]], include: [{ model: HrTransportAccompanier, as: "accompaniers" }] }) : [],
+            isFactoryMgr ? HrOvertimeRequest.findAll({ where: fmWhere, order: [["createdAt", "ASC"]] }) : [],
             // The GM stage isn't Supervisor_No-scoped like the rest of this
             // endpoint -- see isAuthorizedGmDecision -- so it's a flat,
             // unfiltered query gated purely on whether the caller IS the GM.
             isGm ? HrOvertimeRequest.findAll({ where: { status: "pending_gm" }, order: [["createdAt", "ASC"]] }) : [],
         ]);
-        const combinedOvertime = [...overtime, ...overtimeGm];
+        const leave = [...leaveMgr, ...leaveFm];
+        const attendance = [...attendanceMgr, ...attendanceFm];
+        const transport = [...transportMgr, ...transportFm];
+        const combinedOvertime = [...overtimeMgr, ...overtimeFm, ...overtimeGm];
         const [names, projectNames, vacationBalances] = await Promise.all([
             resolveEmployeeNames([...leave, ...attendance, ...transport, ...combinedOvertime].map(r => r.requesterEmpNo)),
             resolveProjectLabels(transport.map(r => r.projectLabel)),
@@ -1469,14 +1524,17 @@ router.get("/manager-approvals-history", authenticateToken, async (req, res) => 
         const supervisedEmpNos = await getSupervisedEmpNosForCaller(req);
         const skipManagerStage = supervisedEmpNos && supervisedEmpNos.length === 0;
         const isGm = await isAuthorizedGmDecision(req);
-        if (skipManagerStage && !isGm) {
+        const isFactoryMgr = isFactoryManagerCaller(req);
+        if (skipManagerStage && !isGm && !isFactoryMgr) {
             return res.json({ success: true, items: [], total: 0, page, pageSize });
         }
         const where = supervisedEmpNos
             ? { managerDecidedAt: { [Op.ne]: null }, requesterEmpNo: supervisedEmpNos }
             : { managerDecidedAt: { [Op.ne]: null } };
 
-        const [leave, attendance, transport, overtime, overtimeGm] = await Promise.all([
+        const fmWhere = { factoryMgrDecidedAt: { [Op.ne]: null } };
+        const fmOrder = [["factoryMgrDecidedAt", "DESC"]];
+        const [leave, attendance, transport, overtime, overtimeGm, leaveFm, attendanceFm, transportFm, overtimeFm] = await Promise.all([
             skipManagerStage ? [] : HrLeaveRequest.findAll({ where, order: [["managerDecidedAt", "DESC"]] }),
             skipManagerStage ? [] : HrAttendanceCorrectionRequest.findAll({ where, order: [["managerDecidedAt", "DESC"]], include: [{ model: HrAttendanceCorrectionRow, as: "rows" }] }),
             skipManagerStage ? [] : HrTransportRequest.findAll({ where, order: [["managerDecidedAt", "DESC"]], include: [{ model: HrTransportAccompanier, as: "accompaniers" }] }),
@@ -1485,6 +1543,12 @@ router.get("/manager-approvals-history", authenticateToken, async (req, res) => 
             // this is every overtime request the GM has ever decided on,
             // gated purely on whether the caller IS the GM.
             isGm ? HrOvertimeRequest.findAll({ where: { gmDecidedAt: { [Op.ne]: null } }, order: [["gmDecidedAt", "DESC"]] }) : [],
+            // Every request the factory manager has decided at his own
+            // stage -- not Supervisor_No-scoped, same as the GM bucket.
+            isFactoryMgr ? HrLeaveRequest.findAll({ where: fmWhere, order: fmOrder }) : [],
+            isFactoryMgr ? HrAttendanceCorrectionRequest.findAll({ where: fmWhere, order: fmOrder, include: [{ model: HrAttendanceCorrectionRow, as: "rows" }] }) : [],
+            isFactoryMgr ? HrTransportRequest.findAll({ where: fmWhere, order: fmOrder, include: [{ model: HrTransportAccompanier, as: "accompaniers" }] }) : [],
+            isFactoryMgr ? HrOvertimeRequest.findAll({ where: fmWhere, order: fmOrder }) : [],
         ]);
 
         // callerStage marks which decision was actually the current
@@ -1501,6 +1565,10 @@ router.get("/manager-approvals-history", authenticateToken, async (req, res) => 
             ...transport.map(r => ({ ...r.toJSON(), type: "transport", callerStage: "manager", sortDate: r.managerDecidedAt })),
             ...overtime.map(r => ({ ...r.toJSON(), type: "overtime", callerStage: "manager", sortDate: r.managerDecidedAt })),
             ...overtimeGm.map(r => ({ ...r.toJSON(), type: "overtime", callerStage: "gm", sortDate: r.gmDecidedAt })),
+            ...leaveFm.map(r => ({ ...r.toJSON(), type: "leave", callerStage: "factory_mgr", sortDate: r.factoryMgrDecidedAt })),
+            ...attendanceFm.map(r => ({ ...r.toJSON(), type: "attendance", callerStage: "factory_mgr", sortDate: r.factoryMgrDecidedAt })),
+            ...transportFm.map(r => ({ ...r.toJSON(), type: "transport", callerStage: "factory_mgr", sortDate: r.factoryMgrDecidedAt })),
+            ...overtimeFm.map(r => ({ ...r.toJSON(), type: "overtime", callerStage: "factory_mgr", sortDate: r.factoryMgrDecidedAt })),
         ];
         combined.sort((a, b) => new Date(b.sortDate) - new Date(a.sortDate));
 
@@ -1567,7 +1635,7 @@ router.get("/manager-approvals-history", authenticateToken, async (req, res) => 
 router.get("/am-i-a-supervisor", authenticateToken, async (req, res) => {
     try {
         const supervisedEmpNos = await getSupervisedEmpNosForCaller(req);
-        const isSupervisor = supervisedEmpNos === null || supervisedEmpNos.length > 0 || (await isAuthorizedGmDecision(req));
+        const isSupervisor = supervisedEmpNos === null || supervisedEmpNos.length > 0 || isFactoryManagerCaller(req) || (await isAuthorizedGmDecision(req));
         res.json({ success: true, isSupervisor });
     } catch (err) {
         console.error("❌ HR AM I A SUPERVISOR ERROR:", err);
