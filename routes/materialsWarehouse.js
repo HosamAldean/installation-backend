@@ -32,6 +32,7 @@ import { Vendor } from '../models/Vendor.js';
 import { MatWhItemStore } from '../models/MatWhItemStore.js';
 import { MatWhItemVariant } from '../models/MatWhItemVariant.js';
 import { normalizeRequestKey, runOnceWithKey } from '../services/matWhRequestKeys.js';
+import { AdminActionAudit } from '../models/AdminActionAudit.js';
 
 const router = express.Router();
 router.use(authenticateToken, requirePermission(PERMISSIONS.MATERIALS_WAREHOUSE_MASTER_DATA));
@@ -256,6 +257,30 @@ router.get('/store-access', requireAdmin, async (req, res) => {
     });
 });
 
+// Admin audit log entry (Audit Log -> Admin Actions) for a store-access
+// change. Fire-and-forget like the other AdminActionAudit writers: a
+// logging failure never undoes the change. The readable before/after goes
+// in entityLabel (that page shows the label, not the changes JSON).
+async function logStoreAccessChange(req, user, before, after) {
+    try {
+        if (before.join(",") === after.join(",")) return;
+        const stores = await MatWhStore.findAll({ where: { id: [...before, ...after] }, attributes: ["id", "storeCode"] });
+        const codeById = new Map(stores.map((s) => [s.id, s.storeCode]));
+        const label = (ids) => (ids.length ? ids.map((id) => codeById.get(id) ?? id).join(", ") : "all stores");
+        await AdminActionAudit.create({
+            module: "matwh_store_access",
+            entityType: "user",
+            entityId: String(user.userId),
+            entityLabel: `${user.username}: ${label(before)} -> ${label(after)}`.slice(0, 255),
+            action: "updated",
+            changes: JSON.stringify({ before, after }),
+            performedByUserId: req.user?.userId ?? null,
+        });
+    } catch (err) {
+        console.error("❌ Failed to record store access audit:", err);
+    }
+}
+
 // Replace one user's whole store set; an empty list means every store
 // again (the default).
 router.put('/store-access/:userId', requireAdmin, async (req, res) => {
@@ -268,6 +293,7 @@ router.put('/store-access/:userId', requireAdmin, async (req, res) => {
         const found = await MatWhStore.count({ where: { id: storeIds } });
         if (found !== storeIds.length) return res.status(400).json({ message: 'Unknown store id in storeIds' });
     }
+    const before = (await MatWhUserStoreAssignment.findAll({ where: { userId } })).map((a) => a.storeId).sort((a, b) => a - b);
     const t = await sequelizeUtf8.transaction();
     try {
         await MatWhUserStoreAssignment.destroy({ where: { userId }, transaction: t });
@@ -275,6 +301,7 @@ router.put('/store-access/:userId', requireAdmin, async (req, res) => {
             await MatWhUserStoreAssignment.bulkCreate(storeIds.map((storeId) => ({ userId, storeId })), { transaction: t });
         }
         await t.commit();
+        logStoreAccessChange(req, user, before, [...storeIds].sort((a, b) => a - b));
         res.json({ userId, storeIds });
     } catch (err) {
         await t.rollback();
