@@ -251,6 +251,40 @@ export async function getAvailableColorsForItem(storeId, itemId, lengthMm) {
 // receipt committed by another transaction while this one waited may be
 // missing from this transaction's balance read, which only slightly
 // under-weights the old average -- acceptable for a valuation figure.
+// The item+store average cost right now (null when no cost is known) --
+// stamped on an external_send so the coating request knows what the
+// material it sent out was worth.
+export async function currentAvgCost(itemId, storeId, transaction) {
+    const row = await MatWhItemCost.findOne({ where: { itemId, storeId }, transaction });
+    return row?.weightedAvgCost ?? null;
+}
+
+// Adds a service cost (e.g. the coating company's painting charge) to the
+// value of the stock already on hand, without changing quantity: the
+// average rises by extraValue / on-hand qty. Same pooled item+store row
+// and on-hand source as applyReceiptCost. Returns what it did, or null
+// when there's nothing on hand to carry the cost.
+export async function addValueToStock(itemId, storeId, extraValue, transaction) {
+    if (!(extraValue > 0)) return null;
+    const onHand = await getPhysicalBalance(storeId, itemId, undefined, undefined, transaction);
+    if (!(onHand > 0)) return null;
+    const [created] = await MatWhItemCost.findOrCreate({
+        where: { itemId, storeId },
+        defaults: { lastCost: null, weightedAvgCost: null, onHandQty: 0 },
+        transaction,
+    });
+    const row = await lockRow(MatWhItemCost, created.id, transaction);
+    const previousAvg = row.weightedAvgCost ?? null;
+    const newAvg = (previousAvg ?? 0) + extraValue / onHand;
+    await row.update({
+        weightedAvgCost: newAvg,
+        onHandQty: onHand,
+        currentCost: row.costMethod === 'weightedAvg' ? newAvg : row.currentCost,
+        lastUpdated: new Date(),
+    }, { transaction });
+    return { itemId, storeId, onHand, oldAvg: previousAvg, newAvg, added: extraValue };
+}
+
 export async function applyReceiptCost(itemId, storeId, qtyAccepted, unitCost, transaction) {
     if (!qtyAccepted || unitCost == null) return;
 

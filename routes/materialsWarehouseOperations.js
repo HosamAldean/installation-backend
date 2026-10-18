@@ -23,7 +23,7 @@ import { MatWhCoatingInvoice } from '../models/MatWhCoatingInvoice.js';
 import { MatWhPurchaseOrder } from '../models/MatWhPurchaseOrder.js';
 import { MatWhPurchaseOrderItem } from '../models/MatWhPurchaseOrderItem.js';
 import { MatWhStockLedger } from '../models/MatWhStockLedger.js';
-import { postLedgerMovement, getAvailableToReserve, getAlreadyReserved, getPendingQty, getPhysicalBalance, normalizeColor, getAvailableColorsForItem, lockRow, lockItems } from '../services/matWhLedger.js';
+import { postLedgerMovement, getAvailableToReserve, getAlreadyReserved, getPendingQty, getPhysicalBalance, normalizeColor, getAvailableColorsForItem, lockRow, lockItems, currentAvgCost, addValueToStock } from '../services/matWhLedger.js';
 import { denyStore, getAllowedStoreIds } from '../services/matWhStoreAccess.js';
 import { normalizeRequestKey, findRequestKey, claimRequestKey } from '../services/matWhRequestKeys.js';
 import {
@@ -1240,6 +1240,7 @@ router.post('/external-processing', requireIssue, async (req, res) => {
         await postLedgerMovement({
             storeId, itemId, qty: qtySent, direction: 'out', docType: 'external_send',
             refType: 'external_processing', refId: row.id, performedBy: req.user.userId,
+            unitCost: (await currentAvgCost(itemId, storeId, t)) ?? undefined,
             color: sourceColor, lengthMm,
         }, t);
         await t.commit();
@@ -1422,6 +1423,7 @@ router.post('/external-processing/:id/confirm-send', requireIssue, async (req, r
             storeId: row.storeId, itemId: row.itemId, qty: qtySent, direction: 'out',
             docType: 'external_send', refType: 'external_processing', refId: row.id,
             performedBy: req.user.userId, color: sourceColor, lengthMm: row.lengthMm ?? null,
+            unitCost: (await currentAvgCost(row.itemId, row.storeId, t)) ?? undefined,
         }, t);
         await row.update({
             status: 'sent', processVendorId, qtySent, sourceColor,
@@ -1580,6 +1582,7 @@ router.post('/external-processing/group/:requestNo/confirm-send', requireIssue, 
                 storeId: row.storeId, itemId: row.itemId, qty: sendQty, direction: 'out',
                 docType: 'external_send', refType: 'external_processing', refId: row.id,
                 performedBy: req.user.userId, color: sourceColor, lengthMm: row.lengthMm ?? null,
+                unitCost: (await currentAvgCost(row.itemId, row.storeId, t)) ?? undefined,
             }, t);
             await row.update({
                 status: 'sent', processVendorId, qtySent: sendQty, sourceColor,
@@ -1684,7 +1687,7 @@ router.post('/external-processing/group/:requestNo/actual-finish', requireAnyOf(
 router.get('/external-processing/group/:requestNo/invoices', requireInvoices, async (req, res) => {
     const { requestNo } = req.params;
     const rows = await MatWhCoatingInvoice.findAll({ where: { requestNo }, order: [['id', 'DESC']] });
-    res.json({ items: rows });
+    res.json({ items: rows, materialCostSuggested: await coatingMaterialCost(requestNo) });
 });
 
 router.post('/external-processing/group/:requestNo/invoices', requireInvoices, async (req, res) => {
@@ -1713,23 +1716,70 @@ router.post('/external-processing/group/:requestNo/invoices', requireInvoices, a
 // (never overwriting) Mix's own already-submitted paintingCost/
 // vendorInvoiceNo/dates -- totalCost is computed and stored as a stable
 // snapshot rather than re-derived on every read.
-router.post('/external-processing/group/:requestNo/invoices/:invoiceId/approve', requireInvoices, async (req, res) => {
-    const inv = await MatWhCoatingInvoice.findOne({ where: { id: req.params.invoiceId, requestNo: req.params.requestNo } });
-    if (!inv) return res.status(404).json({ message: 'Not found' });
-
-    const materialCost = req.body.materialCost !== undefined && req.body.materialCost !== ''
-        ? Number(req.body.materialCost)
-        : (inv.materialCost ?? 0);
-    const paintingCost = Number(inv.paintingCost ?? 0);
-    await inv.update({
-        materialCost,
-        totalCost: materialCost + paintingCost,
-        approvalStatus: 'approved',
-        approvedBy: req.user.userId,
-        approvedAt: new Date(),
-        rejectionReason: null,
+// What the material sent out on this coating request was worth: the
+// external_send movements' cost (the item+store average at send time).
+// null when none of them carried a cost.
+async function coatingMaterialCost(requestNo) {
+    const jobs = await MatWhExternalProcessing.findAll({ where: { requestNo }, attributes: ['id'] });
+    if (!jobs.length) return null;
+    const sends = await MatWhStockLedger.findAll({
+        where: { refType: 'external_processing', refId: jobs.map((j) => j.id), docType: 'external_send' },
+        attributes: ['totalCost'],
     });
-    res.json(inv);
+    const costed = sends.filter((s) => s.totalCost != null);
+    return costed.length ? Math.round(costed.reduce((sum, s) => sum + Number(s.totalCost), 0) * 1000) / 1000 : null;
+}
+
+// Approving also puts Mix's painting cost into the stock value (per direct
+// decision 2026-10-18): it's split over the request's jobs by quantity
+// received (sent, if nothing came back yet) and added to each job's
+// item+store average via addValueToStock. Material cost defaults to the
+// send-time value (coatingMaterialCost) unless the warehouse types one.
+// An invoice can only be approved once, so the cost is never added twice.
+router.post('/external-processing/group/:requestNo/invoices/:invoiceId/approve', requireInvoices, async (req, res) => {
+    const found = await MatWhCoatingInvoice.findOne({ where: { id: req.params.invoiceId, requestNo: req.params.requestNo } });
+    if (!found) return res.status(404).json({ message: 'Not found' });
+
+    const suggested = await coatingMaterialCost(req.params.requestNo);
+    const t = await sequelizeUtf8.transaction();
+    let applied = [];
+    try {
+        const inv = await lockRow(MatWhCoatingInvoice, found.id, t);
+        if (inv.approvalStatus === 'approved') {
+            await t.rollback();
+            return res.status(409).json({ message: 'This invoice is already approved' });
+        }
+        const materialCost = req.body.materialCost !== undefined && req.body.materialCost !== ''
+            ? Number(req.body.materialCost)
+            : (inv.materialCost ?? suggested ?? 0);
+        const paintingCost = Number(inv.paintingCost ?? 0);
+
+        const jobs = await MatWhExternalProcessing.findAll({ where: { requestNo: req.params.requestNo }, transaction: t });
+        const weightOf = (j) => Number(j.qtyReceived ?? 0) > 0 ? Number(j.qtyReceived) : Number(j.qtySent ?? 0);
+        const totalWeight = jobs.reduce((sum, j) => sum + weightOf(j), 0);
+        if (paintingCost > 0 && totalWeight > 0) {
+            await lockItems([...new Set(jobs.map((j) => j.itemId))], t);
+            for (const j of jobs) {
+                const share = paintingCost * (weightOf(j) / totalWeight);
+                const done = await addValueToStock(j.itemId, j.storeId, share, t);
+                applied.push(done ?? { itemId: j.itemId, storeId: j.storeId, added: 0, skipped: 'nothing on hand' });
+            }
+        }
+        await inv.update({
+            materialCost,
+            totalCost: materialCost + paintingCost,
+            approvalStatus: 'approved',
+            approvedBy: req.user.userId,
+            approvedAt: new Date(),
+            rejectionReason: null,
+        }, { transaction: t });
+        await t.commit();
+        res.json({ ...inv.toJSON(), costApplied: applied });
+    } catch (err) {
+        await t.rollback();
+        console.error('Coating invoice approve failed:', err);
+        res.status(500).json({ message: 'Failed to approve invoice' });
+    }
 });
 
 router.post('/external-processing/group/:requestNo/invoices/:invoiceId/reject', requireInvoices, async (req, res) => {
