@@ -293,6 +293,10 @@ router.get('/items-by-ids', requireAnyOf(
     PERMISSIONS.MATERIALS_WAREHOUSE_RECEIVE,
     PERMISSIONS.MATERIALS_WAREHOUSE_PURCHASE_ORDERS,
     PERMISSIONS.MATERIALS_WAREHOUSE_PURCHASING,
+    // Item names only -- also needed by the phone's transfer and
+    // write-off screens (2026-10-18).
+    PERMISSIONS.MATERIALS_WAREHOUSE_TRANSFER,
+    PERMISSIONS.MATERIALS_WAREHOUSE_WRITEOFF,
 ), async (req, res) => {
     const ids = String(req.query.ids || '')
         .split(',')
@@ -1006,12 +1010,22 @@ router.post('/reservation-items/:lineId/return', requireReceive, async (req, res
     if (!Number.isFinite(qty) || qty <= 0) {
         return res.status(400).json({ message: 'qty must be a positive number' });
     }
+    // The phone's per-tap key (see services/matWhRequestKeys.js): returns
+    // can be partial, so a resend would otherwise return the qty twice.
+    const requestKey = normalizeRequestKey(req.body?.requestKey);
+    if (await findRequestKey(requestKey)) {
+        return res.json({ alreadyApplied: true, returnedSoFar: await getReturnedSoFar(line.id), qtyReserved: line.qtyReserved });
+    }
     const header = await MatWhReservationHeader.findByPk(line.reservationHeaderId);
     // Lock + re-sum inside the transaction (see lockRow) so two concurrent
     // returns can't both pass the "still returnable" check.
     const t = await sequelizeUtf8.transaction();
     try {
         await lockRow(MatWhReservationItem, line.id, t);
+        if (!(await claimRequestKey(requestKey, { action: 'return', refId: line.id, userId: req.user.userId }, t))) {
+            await t.rollback();
+            return res.json({ alreadyApplied: true, returnedSoFar: await getReturnedSoFar(line.id), qtyReserved: line.qtyReserved });
+        }
         const returnedSoFar = await getReturnedSoFar(line.id, t);
         if (returnedSoFar + qty > Number(line.qtyReserved) + 0.0001) {
             await t.rollback();
