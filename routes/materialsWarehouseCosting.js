@@ -6,21 +6,62 @@
 // costMethod be switched, which is a flag flip here, not a recompute,
 // since both figures are already kept current regardless of which is live.
 import express from 'express';
+import { Op } from 'sequelize';
 import { authenticateToken } from '../middleware/auth.js';
 import { requirePermission } from '../middleware/permissions.js';
 import { PERMISSIONS } from '../constants/permissions.js';
 import { MatWhItemCost } from '../models/MatWhItemCost.js';
+import { MatWhItem } from '../models/MatWhItem.js';
 
 const router = express.Router();
 const requireItemCost = requirePermission(PERMISSIONS.MATERIALS_WAREHOUSE_ITEM_COST);
 router.use(authenticateToken, requireItemCost);
 
+// Rows carry the item's code/name, so the page doesn't have to resolve
+// thousands of ids itself (after the 2026-10-18 cutover there are ~4,800
+// rows -- an items-by-ids URL for all of them is rejected with 431).
+// Optional search (item code/name) and page/pageSize; without page every
+// matching row comes back, as before.
 router.get('/item-cost', async (req, res) => {
     const where = {};
     if (req.query.itemId) where.itemId = req.query.itemId;
     if (req.query.storeId) where.storeId = req.query.storeId;
-    const rows = await MatWhItemCost.findAll({ where, order: [['itemId', 'ASC']] });
-    res.json({ items: rows });
+    const search = String(req.query.search || '').trim();
+    if (search) {
+        const matches = await MatWhItem.findAll({
+            where: { [Op.or]: [
+                { itemCode: { [Op.like]: `%${search}%` } },
+                { itemName: { [Op.like]: `%${search}%` } },
+                { itemNameAr: { [Op.like]: `%${search}%` } },
+            ] },
+            attributes: ['id'],
+        });
+        where.itemId = matches.map((m) => m.id);
+    }
+    const paged = req.query.page !== undefined;
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const pageSize = Math.min(500, Math.max(1, parseInt(req.query.pageSize) || 50));
+    const { count, rows } = await MatWhItemCost.findAndCountAll({
+        where,
+        order: [['itemId', 'ASC'], ['storeId', 'ASC']],
+        ...(paged ? { offset: (page - 1) * pageSize, limit: pageSize } : {}),
+    });
+    const items = await MatWhItem.findAll({
+        where: { id: [...new Set(rows.map((r) => r.itemId))] },
+        attributes: ['id', 'itemCode', 'itemName', 'itemNameAr'],
+    });
+    const itemById = new Map(items.map((i) => [i.id, i]));
+    res.json({
+        items: rows.map((r) => ({
+            ...r.toJSON(),
+            itemCode: itemById.get(r.itemId)?.itemCode ?? null,
+            itemName: itemById.get(r.itemId)?.itemName ?? null,
+            itemNameAr: itemById.get(r.itemId)?.itemNameAr ?? null,
+        })),
+        total: count,
+        page,
+        pageSize: paged ? pageSize : count,
+    });
 });
 
 router.get('/item-cost/:itemId/:storeId', async (req, res) => {
