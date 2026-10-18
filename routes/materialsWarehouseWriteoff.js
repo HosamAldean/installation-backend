@@ -18,6 +18,10 @@ import { MatWhWriteoffRequestItem } from '../models/MatWhWriteoffRequestItem.js'
 import { MatWhWriteoffReport } from '../models/MatWhWriteoffReport.js';
 import { MatWhWriteoffReportItem } from '../models/MatWhWriteoffReportItem.js';
 import { denyStore } from '../services/matWhStoreAccess.js';
+import { resolveBarcode } from '../services/matWhStoreTransfer.js';
+import { getPhysicalBalance } from '../services/matWhLedger.js';
+import { MatWhItem } from '../models/MatWhItem.js';
+import { MatWhStore } from '../models/MatWhStore.js';
 import {
     createWriteoffRequest, submitWriteoffRequest, decideWriteoffRequest,
     createWriteoffReport, signWriteoffReportCommittee, acknowledgeWriteoffReport,
@@ -70,6 +74,13 @@ router.get('/writeoff-requests', requireAnyWriteoffAccess, async (req, res) => {
     if (req.query.status) where.status = req.query.status;
     const rows = await MatWhWriteoffRequest.findAll({ where, order: [['id', 'DESC']] });
     res.json({ items: rows });
+});
+
+// Active stores for a new request's store picker (the phone has no
+// master-data access). Declared before /:id.
+router.get('/writeoff-requests/options', requireWriteoff, async (req, res) => {
+    const stores = await MatWhStore.findAll({ where: { isActive: true }, order: [['storeCode', 'ASC']] });
+    res.json({ stores: stores.map((s) => ({ id: s.id, storeCode: s.storeCode, storeName: s.storeName, storeNameAr: s.storeNameAr })) });
 });
 
 router.get('/writeoff-requests/:id', requireAnyWriteoffAccess, async (req, res) => {
@@ -133,6 +144,25 @@ router.post('/writeoff-requests/:id/items', requireWriteoff, requireRequestStore
         color: color || null, lengthMm: lengthMm ?? null,
     });
     res.status(201).json(line);
+});
+
+// Scanned code -> item / colour / length, plus how much of it the
+// request's store physically holds -- for adding lines from the phone
+// (variant barcode, item barcode or item code, same rule as transfers).
+router.get('/writeoff-requests/:id/lookup', requireWriteoff, async (req, res) => {
+    const request = await MatWhWriteoffRequest.findByPk(req.params.id);
+    if (!request) return res.status(404).json({ message: 'Write-off request not found' });
+    const code = String(req.query.barcode || '').trim();
+    if (!code) return res.status(400).json({ message: 'barcode is required' });
+    const resolved = await resolveBarcode(code);
+    if (!resolved) return res.status(404).json({ message: 'Barcode not recognized' });
+    const item = await MatWhItem.findByPk(resolved.itemId);
+    const onHand = await getPhysicalBalance(request.storeId, resolved.itemId, resolved.color, resolved.lengthMm);
+    res.json({
+        itemId: resolved.itemId, color: resolved.color, lengthMm: resolved.lengthMm,
+        itemCode: item?.itemCode ?? null, itemName: item?.itemName ?? null, itemNameAr: item?.itemNameAr ?? null,
+        onHand,
+    });
 });
 
 router.delete('/writeoff-requests/:id/items/:lineId', requireWriteoff, requireRequestStore, async (req, res) => {
