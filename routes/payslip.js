@@ -137,16 +137,10 @@ router.get("/", authenticateToken, async (req, res) => {
         //   - Hourly absence deduction ("ABSNH"/legacy "4", "خصم ساعات" /
         //     "Absence Deduction- Hours", Trs_type 2): dbo.
         //     Pay_EmpAbsncDeds.Aldd_amount for the current period.
-        //     UNVERIFIED interpretation -- this column is typed `money` and
-        //     no employee currently has both a pending entry and an already
-        //     -processed payslip line to cross-check directly, but its
-        //     values for pending (not yet payroll-run) rows are suspicious
-        //     -ly round (24, 8) versus the historized version of the same
-        //     table's own values once processed (1.41, 5.66 -- JOD-looking
-        //     decimals), consistent with "hours pre-processing, money
-        //     post-processing". Flagged in the response as
-        //     hoursUnverified: true on that line so the UI can visually
-        //     mark it until confirmed against Alpha's own report.
+        //     These are HOURS -- verified 2026-10-18 against the October
+        //     payroll: for all 5 employees with an ABSNH line, hours x
+        //     (Basic_Salary / 30 / 8) equals the deducted PayAmt (e.g. 24h on
+        //     a 320 salary = 32.00).
         const periodDate = new Date(rows[0].PayDate);
         const periodStart = new Date(Date.UTC(periodDate.getUTCFullYear(), periodDate.getUTCMonth(), 1));
         const periodEnd = new Date(Date.UTC(periodDate.getUTCFullYear(), periodDate.getUTCMonth() + 1, 1));
@@ -199,7 +193,7 @@ router.get("/", authenticateToken, async (req, res) => {
                 labelEn: row.Aldd_DescEng?.trim() || row.PayCode,
                 amount,
                 hours: isOvertimeLine ? overtimeHours : (isAbsenceHoursLine ? absenceHours : null),
-                hoursUnverified: isAbsenceHoursLine,
+                hoursUnverified: false,
             };
             if (row.Trs_type === 1) allowances.push(item);
             else deductions.push(item);
