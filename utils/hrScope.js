@@ -94,6 +94,38 @@ export async function getHrReviewerUserIds(requesterEmpNo) {
     return reviewers.map((u) => u.userId);
 }
 
+// Factory-manager approval stage (status pending_factory_mgr), between
+// the direct manager and the next stage (HR, HR audit, or for overtime the
+// GM), per explicit direction 2026-10-18. Covers factory-HR employees
+// (FACTORY_WHERE) except the 300xxx numbers (Iron Production staff). The
+// factory manager is a fixed employee number -- 100254, head of
+// Work_place 6000 (Industrial Complex) -- not a job code, as requested.
+export const FACTORY_MANAGER_EMP_NO = 100254;
+
+// Active InsUser accounts for the factory manager -- who decides and who
+// gets notified at this stage.
+export async function getFactoryManagerUserIds() {
+    const users = await User.findAll({
+        where: { assignedEmpNo: FACTORY_MANAGER_EMP_NO, active: true },
+        attributes: ["userId"],
+    });
+    return users.map((u) => u.userId);
+}
+
+// Whether a request just approved by its manager (managerApproverEmpNo --
+// null when admin/hr_manager fallback decided) still needs the factory
+// manager. Skipped when he already approved it as the direct manager, for
+// his own requests, and when he has no active account (otherwise the
+// request would wait on nobody).
+export async function needsFactoryManagerStep(requesterEmpNo, managerApproverEmpNo) {
+    const requester = parseInt(requesterEmpNo);
+    if (!requester || requester === FACTORY_MANAGER_EMP_NO) return false;
+    if (parseInt(managerApproverEmpNo) === FACTORY_MANAGER_EMP_NO) return false;
+    if (String(requester).startsWith("300")) return false;
+    if (!(await isInHrScope("hr_factory", requester))) return false;
+    return (await getFactoryManagerUserIds()).length > 0;
+}
+
 // Which InsUser accounts to notify when a transport request reaches
 // pending_finance -- whichever roles actually hold
 // PERMISSIONS.ACCOUNTING_REQUESTS_QUEUE right now (admin-editable via

@@ -39,7 +39,7 @@ export const HrLeaveRequest = sequelizeUtf8.define('HrLeaveRequest', {
     attachmentUrl: { type: DataTypes.STRING, allowNull: true },
     attachmentMimeType: { type: DataTypes.STRING, allowNull: true },
     status: {
-        type: DataTypes.ENUM('pending_manager', 'pending_hr', 'approved', 'rejected', 'canceled'),
+        type: DataTypes.ENUM('pending_manager', 'pending_factory_mgr', 'pending_hr', 'approved', 'rejected', 'canceled'),
         allowNull: false,
         defaultValue: 'pending_manager',
     },
@@ -47,6 +47,12 @@ export const HrLeaveRequest = sequelizeUtf8.define('HrLeaveRequest', {
     managerDecision: { type: DataTypes.ENUM('approved', 'rejected'), allowNull: true },
     managerDecidedAt: { type: DataTypes.DATE, allowNull: true },
     managerNote: { type: DataTypes.TEXT, allowNull: true },
+    // Factory-manager stage (pending_factory_mgr) -- see
+    // needsFactoryManagerStep in utils/hrScope.js. Null when skipped.
+    factoryMgrApproverEmpNo: { type: DataTypes.INTEGER, allowNull: true },
+    factoryMgrDecision: { type: DataTypes.ENUM('approved', 'rejected'), allowNull: true },
+    factoryMgrDecidedAt: { type: DataTypes.DATE, allowNull: true },
+    factoryMgrNote: { type: DataTypes.TEXT, allowNull: true },
     hrReviewerUserId: { type: DataTypes.INTEGER, allowNull: true },
     hrDecision: { type: DataTypes.ENUM('approved', 'rejected'), allowNull: true },
     hrDecidedAt: { type: DataTypes.DATE, allowNull: true },

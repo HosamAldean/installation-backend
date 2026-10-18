@@ -318,6 +318,7 @@ router.get("/leave-attendance", authenticateToken, requirePermission(PERMISSIONS
             resolveEmployeeNames([
                 ...combined.map((r) => r.requesterEmpNo),
                 ...combined.map((r) => r.managerApproverEmpNo),
+                ...combined.map((r) => r.factoryMgrApproverEmpNo),
             ]),
             resolveUserNames(combined.map((r) => r.hrReviewerUserId)),
         ]);
@@ -325,6 +326,7 @@ router.get("/leave-attendance", authenticateToken, requirePermission(PERMISSIONS
             ...r,
             employee: empNames[r.requesterEmpNo] || null,
             managerApprover: r.managerApproverEmpNo ? (empNames[r.managerApproverEmpNo] || null) : null,
+            factoryMgrApprover: r.factoryMgrApproverEmpNo ? (empNames[r.factoryMgrApproverEmpNo] || null) : null,
             hrApprover: r.hrReviewerUserId ? (userNames[r.hrReviewerUserId] || null) : null,
         }));
 
@@ -398,6 +400,7 @@ router.get("/transport", authenticateToken, requirePermission(PERMISSIONS.HR_REP
             resolveEmployeeNames([
                 ...transport.map((r) => r.requesterEmpNo),
                 ...transport.map((r) => r.managerApproverEmpNo),
+                ...transport.map((r) => r.factoryMgrApproverEmpNo),
             ]),
             resolveUserNames([
                 ...transport.map((r) => r.hrAuditorUserId),
@@ -412,6 +415,7 @@ router.get("/transport", authenticateToken, requirePermission(PERMISSIONS.HR_REP
                 projectLabel: withProjectDisplay(r.projectLabel, projectNames),
                 employee: empNames[r.requesterEmpNo] || null,
                 managerApprover: r.managerApproverEmpNo ? (empNames[r.managerApproverEmpNo] || null) : null,
+                factoryMgrApprover: r.factoryMgrApproverEmpNo ? (empNames[r.factoryMgrApproverEmpNo] || null) : null,
                 hrApprover: r.hrAuditorUserId ? (userNames[r.hrAuditorUserId] || null) : null,
                 financeApprover: r.financeApproverUserId ? (userNames[r.financeApproverUserId] || null) : null,
                 paidBy: r.paidByUserId ? (userNames[r.paidByUserId] || null) : null,
@@ -479,6 +483,7 @@ router.get("/overtime", authenticateToken, requirePermission(PERMISSIONS.HR_REPO
             resolveEmployeeNames([
                 ...overtime.map((r) => r.requesterEmpNo),
                 ...overtime.map((r) => r.managerApproverEmpNo),
+                ...overtime.map((r) => r.factoryMgrApproverEmpNo),
             ]),
             resolveUserNames([
                 ...overtime.map((r) => r.gmApproverUserId),
@@ -489,6 +494,7 @@ router.get("/overtime", authenticateToken, requirePermission(PERMISSIONS.HR_REPO
             ...r.toJSON(),
             employee: empNames[r.requesterEmpNo] || null,
             managerApprover: r.managerApproverEmpNo ? (empNames[r.managerApproverEmpNo] || null) : null,
+            factoryMgrApprover: r.factoryMgrApproverEmpNo ? (empNames[r.factoryMgrApproverEmpNo] || null) : null,
             gmApprover: r.gmApproverUserId ? (userNames[r.gmApproverUserId] || null) : null,
             hrApprover: r.hrReviewerUserId ? (userNames[r.hrReviewerUserId] || null) : null,
         }));
