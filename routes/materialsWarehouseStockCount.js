@@ -22,6 +22,7 @@ import { MatWhStore } from '../models/MatWhStore.js';
 import { MatWhItem } from '../models/MatWhItem.js';
 import { MatWhItemVariant } from '../models/MatWhItemVariant.js';
 import { denyStore } from '../services/matWhStoreAccess.js';
+import { normalizeRequestKey, runOnceWithKey } from '../services/matWhRequestKeys.js';
 import {
     createStockCount, countLine, addExtraLine, lookupBarcode, submitStockCount, cancelStockCount,
     recountLines, rejectStockCount, approveStockCount, reservationWarnings, inTransitForCount, currentCosts,
@@ -249,7 +250,16 @@ router.post('/stock-counts/:id/lines', requireCount, requireCountStore, async (r
     const { itemId } = req.body;
     if (!itemId) return res.status(400).json({ message: 'itemId is required' });
     try {
-        const line = await addExtraLine(Number(req.params.id), req.body, req.user.userId);
+        // The phone's per-tap key (see services/matWhRequestKeys.js): a
+        // replay answers with the line the first request added.
+        const { result: line, replay, refId } = await runOnceWithKey(
+            normalizeRequestKey(req.body.requestKey), { action: 'stock_count_extra', userId: req.user.userId },
+            () => addExtraLine(Number(req.params.id), req.body, req.user.userId),
+        );
+        if (replay) {
+            const earlier = refId ? await MatWhStockCountLine.findByPk(refId) : null;
+            return res.json(earlier ? { ...lineForCounter(earlier.toJSON()), alreadyApplied: true } : { alreadyApplied: true });
+        }
         res.status(201).json(lineForCounter(line.toJSON()));
     } catch (err) {
         sendError(res, err, 'Failed to add item');

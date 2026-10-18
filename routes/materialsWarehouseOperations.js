@@ -25,6 +25,7 @@ import { MatWhPurchaseOrderItem } from '../models/MatWhPurchaseOrderItem.js';
 import { MatWhStockLedger } from '../models/MatWhStockLedger.js';
 import { postLedgerMovement, getAvailableToReserve, getAlreadyReserved, getPendingQty, getPhysicalBalance, normalizeColor, getAvailableColorsForItem, lockRow, lockItems } from '../services/matWhLedger.js';
 import { denyStore, getAllowedStoreIds } from '../services/matWhStoreAccess.js';
+import { normalizeRequestKey, findRequestKey, claimRequestKey } from '../services/matWhRequestKeys.js';
 import {
     createReservationHeader, submitReservation,
     confirmReservation, rejectReservation,
@@ -864,7 +865,7 @@ router.post('/reservations/:id/items/:lineId/issue', requireIssue, async (req, r
     if (!line) return res.status(404).json({ message: 'Line not found' });
     if (await denyStore(req, res, line.storeId)) return;
     try {
-        const result = await issueReservationLine(line.id, req.user.userId, req.body?.issuedBarcode, req.body?.issuePurpose);
+        const result = await issueReservationLine(line.id, req.user.userId, req.body?.issuedBarcode, req.body?.issuePurpose, normalizeRequestKey(req.body?.requestKey));
         res.json(result);
     } catch (err) {
         res.status(err.status || 500).json({ message: err.message || 'Failed to issue line' });
@@ -961,6 +962,7 @@ router.post('/reservation-items/:lineId/issue', requireIssue, async (req, res) =
     try {
         const result = await issueReservationLine(
             Number(req.params.lineId), req.user.userId, req.body?.issuedBarcode, req.body?.issuePurpose,
+            normalizeRequestKey(req.body?.requestKey),
         );
         res.json(result);
     } catch (err) {
@@ -1253,6 +1255,10 @@ router.post('/external-processing/:id/receive', requireReceive, async (req, res)
     const row = await MatWhExternalProcessing.findByPk(req.params.id);
     if (!row) return res.status(404).json({ message: 'Not found' });
     if (await denyStore(req, res, row.storeId)) return;
+    // The phone's per-tap key (see services/matWhRequestKeys.js): a replay
+    // of a receive that already went through answers with the job as-is.
+    const requestKey = normalizeRequestKey(req.body.requestKey);
+    if (await findRequestKey(requestKey)) return res.json(row);
     if (row.status !== 'sent') {
         return res.status(409).json({ message: `Cannot receive a job in status '${row.status}'` });
     }
@@ -1277,6 +1283,10 @@ router.post('/external-processing/:id/receive', requireReceive, async (req, res)
     const t = await sequelizeUtf8.transaction();
     try {
         const locked = await lockRow(MatWhExternalProcessing, row.id, t);
+        if (!(await claimRequestKey(requestKey, { action: 'coating_receive', refId: row.id, userId: req.user.userId }, t))) {
+            await t.rollback();
+            return res.json(await row.reload());
+        }
         if (locked.status !== 'sent') {
             await t.rollback();
             return res.status(409).json({ message: `Cannot receive a job in status '${locked.status}'` });
@@ -1332,6 +1342,9 @@ router.post('/external-processing/:id/confirm-send', requireIssue, async (req, r
     const row = await MatWhExternalProcessing.findByPk(req.params.id);
     if (!row) return res.status(404).json({ message: 'Not found' });
     if (await denyStore(req, res, row.storeId)) return;
+    // Same per-tap replay guard as /receive.
+    const requestKey = normalizeRequestKey(req.body.requestKey);
+    if (await findRequestKey(requestKey)) return res.json(row);
     if (row.status !== 'draft') {
         return res.status(409).json({ message: `Cannot confirm-send a job in status '${row.status}'` });
     }
@@ -1388,6 +1401,10 @@ router.post('/external-processing/:id/confirm-send', requireIssue, async (req, r
     const t = await sequelizeUtf8.transaction();
     try {
         const locked = await lockRow(MatWhExternalProcessing, row.id, t);
+        if (!(await claimRequestKey(requestKey, { action: 'coating_confirm_send', refId: row.id, userId: req.user.userId }, t))) {
+            await t.rollback();
+            return res.json(await row.reload());
+        }
         if (locked.status !== 'draft') {
             await t.rollback();
             return res.status(409).json({ message: `Cannot confirm-send a job in status '${locked.status}'` });

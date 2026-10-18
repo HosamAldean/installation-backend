@@ -31,6 +31,7 @@ import { MatWhUnit } from '../models/MatWhUnit.js';
 import { Vendor } from '../models/Vendor.js';
 import { MatWhItemStore } from '../models/MatWhItemStore.js';
 import { MatWhItemVariant } from '../models/MatWhItemVariant.js';
+import { normalizeRequestKey, runOnceWithKey } from '../services/matWhRequestKeys.js';
 
 const router = express.Router();
 router.use(authenticateToken, requirePermission(PERMISSIONS.MATERIALS_WAREHOUSE_MASTER_DATA));
@@ -158,7 +159,17 @@ function crudRoutes(path, model, pkField, searchFields = []) {
         for (const a of attrs) if (req.body[a] !== undefined) values[a] = req.body[a];
 
         try {
-            const row = await model.create(values);
+            // Optional per-tap key (mobile Add Item, see
+            // services/matWhRequestKeys.js): a replay answers with the row
+            // the first request created instead of a duplicate-code 409.
+            const { result: row, replay, refId } = await runOnceWithKey(
+                normalizeRequestKey(req.body.requestKey), { action: `create_${path}`.slice(0, 40), userId: req.user?.userId },
+                () => model.create(values),
+            );
+            if (replay) {
+                const earlier = refId ? await model.findByPk(refId) : null;
+                return res.json(earlier ? { ...earlier.toJSON(), alreadyApplied: true } : { alreadyApplied: true });
+            }
             res.status(201).json(row);
         } catch (err) {
             if (err.name === 'SequelizeUniqueConstraintError') {
