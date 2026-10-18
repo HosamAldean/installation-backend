@@ -21,6 +21,7 @@ import { MatWhItem } from '../models/MatWhItem.js';
 import { MatWhExternalProcessing } from '../models/MatWhExternalProcessing.js';
 import { MatWhItemVariant } from '../models/MatWhItemVariant.js';
 import { getAvailableToReserve, postLedgerMovement, normalizeColor, lockRow, lockItems } from './matWhLedger.js';
+import { findRequestKey, claimRequestKey } from './matWhRequestKeys.js';
 
 // Derives the header's overall status from its lines -- but only once no
 // line is still 'pending' (the caller's job: while any line remains
@@ -628,13 +629,23 @@ export async function requireVariantBarcode(itemId, expectedColor, expectedLengt
     }
 }
 
-export async function issueReservationLine(lineId, issuedBy, issuedBarcode, issuePurpose) {
+// requestKey (optional): the phone's per-tap key (see
+// services/matWhRequestKeys.js) -- a replay of an issue that already went
+// through answers with the line as it is now (alreadyApplied) instead of a
+// "cannot issue a line in status 'issued'" 409.
+export async function issueReservationLine(lineId, issuedBy, issuedBarcode, issuePurpose, requestKey = null) {
     const line = await MatWhReservationItem.findByPk(lineId);
     if (!line) {
         const err = new Error('Reservation line not found');
         err.status = 404;
         throw err;
     }
+    const currentState = async () => ({
+        line: await MatWhReservationItem.findByPk(lineId),
+        header: await MatWhReservationHeader.findByPk(line.reservationHeaderId),
+        alreadyApplied: true,
+    });
+    if (await findRequestKey(requestKey)) return currentState();
     if (!['confirmed', 'partially_confirmed'].includes(line.status)) {
         const err = new Error(`Cannot issue a line in status '${line.status}'`);
         err.status = 409;
@@ -658,6 +669,10 @@ export async function issueReservationLine(lineId, issuedBy, issuedBarcode, issu
     const t = await sequelizeUtf8.transaction();
     try {
         const locked = await lockRow(MatWhReservationItem, line.id, t);
+        if (!(await claimRequestKey(requestKey, { action: 'issue', refId: line.id, userId: issuedBy }, t))) {
+            await t.rollback();
+            return currentState();
+        }
         if (!['confirmed', 'partially_confirmed'].includes(locked.status) || !(locked.qtyReserved > 0)) {
             const err = new Error(`Cannot issue a line in status '${locked.status}'`);
             err.status = 409;

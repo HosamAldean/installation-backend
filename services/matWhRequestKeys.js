@@ -32,3 +32,32 @@ export async function claimRequestKey(requestKey, { action, refId, userId }, tra
         throw err;
     }
 }
+
+// For creates with no document row to lock first (a new item, an extra
+// stock-count line): the key is claimed up front -- its unique index makes
+// two identical requests take turns -- then create() runs and the key
+// records what it made. If create() fails the key is released, so a retry
+// still runs it. Returns { result } when this request did the work, or
+// { replay: true, refId } when an earlier one did (refId is null while
+// that earlier one is still running).
+export async function runOnceWithKey(requestKey, { action, userId }, create) {
+    if (!requestKey) return { result: await create() };
+    const existing = await findRequestKey(requestKey);
+    if (existing) return { replay: true, refId: existing.refId };
+    let keyRow;
+    try {
+        keyRow = await MatWhRequestKey.create({ requestKey, action, userId: userId ?? null });
+    } catch (err) {
+        if (err.name !== 'SequelizeUniqueConstraintError') throw err;
+        const other = await findRequestKey(requestKey);
+        return { replay: true, refId: other?.refId ?? null };
+    }
+    try {
+        const result = await create();
+        await keyRow.update({ refId: result?.id ?? null });
+        return { result };
+    } catch (err) {
+        await keyRow.destroy().catch(() => {});
+        throw err;
+    }
+}
