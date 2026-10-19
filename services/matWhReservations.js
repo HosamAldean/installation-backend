@@ -583,6 +583,46 @@ export async function rejectReservation(headerId, rejectedBy, reason, allowedSto
 // qtyReserved amount ever leaves; a line's own shortfall (covered by its
 // auto-PO, if any) is a separate goods-receipt event later, not part of
 // this line's issue.
+// Coated bars coming back from the coating company belong to the
+// reservation line that raised the job (sourceReservationItemId) -- reserve
+// them to it as part of the same receive. Without this the bars landed as
+// loose stock: a line whose existing mill went to coating ended up issued
+// short (only its bought shortfall was ever reserved), or stuck forever at
+// 'confirmed' with nothing reserved when the mill covered it all. This is
+// not the ambiguous "several lines want the same loose stock" case
+// fulfill-shortfall leaves to the storekeeper -- the job names its line.
+//
+// Capped at what the line still needs (qtyRequested - qtyReserved), so a
+// shortfall already covered some other way is never reserved twice. A job
+// raised for the line's shortfall PO (sourcePurchaseOrderItemId) reduces
+// qtyShortfall by what it reserves; bars lost in coating on a job made from
+// the line's existing mill are added to qtyShortfall, so the line shows
+// short and can be fulfilled later. Only an open line (confirmed /
+// partially_confirmed) is touched. Caller holds the transaction.
+export async function reserveCoatedReturn(job, qtyReceived, t) {
+    if (!job.sourceReservationItemId) return null;
+    const line = await lockRow(MatWhReservationItem, job.sourceReservationItemId, t);
+    if (!line || !['confirmed', 'partially_confirmed'].includes(line.status)) return null;
+
+    const reserved = Number(line.qtyReserved || 0);
+    const outstanding = Math.max(0, Number(line.qtyRequested) - reserved);
+    const toReserve = Math.max(0, Math.min(Number(qtyReceived) || 0, outstanding));
+    const lost = Math.max(0, Number(job.qtySent || 0) - (Number(qtyReceived) || 0));
+
+    let shortfall = Number(line.qtyShortfall || 0);
+    if (job.sourcePurchaseOrderItemId) shortfall -= toReserve;
+    else shortfall += lost;
+    const newReserved = reserved + toReserve;
+    shortfall = Math.max(0, Math.min(shortfall, Number(line.qtyRequested) - newReserved));
+
+    await line.update({
+        qtyReserved: newReserved,
+        qtyShortfall: shortfall,
+        status: shortfall > 0.0001 ? 'partially_confirmed' : 'confirmed',
+    }, { transaction: t });
+    return { lineId: line.id, reserved: toReserve, qtyReserved: newReserved, qtyShortfall: shortfall };
+}
+
 const ISSUE_PURPOSES = ['factory_production', 'general_purpose'];
 
 // Shared barcode-confirmation gate -- scoped narrowly, per direct
