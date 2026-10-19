@@ -935,7 +935,7 @@ router.put("/transport-requests/:id/mark-paid", authenticateToken, requirePermis
 router.post("/overtime-requests", authenticateToken, async (req, res) => {
     const empNo = requireEmpNo(req, res);
     if (empNo === null) return;
-    if (!isEligibleForOvertimeRequest(empNo)) {
+    if (req.user.role !== "admin" && !isEligibleForOvertimeRequest(empNo)) {
         return res.status(403).json({ success: false, message: "Overtime requests are only available to employees in the 100-series" });
     }
     const { date, workNature, otType, hours } = req.body;
@@ -1158,7 +1158,7 @@ function isVisitReportLate(header, rows, submittedAt = new Date()) {
 // (backs showing its tile on the employee home, web and mobile).
 router.get("/visit-reports/eligibility", authenticateToken, async (req, res) => {
     try {
-        const eligible = req.user.assignedEmpNo ? await isEligibleForVisitReport(req.user.assignedEmpNo) : false;
+        const eligible = req.user.role === "admin" || (req.user.assignedEmpNo ? await isEligibleForVisitReport(req.user.assignedEmpNo) : false);
         res.json({ success: true, eligible });
     } catch (err) {
         console.error("❌ HR VISIT REPORT ELIGIBILITY ERROR:", err);
@@ -1172,7 +1172,7 @@ router.post("/visit-reports", authenticateToken, async (req, res) => {
     const parsed = parseVisitReportBody(req.body);
     if (parsed.error) return res.status(400).json({ success: false, message: parsed.error });
     try {
-        if (!(await isEligibleForVisitReport(empNo))) {
+        if (req.user.role !== "admin" && !(await isEligibleForVisitReport(empNo))) {
             return res.status(403).json({ success: false, message: "The daily visits report is not available for your department" });
         }
         const t = await HrVisitReport.sequelize.transaction();
@@ -1493,7 +1493,7 @@ router.put("/overtime-requests/:id", authenticateToken, async (req, res) => {
         }
         // Defense in depth -- submission is already blocked for non-100-
         // series accounts, so no existing request should ever fail this.
-        if (!isEligibleForOvertimeRequest(request.requesterEmpNo)) {
+        if (req.user.role !== "admin" && !isEligibleForOvertimeRequest(request.requesterEmpNo)) {
             return res.status(403).json({ success: false, message: "Overtime requests are only available to employees in the 100-series" });
         }
         if (request.status !== "pending_manager") {
