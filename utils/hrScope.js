@@ -158,6 +158,24 @@ export async function getGmReviewerUserIds() {
     return reviewers.map((u) => u.userId);
 }
 
+// Daily visits report (HR form 10-35) is only for these ERP work places,
+// per explicit direction 2026-10-19: 5310 "خدمات القياس و المساحة"
+// (Measurement & Survey Services, Projects dept., Comp_num 1). Checked
+// live against PayEmp like the HR scopes above, so moving someone in or
+// out of the department in the ERP takes effect without a code change.
+export const VISIT_REPORT_WORK_PLACES = [5310];
+
+export async function isEligibleForVisitReport(empNo) {
+    const n = parseInt(empNo);
+    if (!n) return false;
+    const result = await withSqlRetry("erp", (pool) => pool.request()
+        .input("empNo", n)
+        .query(`SELECT 1 FROM ${SQL_DB}.dbo.PayEmp
+                WHERE Emp_num = @empNo AND Work_status = 1
+                  AND Work_place IN (${VISIT_REPORT_WORK_PLACES.map(Number).join(",")})`));
+    return result.recordset.length > 0;
+}
+
 export async function getEmpNosByPrefixGroup(group) {
     const cond = group === '100'
         ? "CAST(Emp_num AS VARCHAR) LIKE '100%'"

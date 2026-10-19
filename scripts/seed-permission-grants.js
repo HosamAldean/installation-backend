@@ -144,6 +144,8 @@ const SEED_GRANTS = [
     // no Finance/payment stage), gm included for the same view-only
     // oversight reasoning as every other HR report tab.
     [PERMISSIONS.HR_REPORTS_OVERTIME, ["hr_factory", "hr_ittihad", "hr", "hr_manager", "gm"]],
+    // Daily visits report (HR 10-35) -- same roles as the overtime tab.
+    [PERMISSIONS.HR_REPORTS_VISITS, ["hr_factory", "hr_ittihad", "hr", "hr_manager", "gm"]],
     // Not previously in this seed list at all (granted live, directly
     // against the table, to hr_ittihad/hr_manager only) -- added here now
     // so this script stays a complete, accurate record, with gm alongside

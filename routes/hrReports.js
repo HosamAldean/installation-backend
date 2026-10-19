@@ -23,6 +23,8 @@ import {
     HrTransportRequest,
     HrTransportAccompanier,
     HrOvertimeRequest,
+    HrVisitReport,
+    HrVisitReportRow,
 } from "../models/index.js";
 import { resolveEmployeeNames } from "../utils/employeeLookup.js";
 import { resolveUserNames } from "../utils/userLookup.js";
@@ -147,6 +149,23 @@ router.get("/overtime/employees", authenticateToken, requirePermission(PERMISSIO
     }
 });
 
+// ============================================================
+// GET /visits/employees -- every employee with a daily visits report,
+// scoped the same way GET /visits itself is.
+// ============================================================
+router.get("/visits/employees", authenticateToken, requirePermission(PERMISSIONS.HR_REPORTS_VISITS), async (req, res) => {
+    try {
+        const scopeFilter = await hrReportScopeFilter(req.user.role);
+        const rows = await HrVisitReport.findAll({ attributes: ["requesterEmpNo"] });
+        let empNos = rows.map((r) => r.requesterEmpNo);
+        if (scopeFilter) empNos = empNos.filter((n) => scopeFilter.has(Number(n)));
+        res.json({ success: true, data: await sortedEmployeeList(empNos) });
+    } catch (err) {
+        console.error("❌ HR VISITS EMPLOYEES ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to fetch employee list" });
+    }
+});
+
 function daysInLeave(r) {
     if (r.kind !== "leave" || !r.fromDate || !r.toDate) return 0;
     return Math.round((new Date(r.toDate) - new Date(r.fromDate)) / 86400000) + 1;
@@ -177,11 +196,12 @@ router.get("/summary", authenticateToken, requirePermission(PERMISSIONS.HR_REPOR
         const scopeFilter = await hrReportScopeFilter(req.user.role);
         const inScope = (r) => !scopeFilter || scopeFilter.has(Number(r.requesterEmpNo));
 
-        const [allLeaveAndDeparture, allAttendance, allTransport, allOvertime] = await Promise.all([
+        const [allLeaveAndDeparture, allAttendance, allTransport, allOvertime, allVisits] = await Promise.all([
             HrLeaveRequest.findAll().then((rows) => rows.filter(inScope)),
             HrAttendanceCorrectionRequest.findAll().then((rows) => rows.filter(inScope)),
             HrTransportRequest.findAll().then((rows) => rows.filter(inScope)),
             HrOvertimeRequest.findAll().then((rows) => rows.filter(inScope)),
+            HrVisitReport.findAll({ include: [{ model: HrVisitReportRow, as: "rows", attributes: ["id"] }] }).then((rows) => rows.filter(inScope)),
         ]);
         // HrLeaveRequest covers both full-day leave (kind='leave') and
         // partial-day work departure (kind='departure', Form 10-20's other
@@ -237,6 +257,13 @@ router.get("/summary", authenticateToken, requirePermission(PERMISSIONS.HR_REPOR
                 byStatus: countByStatus(allOvertime),
                 approvedHoursThisMonth: overtimeHours(allOvertime.filter((r) => r.status === "approved" && r.date >= monthStart)),
                 approvedHoursThisYear: overtimeHours(allOvertime.filter((r) => r.status === "approved" && r.date >= yearStart)),
+            },
+            visits: {
+                byStatus: countByStatus(allVisits),
+                visitsThisMonth: allVisits
+                    .filter((r) => r.visitDate >= monthStart && r.status !== "canceled")
+                    .reduce((s, r) => s + (r.rows?.length || 0), 0),
+                lateThisMonth: allVisits.filter((r) => r.visitDate >= monthStart && r.submittedLate && r.status !== "canceled").length,
             },
         });
     } catch (err) {
@@ -654,6 +681,99 @@ router.put("/overtime/mark-exported", authenticateToken, requirePermission(PERMI
         res.json({ success: true, count });
     } catch (err) {
         console.error("❌ HR OVERTIME MARK-EXPORTED ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to mark records as exported" });
+    }
+});
+
+// ============================================================
+// Daily visits report (HR form 10-35) -- GET /visits and its
+// mark-exported. Same HR-tier scope as /overtime (hrReportScopeFilter).
+// late=yes|no filters on submittedLate (the form's 48-hour rule).
+// ============================================================
+async function visitsWhere(req, q) {
+    const { status, dateFrom, dateTo, search, empGroup, late } = q;
+    let empNoFilter = await resolveSearchToEmpNos(search);
+    const scopeFilter = await hrReportScopeFilter(req.user.role);
+    const groupFilter = await empGroupFilter(empGroup);
+    for (const filter of [scopeFilter, groupFilter]) {
+        if (!filter) continue;
+        empNoFilter = empNoFilter
+            ? empNoFilter.filter((n) => filter.has(Number(n)))
+            : [...filter];
+    }
+    if (empNoFilter && empNoFilter.length === 0) return null;
+    const where = {};
+    if (status) where.status = status;
+    if (empNoFilter) where.requesterEmpNo = { [Op.in]: empNoFilter };
+    if (dateFrom || dateTo) {
+        where.visitDate = {};
+        if (dateFrom) where.visitDate[Op.gte] = dateFrom;
+        if (dateTo) where.visitDate[Op.lte] = dateTo;
+    }
+    if (late === "yes") where.submittedLate = true;
+    else if (late === "no") where.submittedLate = false;
+    return where;
+}
+
+router.get("/visits", authenticateToken, requirePermission(PERMISSIONS.HR_REPORTS_VISITS), async (req, res) => {
+    try {
+        const { page, pageSize } = parsePagination(req.query);
+        const where = await visitsWhere(req, req.query);
+        if (!where) {
+            return res.json({ success: true, items: [], total: 0, page, pageSize, totals: { reports: 0, visits: 0, late: 0 } });
+        }
+        if (req.query.exported === "no") where.exportedAt = null;
+        else if (req.query.exported === "yes") where.exportedAt = { [Op.ne]: null };
+
+        const visits = await HrVisitReport.findAll({
+            where,
+            order: [["visitDate", "DESC"], ["id", "DESC"]],
+            include: [{ model: HrVisitReportRow, as: "rows" }],
+        });
+        // Rows in visit order -- an include can't be ordered per-parent
+        // without a separate top-level order clause.
+        const sortedRows = (r) => [...(r.rows || [])].sort((a, b) => String(a.fromTime).localeCompare(String(b.fromTime)));
+
+        const [empNames, userNames] = await Promise.all([
+            resolveEmployeeNames([
+                ...visits.map((r) => r.requesterEmpNo),
+                ...visits.map((r) => r.managerApproverEmpNo),
+                ...visits.map((r) => r.factoryMgrApproverEmpNo),
+            ]),
+            resolveUserNames(visits.map((r) => r.hrReviewerUserId)),
+        ]);
+        const enriched = visits.map((r) => ({
+            ...r.toJSON(),
+            rows: sortedRows(r).map((x) => x.toJSON()),
+            employee: empNames[r.requesterEmpNo] || null,
+            managerApprover: r.managerApproverEmpNo ? (empNames[r.managerApproverEmpNo] || null) : null,
+            factoryMgrApprover: r.factoryMgrApproverEmpNo ? (empNames[r.factoryMgrApproverEmpNo] || null) : null,
+            hrApprover: r.hrReviewerUserId ? (userNames[r.hrReviewerUserId] || null) : null,
+        }));
+
+        const total = enriched.length;
+        const items = enriched.slice((page - 1) * pageSize, page * pageSize);
+        const totals = {
+            reports: total,
+            visits: enriched.reduce((s, r) => s + r.rows.length, 0),
+            late: enriched.filter((r) => r.submittedLate).length,
+        };
+        res.json({ success: true, items, total, page, pageSize, totals });
+    } catch (err) {
+        console.error("❌ HR VISITS REPORT ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to fetch daily visits report" });
+    }
+});
+
+router.put("/visits/mark-exported", authenticateToken, requirePermission(PERMISSIONS.HR_REPORTS_VISITS), blockGmWrites, async (req, res) => {
+    try {
+        const where = await visitsWhere(req, req.body || {});
+        if (!where) return res.json({ success: true, count: 0 });
+        where.exportedAt = null;
+        const [count] = await HrVisitReport.update({ exportedAt: new Date() }, { where });
+        res.json({ success: true, count });
+    } catch (err) {
+        console.error("❌ HR VISITS MARK-EXPORTED ERROR:", err);
         res.status(500).json({ success: false, message: "Failed to mark records as exported" });
     }
 });
