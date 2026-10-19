@@ -25,6 +25,8 @@ import {
     HrTransportRequest,
     HrTransportAccompanier,
     HrOvertimeRequest,
+    HrVisitReport,
+    HrVisitReportRow,
 } from "../models/index.js";
 
 const run = async () => {
@@ -41,6 +43,11 @@ const run = async () => {
         console.log("✅ HrTransportAccompaniers ready");
         await HrOvertimeRequest.sync();
         console.log("✅ HrOvertimeRequests ready");
+        // HR 10-35 daily visits report (added 2026-10-19).
+        await HrVisitReport.sync();
+        console.log("✅ HrVisitReports ready");
+        await HrVisitReportRow.sync();
+        console.log("✅ HrVisitReportRows ready");
         process.exit(0);
     } catch (err) {
         console.error("❌ Failed to create HR tables:", err);

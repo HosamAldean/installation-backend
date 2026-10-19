@@ -27,9 +27,11 @@ import {
     HrTransportRequest,
     HrTransportAccompanier,
     HrOvertimeRequest,
+    HrVisitReport,
+    HrVisitReportRow,
 } from "../models/index.js";
 import { isSupervisorOf, getSupervisedEmpNos, hasRealSupervisor, getEmpNosWithoutRealSupervisor, getSupervisorUserId, getFallbackManagerUserIds, isGeneralManager } from "../utils/supervisorLookup.js";
-import { isHrScopedRole, getHrQueueEmpNos, isInHrQueueScope, getHrReviewerUserIds, getFinanceReviewerUserIds, getGmReviewerUserIds, getFactoryManagerUserIds, needsFactoryManagerStep, FACTORY_MANAGER_EMP_NO } from "../utils/hrScope.js";
+import { isHrScopedRole, getHrQueueEmpNos, isInHrQueueScope, getHrReviewerUserIds, getFinanceReviewerUserIds, getGmReviewerUserIds, getFactoryManagerUserIds, needsFactoryManagerStep, FACTORY_MANAGER_EMP_NO, isEligibleForVisitReport } from "../utils/hrScope.js";
 import { resolveEmployeeNames, resolveVacationBalances } from "../utils/employeeLookup.js";
 import { resolveUserNames } from "../utils/userLookup.js";
 import { resolveProjectLabels, withProjectDisplay } from "../utils/projectLookup.js";
@@ -933,7 +935,7 @@ router.put("/transport-requests/:id/mark-paid", authenticateToken, requirePermis
 router.post("/overtime-requests", authenticateToken, async (req, res) => {
     const empNo = requireEmpNo(req, res);
     if (empNo === null) return;
-    if (!isEligibleForOvertimeRequest(empNo)) {
+    if (req.user.role !== "admin" && !isEligibleForOvertimeRequest(empNo)) {
         return res.status(403).json({ success: false, message: "Overtime requests are only available to employees in the 100-series" });
     }
     const { date, workNature, otType, hours } = req.body;
@@ -1068,6 +1070,253 @@ router.put("/overtime-requests/:id/hr-decision", authenticateToken, requirePermi
     }
 });
 
+// ============================================================
+// Daily visits report (HR form 10-35) -- /visit-reports. Only for
+// employees in VISIT_REPORT_WORK_PLACES (utils/hrScope.js, checked live
+// against PayEmp). Same approval line as the paper form: manager (plus
+// the factory-manager stage, via applyManagerStageDecision) -> HR audit.
+// ============================================================
+const VISIT_ROWS_INCLUDE = { model: HrVisitReportRow, as: "rows" };
+const VISIT_REPORT_MAX_ROWS = 30;
+// The form's note: the report must reach HR within 48 hours.
+const VISIT_REPORT_DEADLINE_HOURS = 48;
+const HHMM = /^([01]\d|2[0-3]):[0-5]\d$/;
+
+function localToday() {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+// Validates a create/edit body. Returns { error } or { header, rows }.
+function parseVisitReportBody(body) {
+    const { visitDate, leftCompanyTime, returnedTime } = body;
+    if (!visitDate || !/^\d{4}-\d{2}-\d{2}$/.test(String(visitDate))) {
+        return { error: "visitDate is required (YYYY-MM-DD)" };
+    }
+    if (String(visitDate) > localToday()) {
+        return { error: "The visit date can't be in the future" };
+    }
+    for (const [name, v] of [["leftCompanyTime", leftCompanyTime], ["returnedTime", returnedTime]]) {
+        if (v && !HHMM.test(String(v))) return { error: `${name} must be in HH:MM format` };
+    }
+    if (leftCompanyTime && returnedTime && String(returnedTime) <= String(leftCompanyTime)) {
+        return { error: "The return time must be after the time you left the company" };
+    }
+    const input = Array.isArray(body.rows) ? body.rows : [];
+    if (input.length === 0) {
+        return { error: "At least one visit is required" };
+    }
+    if (input.length > VISIT_REPORT_MAX_ROWS) {
+        return { error: `At most ${VISIT_REPORT_MAX_ROWS} visits per report` };
+    }
+    const rows = [];
+    for (const [i, r] of input.entries()) {
+        const n = i + 1;
+        const fromTime = String(r?.fromTime || "").trim();
+        const toTime = String(r?.toTime || "").trim();
+        const visitedParty = String(r?.visitedParty || "").trim();
+        const visitReason = String(r?.visitReason || "").trim();
+        const requestedBy = String(r?.requestedBy || "").trim();
+        if (!HHMM.test(fromTime) || !HHMM.test(toTime)) {
+            return { error: `Visit ${n}: from and to times are required (HH:MM)` };
+        }
+        if (toTime <= fromTime) {
+            return { error: `Visit ${n}: the end time must be after the start time` };
+        }
+        if (!visitedParty) return { error: `Visit ${n}: the visited party is required` };
+        if (!visitReason) return { error: `Visit ${n}: the reason for the visit is required` };
+        rows.push({
+            fromTime,
+            toTime,
+            visitedParty: visitedParty.slice(0, 255),
+            visitReason: visitReason.slice(0, 500),
+            requestedBy: requestedBy ? requestedBy.slice(0, 255) : null,
+        });
+    }
+    rows.sort((a, b) => a.fromTime.localeCompare(b.fromTime));
+    return {
+        header: {
+            visitDate: String(visitDate),
+            leftCompanyTime: leftCompanyTime || null,
+            returnedTime: returnedTime || null,
+        },
+        rows,
+    };
+}
+
+// Late = submitted more than 48 hours after the end of the visit day's
+// work (the return time, else the last visit's end time). Server-local
+// time, same as every other HH:MM on these forms.
+function isVisitReportLate(header, rows, submittedAt = new Date()) {
+    const end = header.returnedTime || rows.map((r) => r.toTime).sort().pop() || "23:59";
+    const deadline = new Date(`${header.visitDate}T${end}:00`);
+    deadline.setHours(deadline.getHours() + VISIT_REPORT_DEADLINE_HOURS);
+    return submittedAt > deadline;
+}
+
+// GET /visit-reports/eligibility -- whether the caller may file the form
+// (backs showing its tile on the employee home, web and mobile).
+router.get("/visit-reports/eligibility", authenticateToken, async (req, res) => {
+    try {
+        const eligible = req.user.role === "admin" || (req.user.assignedEmpNo ? await isEligibleForVisitReport(req.user.assignedEmpNo) : false);
+        res.json({ success: true, eligible });
+    } catch (err) {
+        console.error("❌ HR VISIT REPORT ELIGIBILITY ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to check eligibility" });
+    }
+});
+
+router.post("/visit-reports", authenticateToken, async (req, res) => {
+    const empNo = requireEmpNo(req, res);
+    if (empNo === null) return;
+    const parsed = parseVisitReportBody(req.body);
+    if (parsed.error) return res.status(400).json({ success: false, message: parsed.error });
+    try {
+        if (req.user.role !== "admin" && !(await isEligibleForVisitReport(empNo))) {
+            return res.status(403).json({ success: false, message: "The daily visits report is not available for your department" });
+        }
+        const t = await HrVisitReport.sequelize.transaction();
+        let request;
+        try {
+            request = await HrVisitReport.create({
+                requesterUserId: req.user.userId,
+                requesterEmpNo: empNo,
+                ...parsed.header,
+                submittedLate: isVisitReportLate(parsed.header, parsed.rows),
+            }, { transaction: t });
+            await HrVisitReportRow.bulkCreate(parsed.rows.map((r) => ({ ...r, requestId: request.id })), { transaction: t });
+            await t.commit();
+        } catch (txErr) {
+            await t.rollback();
+            throw txErr;
+        }
+        notifyManagerOfNewRequest(empNo, {
+            title: "New daily visits report",
+            body: "A request from your team needs your approval.",
+        });
+        res.json({ success: true, id: request.id, submittedLate: request.submittedLate });
+    } catch (err) {
+        console.error("❌ HR CREATE VISIT REPORT ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to submit daily visits report" });
+    }
+});
+
+router.put("/visit-reports/:id/manager-decision", authenticateToken, async (req, res) => {
+    const { decision, note } = req.body;
+    if (!["approved", "rejected"].includes(decision)) {
+        return res.status(400).json({ success: false, message: "decision must be 'approved' or 'rejected'" });
+    }
+    try {
+        const request = await HrVisitReport.findByPk(req.params.id);
+        if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+        const stage = await applyManagerStageDecision(req, res, request, decision, note, "pending_hr");
+        if (!stage) return;
+        if (request.status === "pending_factory_mgr") {
+            notifyAwaitingFactoryManager(request, { title: "Daily visits report update", noun: "daily visits report" });
+            return res.json({ success: true });
+        }
+        const by = stage === "factory_mgr" ? "The factory manager" : "Your manager";
+        sendPushToUser(request.requesterUserId, {
+            title: "Daily visits report update",
+            body: decision === "approved" ? `${by} approved your daily visits report — now awaiting HR audit.` : `${by} rejected your daily visits report.`,
+        });
+        if (decision === "approved") {
+            notifyHrReviewers(request.requesterEmpNo, {
+                title: "Daily visits report awaiting HR audit",
+                body: "A manager-approved daily visits report needs your review.",
+            });
+        }
+        res.json({ success: true });
+    } catch (err) {
+        console.error("❌ HR VISIT REPORT MANAGER DECISION ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to record decision" });
+    }
+});
+
+router.put("/visit-reports/:id/hr-decision", authenticateToken, requirePermission(PERMISSIONS.HR_REQUESTS_QUEUE), blockGmWrites, async (req, res) => {
+    const { decision, note } = req.body;
+    if (!["approved", "rejected"].includes(decision)) {
+        return res.status(400).json({ success: false, message: "decision must be 'approved' or 'rejected'" });
+    }
+    try {
+        const request = await HrVisitReport.findByPk(req.params.id);
+        if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+        if (!(await isHrDecisionInScope(req.user.role, request.requesterEmpNo))) {
+            return res.status(403).json({ success: false, message: "Forbidden" });
+        }
+        if (request.status !== "pending_hr") {
+            return res.status(400).json({ success: false, message: "This request is not awaiting HR review" });
+        }
+        await request.update({
+            hrReviewerUserId: req.user.userId,
+            hrDecision: decision,
+            hrDecidedAt: new Date(),
+            hrNote: note || null,
+            status: decision,
+        });
+        sendPushToUser(request.requesterUserId, {
+            title: "Daily visits report update",
+            body: decision === "approved" ? "HR audited and approved your daily visits report." : "HR rejected your daily visits report.",
+        });
+        res.json({ success: true });
+    } catch (err) {
+        console.error("❌ HR VISIT REPORT HR DECISION ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to record decision" });
+    }
+});
+
+// Self-service edit -- same rule as the other forms below: requester only,
+// while still pending_manager. submittedLate is not recomputed: the 48-hour
+// rule is about when the report first reached the system.
+router.put("/visit-reports/:id", authenticateToken, async (req, res) => {
+    const parsed = parseVisitReportBody(req.body);
+    if (parsed.error) return res.status(400).json({ success: false, message: parsed.error });
+    try {
+        const request = await HrVisitReport.findByPk(req.params.id);
+        if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+        if (request.requesterUserId !== req.user.userId) {
+            return res.status(403).json({ success: false, message: "You can only edit your own requests" });
+        }
+        if (request.status !== "pending_manager") {
+            return res.status(400).json({ success: false, message: "This request has already entered review and can no longer be edited" });
+        }
+        const t = await HrVisitReport.sequelize.transaction();
+        try {
+            await request.update(parsed.header, { transaction: t });
+            await HrVisitReportRow.destroy({ where: { requestId: request.id }, transaction: t });
+            await HrVisitReportRow.bulkCreate(parsed.rows.map((r) => ({ ...r, requestId: request.id })), { transaction: t });
+            await t.commit();
+        } catch (txErr) {
+            await t.rollback();
+            throw txErr;
+        }
+        res.json({ success: true });
+    } catch (err) {
+        console.error("❌ HR EDIT VISIT REPORT ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to update daily visits report" });
+    }
+});
+
+// Self-service cancel -- same soft cancel as the other forms below.
+router.delete("/visit-reports/:id", authenticateToken, async (req, res) => {
+    try {
+        const request = await HrVisitReport.findByPk(req.params.id);
+        if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+        if (request.requesterUserId !== req.user.userId) {
+            return res.status(403).json({ success: false, message: "You can only cancel your own requests" });
+        }
+        if (["approved", "rejected", "canceled"].includes(request.status)) {
+            return res.status(400).json({ success: false, message: "This request has already been decided and can no longer be canceled" });
+        }
+        await request.update({ status: "canceled", canceledAt: new Date() });
+        res.json({ success: true });
+    } catch (err) {
+        console.error("❌ HR VISIT REPORT CANCEL ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to cancel request" });
+    }
+});
+
+// ============================================================
 // PUT /leave-requests/:id, /attendance-corrections/:id,
 // /transport-requests/:id -- self-service edit. Requester-only, and only
 // while still pending_manager -- stricter than cancel's window below,
@@ -1244,7 +1493,7 @@ router.put("/overtime-requests/:id", authenticateToken, async (req, res) => {
         }
         // Defense in depth -- submission is already blocked for non-100-
         // series accounts, so no existing request should ever fail this.
-        if (!isEligibleForOvertimeRequest(request.requesterEmpNo)) {
+        if (req.user.role !== "admin" && !isEligibleForOvertimeRequest(request.requesterEmpNo)) {
             return res.status(403).json({ success: false, message: "Overtime requests are only available to employees in the 100-series" });
         }
         if (request.status !== "pending_manager") {
@@ -1349,11 +1598,11 @@ router.delete("/overtime-requests/:id", authenticateToken, async (req, res) => {
 });
 
 // ============================================================
-// GET /my-requests -- everything the caller submitted, all 4 types
+// GET /my-requests -- everything the caller submitted, all 5 types
 // ============================================================
 router.get("/my-requests", authenticateToken, async (req, res) => {
     try {
-        const [leave, attendance, transport, overtime] = await Promise.all([
+        const [leave, attendance, transport, overtime, visits] = await Promise.all([
             HrLeaveRequest.findAll({ where: { requesterUserId: req.user.userId }, order: [["createdAt", "DESC"]] }),
             HrAttendanceCorrectionRequest.findAll({
                 where: { requesterUserId: req.user.userId },
@@ -1368,6 +1617,11 @@ router.get("/my-requests", authenticateToken, async (req, res) => {
             HrOvertimeRequest.findAll({
                 where: { requesterUserId: req.user.userId },
                 order: [["createdAt", "DESC"]],
+            }),
+            HrVisitReport.findAll({
+                where: { requesterUserId: req.user.userId },
+                order: [["createdAt", "DESC"]],
+                include: [VISIT_ROWS_INCLUDE],
             }),
         ]);
 
@@ -1385,6 +1639,8 @@ router.get("/my-requests", authenticateToken, async (req, res) => {
                 ...transport.map(r => r.factoryMgrApproverEmpNo),
                 ...overtime.map(r => r.managerApproverEmpNo),
                 ...overtime.map(r => r.factoryMgrApproverEmpNo),
+                ...visits.map(r => r.managerApproverEmpNo),
+                ...visits.map(r => r.factoryMgrApproverEmpNo),
             ]),
             resolveUserNames([
                 ...leave.map(r => r.hrReviewerUserId),
@@ -1394,6 +1650,7 @@ router.get("/my-requests", authenticateToken, async (req, res) => {
                 ...transport.map(r => r.paidByUserId),
                 ...overtime.map(r => r.gmApproverUserId),
                 ...overtime.map(r => r.hrReviewerUserId),
+                ...visits.map(r => r.hrReviewerUserId),
             ]),
             resolveProjectLabels(transport.map(r => r.projectLabel)),
         ]);
@@ -1421,6 +1678,7 @@ router.get("/my-requests", authenticateToken, async (req, res) => {
                 ...approvers(r, "hrReviewerUserId"),
                 gmApprover: r.gmApproverUserId ? (userNames[r.gmApproverUserId] || null) : null,
             })),
+            visits: visits.map(r => ({ ...r.toJSON(), type: "visit", ...approvers(r, "hrReviewerUserId") })),
         });
     } catch (err) {
         console.error("❌ HR MY REQUESTS ERROR:", err);
@@ -1440,7 +1698,7 @@ router.get("/manager-approvals", authenticateToken, async (req, res) => {
         const isGm = await isAuthorizedGmDecision(req);
         const isFactoryMgr = isFactoryManagerCaller(req);
         if (skipManagerStage && !isGm && !isFactoryMgr) {
-            return res.json({ success: true, leave: [], attendance: [], transport: [], overtime: [] });
+            return res.json({ success: true, leave: [], attendance: [], transport: [], overtime: [], visits: [] });
         }
         const where = supervisedEmpNos
             ? { status: "pending_manager", requesterEmpNo: supervisedEmpNos }
@@ -1449,7 +1707,7 @@ router.get("/manager-approvals", authenticateToken, async (req, res) => {
         // pending_factory_mgr isn't Supervisor_No-scoped either -- the
         // factory manager sees every request waiting at his stage.
         const fmWhere = { status: "pending_factory_mgr" };
-        const [leaveMgr, attendanceMgr, transportMgr, overtimeMgr, leaveFm, attendanceFm, transportFm, overtimeFm, overtimeGm] = await Promise.all([
+        const [leaveMgr, attendanceMgr, transportMgr, overtimeMgr, leaveFm, attendanceFm, transportFm, overtimeFm, overtimeGm, visitsMgr, visitsFm] = await Promise.all([
             skipManagerStage ? [] : HrLeaveRequest.findAll({ where, order: [["createdAt", "ASC"]] }),
             skipManagerStage ? [] : HrAttendanceCorrectionRequest.findAll({ where, order: [["createdAt", "ASC"]], include: [{ model: HrAttendanceCorrectionRow, as: "rows" }] }),
             skipManagerStage ? [] : HrTransportRequest.findAll({ where, order: [["createdAt", "ASC"]], include: [{ model: HrTransportAccompanier, as: "accompaniers" }] }),
@@ -1462,13 +1720,16 @@ router.get("/manager-approvals", authenticateToken, async (req, res) => {
             // endpoint -- see isAuthorizedGmDecision -- so it's a flat,
             // unfiltered query gated purely on whether the caller IS the GM.
             isGm ? HrOvertimeRequest.findAll({ where: { status: "pending_gm" }, order: [["createdAt", "ASC"]] }) : [],
+            skipManagerStage ? [] : HrVisitReport.findAll({ where, order: [["createdAt", "ASC"]], include: [VISIT_ROWS_INCLUDE] }),
+            isFactoryMgr ? HrVisitReport.findAll({ where: fmWhere, order: [["createdAt", "ASC"]], include: [VISIT_ROWS_INCLUDE] }) : [],
         ]);
         const leave = [...leaveMgr, ...leaveFm];
+        const visits = [...visitsMgr, ...visitsFm];
         const attendance = [...attendanceMgr, ...attendanceFm];
         const transport = [...transportMgr, ...transportFm];
         const combinedOvertime = [...overtimeMgr, ...overtimeFm, ...overtimeGm];
         const [names, projectNames, vacationBalances] = await Promise.all([
-            resolveEmployeeNames([...leave, ...attendance, ...transport, ...combinedOvertime].map(r => r.requesterEmpNo)),
+            resolveEmployeeNames([...leave, ...attendance, ...transport, ...combinedOvertime, ...visits].map(r => r.requesterEmpNo)),
             resolveProjectLabels(transport.map(r => r.projectLabel)),
             // Same as GET /hr-queue's own vacationBalance -- leave/departure
             // only, requested for the manager's approval card too now.
@@ -1494,6 +1755,7 @@ router.get("/manager-approvals", authenticateToken, async (req, res) => {
                 type: "overtime",
                 employee: names[r.requesterEmpNo] || null,
             })),
+            visits: visits.map(r => ({ ...r.toJSON(), type: "visit", employee: names[r.requesterEmpNo] || null })),
         });
     } catch (err) {
         console.error("❌ HR MANAGER APPROVALS ERROR:", err);
@@ -1534,7 +1796,11 @@ router.get("/manager-approvals-history", authenticateToken, async (req, res) => 
 
         const fmWhere = { factoryMgrDecidedAt: { [Op.ne]: null } };
         const fmOrder = [["factoryMgrDecidedAt", "DESC"]];
-        const [leave, attendance, transport, overtime, overtimeGm, leaveFm, attendanceFm, transportFm, overtimeFm] = await Promise.all([
+        // Visit reports only when the client asks (?include=visit) --
+        // this is one mixed list, and an app version that doesn't know the
+        // type yet would show it as a broken card.
+        const withVisits = String(req.query.include || "").split(",").includes("visit");
+        const [leave, attendance, transport, overtime, overtimeGm, leaveFm, attendanceFm, transportFm, overtimeFm, visits, visitsFm] = await Promise.all([
             skipManagerStage ? [] : HrLeaveRequest.findAll({ where, order: [["managerDecidedAt", "DESC"]] }),
             skipManagerStage ? [] : HrAttendanceCorrectionRequest.findAll({ where, order: [["managerDecidedAt", "DESC"]], include: [{ model: HrAttendanceCorrectionRow, as: "rows" }] }),
             skipManagerStage ? [] : HrTransportRequest.findAll({ where, order: [["managerDecidedAt", "DESC"]], include: [{ model: HrTransportAccompanier, as: "accompaniers" }] }),
@@ -1549,6 +1815,8 @@ router.get("/manager-approvals-history", authenticateToken, async (req, res) => 
             isFactoryMgr ? HrAttendanceCorrectionRequest.findAll({ where: fmWhere, order: fmOrder, include: [{ model: HrAttendanceCorrectionRow, as: "rows" }] }) : [],
             isFactoryMgr ? HrTransportRequest.findAll({ where: fmWhere, order: fmOrder, include: [{ model: HrTransportAccompanier, as: "accompaniers" }] }) : [],
             isFactoryMgr ? HrOvertimeRequest.findAll({ where: fmWhere, order: fmOrder }) : [],
+            withVisits && !skipManagerStage ? HrVisitReport.findAll({ where, order: [["managerDecidedAt", "DESC"]], include: [VISIT_ROWS_INCLUDE] }) : [],
+            withVisits && isFactoryMgr ? HrVisitReport.findAll({ where: fmWhere, order: fmOrder, include: [VISIT_ROWS_INCLUDE] }) : [],
         ]);
 
         // callerStage marks which decision was actually the current
@@ -1569,6 +1837,8 @@ router.get("/manager-approvals-history", authenticateToken, async (req, res) => 
             ...attendanceFm.map(r => ({ ...r.toJSON(), type: "attendance", callerStage: "factory_mgr", sortDate: r.factoryMgrDecidedAt })),
             ...transportFm.map(r => ({ ...r.toJSON(), type: "transport", callerStage: "factory_mgr", sortDate: r.factoryMgrDecidedAt })),
             ...overtimeFm.map(r => ({ ...r.toJSON(), type: "overtime", callerStage: "factory_mgr", sortDate: r.factoryMgrDecidedAt })),
+            ...visits.map(r => ({ ...r.toJSON(), type: "visit", callerStage: "manager", sortDate: r.managerDecidedAt })),
+            ...visitsFm.map(r => ({ ...r.toJSON(), type: "visit", callerStage: "factory_mgr", sortDate: r.factoryMgrDecidedAt })),
         ];
         combined.sort((a, b) => new Date(b.sortDate) - new Date(a.sortDate));
 
@@ -1648,11 +1918,12 @@ router.get("/am-i-a-supervisor", authenticateToken, async (req, res) => {
 // ============================================================
 router.get("/hr-queue", authenticateToken, requirePermission(PERMISSIONS.HR_REQUESTS_QUEUE), async (req, res) => {
     try {
-        const [leave, attendance, transport, overtime] = await Promise.all([
+        const [leave, attendance, transport, overtime, visits] = await Promise.all([
             HrLeaveRequest.findAll({ where: { status: "pending_hr" }, order: [["createdAt", "ASC"]] }),
             HrAttendanceCorrectionRequest.findAll({ where: { status: "pending_hr" }, order: [["createdAt", "ASC"]], include: [{ model: HrAttendanceCorrectionRow, as: "rows" }] }),
             HrTransportRequest.findAll({ where: { status: "pending_hr_audit" }, order: [["createdAt", "ASC"]], include: [{ model: HrTransportAccompanier, as: "accompaniers" }] }),
             HrOvertimeRequest.findAll({ where: { status: "pending_hr" }, order: [["createdAt", "ASC"]] }),
+            HrVisitReport.findAll({ where: { status: "pending_hr" }, order: [["createdAt", "ASC"]], include: [VISIT_ROWS_INCLUDE] }),
         ]);
         // hr_factory/hr_ittihad/hr are each scoped to a slice of the company
         // (see utils/hrScope.js) -- hr_manager (and admin, which never
@@ -1667,8 +1938,9 @@ router.get("/hr-queue", authenticateToken, requirePermission(PERMISSIONS.HR_REQU
         const scopedAttendance = attendance.filter(inScope);
         const scopedTransport = transport.filter(inScope);
         const scopedOvertime = overtime.filter(inScope);
+        const scopedVisits = visits.filter(inScope);
         const [names, projectNames, vacationBalances] = await Promise.all([
-            resolveEmployeeNames([...scopedLeave, ...scopedAttendance, ...scopedTransport, ...scopedOvertime].map(r => r.requesterEmpNo)),
+            resolveEmployeeNames([...scopedLeave, ...scopedAttendance, ...scopedTransport, ...scopedOvertime, ...scopedVisits].map(r => r.requesterEmpNo)),
             resolveProjectLabels(scopedTransport.map(r => r.projectLabel)),
             // Leave/departure only -- an approver reviewing here benefits
             // from seeing the requester's remaining balance; attendance
@@ -1697,6 +1969,7 @@ router.get("/hr-queue", authenticateToken, requirePermission(PERMISSIONS.HR_REQU
                 type: "overtime",
                 employee: names[r.requesterEmpNo] || null,
             })),
+            visits: scopedVisits.map(r => ({ ...r.toJSON(), type: "visit", employee: names[r.requesterEmpNo] || null })),
         });
     } catch (err) {
         console.error("❌ HR QUEUE ERROR:", err);

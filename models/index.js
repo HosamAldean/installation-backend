@@ -22,6 +22,8 @@ import { HrAttendanceCorrectionRow } from "./HrAttendanceCorrectionRow.js";
 import { HrTransportRequest } from "./HrTransportRequest.js";
 import { HrTransportAccompanier } from "./HrTransportAccompanier.js";
 import { HrOvertimeRequest } from "./HrOvertimeRequest.js";
+import { HrVisitReport } from "./HrVisitReport.js";
+import { HrVisitReportRow } from "./HrVisitReportRow.js";
 import { IttihadClockImportRow } from "./IttihadClockImportRow.js";
 
 
@@ -46,6 +48,8 @@ export {
     HrTransportRequest,
     HrTransportAccompanier,
     HrOvertimeRequest,
+    HrVisitReport,
+    HrVisitReportRow,
     IttihadClockImportRow
 };
 
@@ -225,3 +229,13 @@ HrTransportAccompanier.belongsTo(HrTransportRequest, {
 // only now, see that model's header comment) -- the old hasMany/belongsTo
 // association to HrOvertimeEmployee (still a real, unused table -- not
 // dropped) was removed here along with it.
+
+HrVisitReport.hasMany(HrVisitReportRow, {
+    foreignKey: "requestId",
+    as: "rows"
+});
+
+HrVisitReportRow.belongsTo(HrVisitReport, {
+    foreignKey: "requestId",
+    as: "request"
+});

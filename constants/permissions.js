@@ -139,6 +139,8 @@ export const PERMISSIONS = Object.freeze({
     HR_REPORTS_TRANSPORT: 'hr.reports_transport',
     HR_REPORTS_LEAVE_ATTENDANCE: 'hr.reports_leave_attendance',
     HR_REPORTS_OVERTIME: 'hr.reports_overtime',
+    // Daily visits report tab (HR form 10-35).
+    HR_REPORTS_VISITS: 'hr.reports_visits',
     HR_ITTIHAD_ATTENDANCE: 'hr.ittihad_attendance',
     // Toggling the employee Payslip report's global on/off switch (see
     // models/PayslipVisibility.js) -- separate from HR_REQUESTS_QUEUE/
@@ -331,6 +333,7 @@ export const PERMISSION_GROUPS = [
             { key: PERMISSIONS.HR_REPORTS_TRANSPORT, labelKey: 'hrReportsTransport' },
             { key: PERMISSIONS.HR_REPORTS_LEAVE_ATTENDANCE, labelKey: 'hrReportsLeaveAttendance' },
             { key: PERMISSIONS.HR_REPORTS_OVERTIME, labelKey: 'hrReportsOvertime' },
+            { key: PERMISSIONS.HR_REPORTS_VISITS, labelKey: 'hrReportsVisits' },
             { key: PERMISSIONS.HR_ITTIHAD_ATTENDANCE, labelKey: 'hrIttihadAttendance' },
             { key: PERMISSIONS.HR_PAYSLIP_VISIBILITY_MANAGE, labelKey: 'hrPayslipVisibilityManage' },
         ],
