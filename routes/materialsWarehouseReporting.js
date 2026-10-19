@@ -52,34 +52,64 @@ router.get('/reports/card', async (req, res) => {
 // Remaining Stock -- balance across items, optionally scoped to one
 // store. Single grouped query against the ledger rather than one query
 // per item -- matWhItems can be large (Alpha's own equivalent has 26k
-// rows, §04).
+// rows, §04). With the real stock loaded (2026-10-18 cutover) an
+// all-stores answer is ~5k rows, so ?page= (with optional ?search= on
+// item code/name) returns one sorted page plus the total; without
+// ?page= the full list comes back as before.
 // ------------------------------------------------------------
 router.get('/reports/remaining-stock', async (req, res) => {
     const storeId = req.query.storeId ? parseInt(req.query.storeId) : null;
     const belowReorderOnly = req.query.belowReorderOnly === 'true';
+    const search = String(req.query.search || '').trim();
+    const page = req.query.page ? Math.max(1, parseInt(req.query.page) || 1) : null;
+    const pageSize = Math.min(500, Math.max(1, parseInt(req.query.pageSize) || 50));
 
-    const [balances] = await sequelizeUtf8.query(`
-        SELECT itemId, storeId,
-               SUM(CASE WHEN direction = 'in' THEN qty ELSE -qty END) AS balance
-        FROM matWhStockLedger
-        ${storeId ? 'WHERE storeId = :storeId' : ''}
-        GROUP BY itemId, storeId
+    const where = [];
+    const replacements = {};
+    if (storeId) { where.push('l.storeId = :storeId'); replacements.storeId = storeId; }
+    if (search) {
+        where.push('(i.itemCode LIKE :search OR i.itemName LIKE :search OR i.itemNameAr LIKE :search)');
+        replacements.search = `%${search}%`;
+    }
+    const grouped = `
+        SELECT l.itemId, l.storeId,
+               SUM(CASE WHEN l.direction = 'in' THEN l.qty ELSE -l.qty END) AS balance
+        FROM matWhStockLedger l
+        JOIN matWhItems i ON i.id = l.itemId
+        ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+        GROUP BY l.itemId, l.storeId
         HAVING balance != 0
-    `, { replacements: storeId ? { storeId } : {} });
+        ${belowReorderOnly ? 'AND MAX(i.reorderQty) IS NOT NULL AND balance < MAX(i.reorderQty)' : ''}
+    `;
+
+    let total = null;
+    let balances;
+    if (page) {
+        const [[countRow]] = await sequelizeUtf8.query(`SELECT COUNT(*) AS n FROM (${grouped}) g`, { replacements });
+        total = Number(countRow.n);
+        [balances] = await sequelizeUtf8.query(`
+            SELECT g.* FROM (${grouped}) g
+            JOIN matWhItems i ON i.id = g.itemId
+            ORDER BY i.itemCode, g.storeId
+            LIMIT :limit OFFSET :offset
+        `, { replacements: { ...replacements, limit: pageSize, offset: (page - 1) * pageSize } });
+    } else {
+        [balances] = await sequelizeUtf8.query(grouped, { replacements });
+    }
 
     const itemIds = [...new Set(balances.map((b) => b.itemId))];
-    const items = await MatWhItem.findAll({ where: { id: itemIds } });
+    const items = itemIds.length ? await MatWhItem.findAll({ where: { id: itemIds } }) : [];
     const itemById = new Map(items.map((i) => [i.id, i]));
 
-    const costRows = await MatWhItemCost.findAll({ where: { itemId: itemIds } });
+    const costRows = itemIds.length ? await MatWhItemCost.findAll({ where: { itemId: itemIds } }) : [];
     const costByKey = new Map(costRows.map((c) => [`${c.itemId}:${c.storeId}`, c]));
 
-    let rows = balances.map((b) => {
+    const rows = balances.map((b) => {
         const item = itemById.get(b.itemId);
         const cost = costByKey.get(`${b.itemId}:${b.storeId}`);
         return {
             itemId: b.itemId, storeId: b.storeId,
-            itemCode: item?.itemCode, itemName: item?.itemName,
+            itemCode: item?.itemCode, itemName: item?.itemName, itemNameAr: item?.itemNameAr ?? null,
             balance: Number(b.balance),
             currentCost: cost?.currentCost ?? null,
             reorderQty: item?.reorderQty ?? null,
@@ -87,7 +117,7 @@ router.get('/reports/remaining-stock', async (req, res) => {
         };
     });
 
-    if (belowReorderOnly) rows = rows.filter((r) => r.belowReorderPoint);
+    if (page) return res.json({ items: rows, total, page, pageSize });
     res.json({ items: rows });
 });
 
