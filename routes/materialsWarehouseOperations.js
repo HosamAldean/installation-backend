@@ -31,7 +31,7 @@ import {
     confirmReservation, rejectReservation,
     confirmReservationLine, rejectReservationLine,
     issueReservationLine, computeHeaderStatus,
-    createWithGeneratedNo, requireVariantBarcode, splitOffRemainder,
+    createWithGeneratedNo, requireVariantBarcode, splitOffRemainder, reserveCoatedReturn,
 } from '../services/matWhReservations.js';
 
 const router = express.Router();
@@ -1314,6 +1314,9 @@ router.post('/external-processing/:id/receive', requireReceive, async (req, res)
                 performedBy: req.user.userId, color: row.targetColor ?? null, lengthMm: row.lengthMm ?? null,
             }, t);
         }
+        // The coated bars go straight onto the reservation line that
+        // raised this job (see reserveCoatedReturn).
+        await reserveCoatedReturn(locked, qtyReceived, t);
         await t.commit();
         await row.reload();
     } catch (err) {
