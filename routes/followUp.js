@@ -1,6 +1,6 @@
 ﻿//backend/routes/followUp.js
 import express from "express";
-import { sequelize, sequelize2, sequelizeUtf8, withSqlRetry } from "../config/db.js";
+import { sequelize, sequelize2, sequelize3, sequelizeUtf8, withSqlRetry } from "../config/db.js";
 import { QueryTypes } from "sequelize";
 import { authenticateToken } from "../middleware/auth.js";
 import { requirePermission } from "../middleware/permissions.js";
@@ -949,21 +949,142 @@ router.get('/team/history/:teamId', authenticateToken, requirePermission(PERMISS
         // limit param optional
         const limit = Math.min(parseInt(req.query.limit || '200', 10), 500);
 
+        // Latest `limit` pings, returned oldest-first for drawing (was
+        // ORDER BY ASC LIMIT, i.e. the team's oldest pings ever).
         const history = await sequelize2.query(
             `
       SELECT id, team_id, latitude, longitude, ping_time
       FROM IIT_Petra.instTeamLocations
       WHERE team_id = :teamId
-      ORDER BY ping_time ASC
+      ORDER BY ping_time DESC, id DESC
       LIMIT :limit
       `,
             { replacements: { teamId, limit }, type: QueryTypes.SELECT }
         );
 
-        res.json({ success: true, data: history });
+        res.json({ success: true, data: history.reverse() });
     } catch (err) {
         console.error('❌ TEAM HISTORY ERROR:', err);
         res.status(500).json({ success: false, message: 'Failed to fetch team history' });
+    }
+});
+
+// ------------------------ GET Team Day Movement ------------------------
+// One team's whole day for the live map's team panel: GPS path, check-in/
+// out checkpoints (with project), materials the team's members confirmed,
+// and a summary. ?date=YYYY-MM-DD is a Jordan calendar day (UTC+3, no DST
+// since 2022); pings/checkpoints are stored in UTC, so the day is turned
+// into a UTC range here. Defaults to today.
+const JORDAN_UTC_OFFSET_HOURS = 3;
+const MAX_DAY_PATH_POINTS = 1500;
+
+function jordanDayRange(dateStr) {
+    let y, m, d;
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateStr || '');
+    if (match) {
+        [y, m, d] = [Number(match[1]), Number(match[2]), Number(match[3])];
+    } else {
+        const now = new Date(Date.now() + JORDAN_UTC_OFFSET_HOURS * 3600_000);
+        [y, m, d] = [now.getUTCFullYear(), now.getUTCMonth() + 1, now.getUTCDate()];
+    }
+    const start = new Date(Date.UTC(y, m - 1, d) - JORDAN_UTC_OFFSET_HOURS * 3600_000);
+    const end = new Date(start.getTime() + 24 * 3600_000);
+    const date = `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+    return { date, start, end };
+}
+
+function haversineKm(a, b) {
+    const R = 6371;
+    const toRad = (v) => (v * Math.PI) / 180;
+    const dLat = toRad(b.latitude - a.latitude);
+    const dLng = toRad(b.longitude - a.longitude);
+    const h = Math.sin(dLat / 2) ** 2
+        + Math.cos(toRad(a.latitude)) * Math.cos(toRad(b.latitude)) * Math.sin(dLng / 2) ** 2;
+    return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+router.get('/team/day/:teamId', authenticateToken, requirePermission(PERMISSIONS.INSTALLATION_REPORTS), async (req, res) => {
+    try {
+        const teamId = parseInt(req.params.teamId, 10);
+        if (!teamId) return res.status(400).json({ success: false, message: 'teamId required' });
+        const { date, start, end } = jordanDayRange(req.query.date);
+
+        // Same supervisor scoping as /team/locations.
+        const isScoped = req.user.role === 'installation_supervisor';
+        const [team] = await sequelize2.query(
+            `SELECT id, name, supervisor_emp_no FROM IIT_Petra.instTeams WHERE id = :teamId`,
+            { replacements: { teamId }, type: QueryTypes.SELECT }
+        );
+        if (!team) return res.status(404).json({ success: false, message: 'Team not found' });
+        if (isScoped && parseInt(team.supervisor_emp_no) !== parseInt(req.user.assignedEmpNo)) {
+            return res.status(403).json({ success: false, message: 'Not your team' });
+        }
+
+        const pings = await sequelize2.query(
+            `SELECT latitude, longitude, ping_time
+             FROM IIT_Petra.instTeamLocations
+             WHERE team_id = :teamId AND ping_time >= :start AND ping_time < :end
+             ORDER BY ping_time ASC, id ASC`,
+            { replacements: { teamId, start, end }, type: QueryTypes.SELECT }
+        );
+
+        const checkpointsRaw = await sequelize3.query(
+            `SELECT c.id, c.checkpoint_type AS type, c.notes AS note, c.latitude, c.longitude, c.createdAt AS time,
+                    j.projectNo, j.projectName
+             FROM IIT_Petra.instTeamCheckpoints c
+             LEFT JOIN IIT_Petra.instOrders o ON o.Id = c.order_id
+             LEFT JOIN IIT_Petra.instReqMaster m ON m.instReqMasterId = o.instReqMasterId
+             LEFT JOIN IIT_Petra.project j ON j.projectId = m.projectId
+             WHERE c.team_id = :teamId AND c.createdAt >= :start AND c.createdAt < :end
+             ORDER BY c.createdAt ASC`,
+            { replacements: { teamId, start, end }, type: QueryTypes.SELECT }
+        );
+        const checkpoints = checkpointsRaw.map((c) => ({ ...c, projectName: fixArabic(c.projectName) }));
+
+        const members = await sequelize2.query(
+            `SELECT DISTINCT emp_no FROM IIT_Petra.instTeamMembers WHERE team_id = :teamId`,
+            { replacements: { teamId }, type: QueryTypes.SELECT }
+        );
+        const memberEmpNos = members.map((m) => String(m.emp_no)).filter(Boolean);
+        const [work] = memberEmpNos.length
+            ? await sequelizeUtf8.query(
+                `SELECT SUM(status = 'Installed') AS installed, SUM(status = 'Issue') AS issues
+                 FROM InstOrderComponents
+                 WHERE confirmedByEmpNo IN (:memberEmpNos) AND updatedAt >= :start AND updatedAt < :end`,
+                { replacements: { memberEmpNos, start, end }, type: QueryTypes.SELECT }
+            )
+            : [{ installed: 0, issues: 0 }];
+
+        let distanceKm = 0;
+        for (let i = 1; i < pings.length; i++) distanceKm += haversineKm(pings[i - 1], pings[i]);
+
+        // Thin very dense days for drawing (keeps first and last point).
+        const step = Math.ceil(pings.length / MAX_DAY_PATH_POINTS) || 1;
+        const path = pings
+            .filter((_, i) => i % step === 0 || i === pings.length - 1)
+            .map((p) => ({ lat: p.latitude, lng: p.longitude, time: p.ping_time }));
+
+        res.json({
+            success: true,
+            data: {
+                date,
+                team: { id: team.id, name: team.name },
+                path,
+                checkpoints,
+                summary: {
+                    firstSeen: pings[0]?.ping_time || null,
+                    lastSeen: pings[pings.length - 1]?.ping_time || null,
+                    pings: pings.length,
+                    distanceKm: Math.round(distanceKm * 10) / 10,
+                    projectsVisited: new Set(checkpoints.filter((c) => c.type === 'inProject' && c.projectNo).map((c) => c.projectNo)).size,
+                    installed: Number(work?.installed) || 0,
+                    issues: Number(work?.issues) || 0,
+                },
+            },
+        });
+    } catch (err) {
+        console.error('❌ TEAM DAY ERROR:', err);
+        res.status(500).json({ success: false, message: 'Failed to fetch team day' });
     }
 });
 
