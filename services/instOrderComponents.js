@@ -500,6 +500,36 @@ export async function getUnitCompletionStatsBulk(instOrderItemIds) {
     return result;
 }
 
+// Unit stats without the per-material list, for the orders overview
+// (GET /instOrders/assigned-components) -- the full lists for every unit
+// made that response ~6.4MB. Keeps the counts plus the few derived values
+// the page shows without opening a unit: timing rollup and install dates
+// (reports timeline). Full lists come from /assigned-components/materials
+// when an order is opened.
+export function summarizeUnitStats(stats) {
+    const { materials, ...rest } = stats;
+    const latest = (values) => values.filter(Boolean).sort().at(-1) || null;
+    const starts = materials.map((m) => toIso(m.startedAt)).filter(Boolean).sort();
+    return {
+        ...rest,
+        timing: {
+            lastUpdate: latest(materials.map((m) => toIso(m.updatedAt))),
+            earliestStart: starts[0] || null,
+            latestActivity: latest(materials.map((m) => toIso(m.completedAt || m.updatedAt || m.startedAt))),
+            inProgressCount: materials.filter((m) => m.status === 'Pending' && m.startedAt && !m.onHold).length,
+            pausedCount: materials.filter((m) => m.onHold).length,
+        },
+        installedAt: materials.map((m) => toIso(m.completedAt)).filter(Boolean),
+    };
+}
+
+// Dates come back from Sequelize as Date objects; ISO strings sort
+// chronologically, so compare/serialize them as such.
+function toIso(value) {
+    if (!value) return null;
+    return value instanceof Date ? value.toISOString() : String(value);
+}
+
 function buildUnitStats(unit, materials, components, confirmerNames) {
     const componentsByBarcode = new Map(components.map((c) => [String(c.barcode), c]));
 

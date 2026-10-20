@@ -10,6 +10,7 @@ import { sequelize, getSqlPool, sequelize2 } from "./config/db.js";
 import { QueryTypes } from 'sequelize';
 import { notifyOrderUpdate } from './routes/instOrders.js';
 import cookieParser from 'cookie-parser';
+import compression from 'compression';
 import { monitorLog } from './middleware/monitorLog.js';
 import { blockIpMiddleware } from './middleware/ipBlock.js';
 import { startSecurityMonitor } from './services/securityMonitor.js';
@@ -114,6 +115,16 @@ app.use(cors({
     credentials: true,
 }));
 
+// gzip JSON/text responses -- e.g. /instOrders/assigned-components is ~3MB
+// of mostly repeated keys. Skipped for the SSE streams (EventSource sends
+// Accept: text/event-stream): compression buffers output, which would hold
+// back live events.
+app.use(compression({
+    filter: (req, res) => {
+        if (String(req.headers.accept || '').includes('text/event-stream')) return false;
+        return compression.filter(req, res);
+    },
+}));
 
 // ======================
 // Body parsers
