@@ -1058,6 +1058,30 @@ router.get('/team/day/:teamId', authenticateToken, requirePermission(PERMISSIONS
         let distanceKm = 0;
         for (let i = 1; i < pings.length; i++) distanceKm += haversineKm(pings[i - 1], pings[i]);
 
+        // Project visits: each inProject paired with the next outProject
+        // (before any later inProject). An arrival with no departure is
+        // "onSite" when it's today, otherwise a missing check-out.
+        const isToday = date === jordanDayRange().date;
+        const visits = [];
+        let open = null;
+        // Still on site today: minutes so far.
+        const closeVisit = (leftAt) => {
+            const until = leftAt ? new Date(leftAt) : (isToday ? new Date() : null);
+            const minutes = until ? Math.max(0, Math.round((until - new Date(open.arrivedAt)) / 60_000)) : null;
+            visits.push({ ...open, leftAt, minutes, status: leftAt ? 'done' : (isToday ? 'onSite' : 'noDeparture') });
+            open = null;
+        };
+        for (const c of checkpoints) {
+            if (c.type === 'inProject') {
+                if (open) closeVisit(null);
+                open = { projectNo: c.projectNo, projectName: c.projectName, arrivedAt: c.time };
+            } else if (c.type === 'outProject' && open) {
+                closeVisit(c.time);
+            }
+        }
+        if (open) closeVisit(null);
+        const minutesOnSite = visits.reduce((sum, v) => sum + (v.minutes || 0), 0);
+
         // Thin very dense days for drawing (keeps first and last point).
         const step = Math.ceil(pings.length / MAX_DAY_PATH_POINTS) || 1;
         const path = pings
@@ -1071,7 +1095,9 @@ router.get('/team/day/:teamId', authenticateToken, requirePermission(PERMISSIONS
                 team: { id: team.id, name: team.name },
                 path,
                 checkpoints,
+                visits,
                 summary: {
+                    minutesOnSite,
                     firstSeen: pings[0]?.ping_time || null,
                     lastSeen: pings[pings.length - 1]?.ping_time || null,
                     pings: pings.length,
