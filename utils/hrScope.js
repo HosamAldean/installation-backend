@@ -102,28 +102,69 @@ export async function getHrReviewerUserIds(requesterEmpNo) {
 // Work_place 6000 (Industrial Complex) -- not a job code, as requested.
 export const FACTORY_MANAGER_EMP_NO = 100254;
 
-// Active InsUser accounts for the factory manager -- who decides and who
-// gets notified at this stage.
-export async function getFactoryManagerUserIds() {
-    const users = await User.findAll({
-        where: { assignedEmpNo: FACTORY_MANAGER_EMP_NO, active: true },
-        attributes: ["userId"],
-    });
-    return users.map((u) => u.userId);
+// Second-approval stage for Ittihad installation (per explicit direction
+// 2026-10-20): any manager approval made by someone in Work_place 1364
+// ("مشرف أعمال التركيب", installation works supervisor -- today 978) also
+// needs employee 554's approval. Keyed on who gave the FIRST approval,
+// not the requester's own work place, so it covers everyone that
+// supervisor approves for (incl. 975 in Work_place 1354). Shares the
+// pending_factory_mgr status/columns with the factory-manager stage; which
+// of the two approvers a pending request waits on is derived by
+// secondStageApproverFor below.
+export const SECOND_APPROVAL_SOURCE_WORK_PLACES = [1364];
+export const INSTALLATION_SECOND_APPROVER_EMP_NO = 554;
+const SECOND_APPROVER_EMP_NOS = [FACTORY_MANAGER_EMP_NO, INSTALLATION_SECOND_APPROVER_EMP_NO];
+
+// Active employees whose approval triggers the 554 stage.
+export async function getSecondApprovalSourceEmpNos() {
+    return empNosForWhere(`Work_place IN (${SECOND_APPROVAL_SOURCE_WORK_PLACES.join(",")})`);
 }
 
-// Whether a request just approved by its manager (managerApproverEmpNo --
-// null when admin/hr_manager fallback decided) still needs the factory
-// manager. Skipped when he already approved it as the direct manager, for
-// his own requests, and when he has no active account (otherwise the
+async function hasActiveAccount(empNo) {
+    return (await User.count({ where: { assignedEmpNo: empNo, active: true } })) > 0;
+}
+
+// Which employee must give the second approval for a request that its
+// manager (managerApproverEmpNo -- null when admin/hr_manager fallback
+// decided) just approved, or null when no second stage applies. Skipped
+// when that person already approved it as the direct manager, for their
+// own requests, and when they have no active account (otherwise the
 // request would wait on nobody).
-export async function needsFactoryManagerStep(requesterEmpNo, managerApproverEmpNo) {
+export async function getSecondApproverEmpNo(requesterEmpNo, managerApproverEmpNo) {
     const requester = parseInt(requesterEmpNo);
-    if (!requester || requester === FACTORY_MANAGER_EMP_NO) return false;
-    if (parseInt(managerApproverEmpNo) === FACTORY_MANAGER_EMP_NO) return false;
-    if (String(requester).startsWith("300")) return false;
-    if (!(await isInHrScope("hr_factory", requester))) return false;
-    return (await getFactoryManagerUserIds()).length > 0;
+    const managerApprover = parseInt(managerApproverEmpNo);
+    if (!requester) return null;
+
+    if (managerApprover && (await getSecondApprovalSourceEmpNos()).includes(managerApprover)) {
+        const approver = INSTALLATION_SECOND_APPROVER_EMP_NO;
+        if (requester === approver || managerApprover === approver) return null;
+        return (await hasActiveAccount(approver)) ? approver : null;
+    }
+
+    if (requester === FACTORY_MANAGER_EMP_NO) return null;
+    if (managerApprover === FACTORY_MANAGER_EMP_NO) return null;
+    if (String(requester).startsWith("300")) return null;
+    if (!(await isInHrScope("hr_factory", requester))) return null;
+    return (await hasActiveAccount(FACTORY_MANAGER_EMP_NO)) ? FACTORY_MANAGER_EMP_NO : null;
+}
+
+// For a request already at pending_factory_mgr: who it's waiting on.
+// Derived from who gave the first approval, so no extra column is needed
+// (and requests already pending for the factory manager stay his).
+export function secondStageApproverFor(request, sourceEmpNos) {
+    return sourceEmpNos.includes(parseInt(request.managerApproverEmpNo))
+        ? INSTALLATION_SECOND_APPROVER_EMP_NO
+        : FACTORY_MANAGER_EMP_NO;
+}
+
+export function isSecondApproverEmpNo(empNo) {
+    return SECOND_APPROVER_EMP_NOS.includes(parseInt(empNo));
+}
+
+// Active InsUser accounts for one second-stage approver.
+export async function getUserIdsForEmpNo(empNo) {
+    const users = await User.findAll({ where: { assignedEmpNo: empNo, active: true }, attributes: ["userId"] });
+    return users.map((u) => u.userId);
 }
 
 // Which InsUser accounts to notify when a transport request reaches

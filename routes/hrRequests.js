@@ -31,7 +31,7 @@ import {
     HrVisitReportRow,
 } from "../models/index.js";
 import { isSupervisorOf, getSupervisedEmpNos, hasRealSupervisor, getEmpNosWithoutRealSupervisor, getSupervisorUserId, getFallbackManagerUserIds, isGeneralManager } from "../utils/supervisorLookup.js";
-import { isHrScopedRole, getHrQueueEmpNos, isInHrQueueScope, getHrReviewerUserIds, getFinanceReviewerUserIds, getGmReviewerUserIds, getFactoryManagerUserIds, needsFactoryManagerStep, FACTORY_MANAGER_EMP_NO, isEligibleForVisitReport } from "../utils/hrScope.js";
+import { isHrScopedRole, getHrQueueEmpNos, isInHrQueueScope, getHrReviewerUserIds, getFinanceReviewerUserIds, getGmReviewerUserIds, getSecondApproverEmpNo, getSecondApprovalSourceEmpNos, secondStageApproverFor, isSecondApproverEmpNo, getUserIdsForEmpNo, INSTALLATION_SECOND_APPROVER_EMP_NO, isEligibleForVisitReport } from "../utils/hrScope.js";
 import { resolveEmployeeNames, resolveVacationBalances } from "../utils/employeeLookup.js";
 import { resolveUserNames } from "../utils/userLookup.js";
 import { resolveProjectLabels, withProjectDisplay } from "../utils/projectLookup.js";
@@ -103,21 +103,23 @@ async function notifyGmReviewers({ title, body }) {
     }
 }
 
-// A manager just moved this request to pending_factory_mgr -- tell the
-// requester where it stands and the factory manager that it's his turn.
+// A manager just moved this request to pending_factory_mgr (the second-
+// approval stage) -- tell the requester where it stands and the second
+// approver (see secondStageApproverFor) that it's their turn.
 async function notifyAwaitingFactoryManager(request, { title, noun }) {
     sendPushToUser(request.requesterUserId, {
         title,
-        body: `Your manager approved your ${noun} — now awaiting the factory manager.`,
+        body: `Your manager approved your ${noun} — now awaiting second approval.`,
     });
     try {
-        const ids = await getFactoryManagerUserIds();
+        const approver = secondStageApproverFor(request, await getSecondApprovalSourceEmpNos());
+        const ids = await getUserIdsForEmpNo(approver);
         ids.forEach((id) => sendPushToUser(id, {
-            title: `${noun.charAt(0).toUpperCase() + noun.slice(1)} awaiting factory manager approval`,
+            title: `${noun.charAt(0).toUpperCase() + noun.slice(1)} awaiting your second approval`,
             body: `A manager-approved ${noun} needs your review.`,
         }));
     } catch (err) {
-        console.error("❌ Failed to notify factory manager:", err);
+        console.error("❌ Failed to notify second approver:", err);
     }
 }
 
@@ -159,12 +161,29 @@ async function isAuthorizedManagerDecision(req, requesterEmpNo) {
     return false;
 }
 
-// The factory-manager stage (pending_factory_mgr, see
-// needsFactoryManagerStep in utils/hrScope.js) -- decided by employee
-// FACTORY_MANAGER_EMP_NO himself, or admin.
+// The second-approval stage (pending_factory_mgr, see
+// getSecondApproverEmpNo in utils/hrScope.js) -- decided by one of the
+// fixed second approvers (factory manager 100254, or 554 for approvals
+// from Work_place 1364), or admin.
 function isFactoryManagerCaller(req) {
     if (req.user.role === "admin") return true;
-    return parseInt(req.user.assignedEmpNo) === FACTORY_MANAGER_EMP_NO;
+    return isSecondApproverEmpNo(req.user.assignedEmpNo);
+}
+
+// Which pending_factory_mgr / factoryMgr* rows belong to this caller:
+// {} for admin (everything), null when the caller isn't a second approver.
+// 554 gets the requests first-approved by Work_place 1364 staff; the
+// factory manager gets the rest (including admin-fallback approvals,
+// managerApproverEmpNo NULL), same as before this split.
+async function secondStageWhereForCaller(req) {
+    if (req.user.role === "admin") return {};
+    if (!isSecondApproverEmpNo(req.user.assignedEmpNo)) return null;
+    const sources = await getSecondApprovalSourceEmpNos();
+    if (parseInt(req.user.assignedEmpNo) === INSTALLATION_SECOND_APPROVER_EMP_NO) {
+        return { managerApproverEmpNo: sources.length ? sources : [-1] };
+    }
+    if (!sources.length) return {};
+    return { [Op.or]: [{ managerApproverEmpNo: null }, { managerApproverEmpNo: { [Op.notIn]: sources } }] };
 }
 
 // Shared by all 4 .../manager-decision endpoints. Covers both
@@ -177,8 +196,9 @@ function isFactoryManagerCaller(req) {
 async function applyManagerStageDecision(req, res, request, decision, note, nextStatus) {
     const callerEmpNo = req.user.assignedEmpNo ? parseInt(req.user.assignedEmpNo) : null;
     if (request.status === "pending_factory_mgr") {
-        if (!isFactoryManagerCaller(req)) {
-            res.status(403).json({ success: false, message: "Only the factory manager can act on this stage" });
+        const approver = secondStageApproverFor(request, await getSecondApprovalSourceEmpNos());
+        if (req.user.role !== "admin" && callerEmpNo !== approver) {
+            res.status(403).json({ success: false, message: "Only the second approver can act on this stage" });
             return null;
         }
         await request.update({
@@ -200,7 +220,7 @@ async function applyManagerStageDecision(req, res, request, decision, note, next
     }
     let status = "rejected";
     if (decision === "approved") {
-        status = (await needsFactoryManagerStep(request.requesterEmpNo, callerEmpNo)) ? "pending_factory_mgr" : nextStatus;
+        status = (await getSecondApproverEmpNo(request.requesterEmpNo, callerEmpNo)) ? "pending_factory_mgr" : nextStatus;
     }
     await request.update({
         managerApproverEmpNo: callerEmpNo,
@@ -552,7 +572,7 @@ router.put("/leave-requests/:id/manager-decision", authenticateToken, async (req
             notifyAwaitingFactoryManager(request, { title: "Leave request update", noun: "leave request" });
             return res.json({ success: true });
         }
-        const by = stage === "factory_mgr" ? "The factory manager" : "Your manager";
+        const by = stage === "factory_mgr" ? "The second approver" : "Your manager";
         sendPushToUser(request.requesterUserId, {
             title: "Leave request update",
             body: decision === "approved" ? `${by} approved your leave request — now awaiting HR.` : `${by} rejected your leave request.`,
@@ -649,7 +669,7 @@ router.put("/attendance-corrections/:id/manager-decision", authenticateToken, as
             notifyAwaitingFactoryManager(request, { title: "Attendance correction update", noun: "attendance correction" });
             return res.json({ success: true });
         }
-        const by = stage === "factory_mgr" ? "The factory manager" : "Your manager";
+        const by = stage === "factory_mgr" ? "The second approver" : "Your manager";
         sendPushToUser(request.requesterUserId, {
             title: "Attendance correction update",
             body: decision === "approved" ? `${by} approved your attendance correction — now awaiting HR.` : `${by} rejected your attendance correction.`,
@@ -792,7 +812,7 @@ router.put("/transport-requests/:id/manager-decision", authenticateToken, async 
             notifyAwaitingFactoryManager(request, { title: "Transportation request update", noun: "transportation request" });
             return res.json({ success: true });
         }
-        const by = stage === "factory_mgr" ? "The factory manager" : "Your manager";
+        const by = stage === "factory_mgr" ? "The second approver" : "Your manager";
         sendPushToUser(request.requesterUserId, {
             title: "Transportation request update",
             body: decision === "approved" ? `${by} approved your transportation request — now awaiting HR audit.` : `${by} rejected your transportation request.`,
@@ -979,7 +999,7 @@ router.put("/overtime-requests/:id/manager-decision", authenticateToken, async (
             notifyAwaitingFactoryManager(request, { title: "Overtime request update", noun: "overtime request" });
             return res.json({ success: true });
         }
-        const by = stage === "factory_mgr" ? "The factory manager" : "Your manager";
+        const by = stage === "factory_mgr" ? "The second approver" : "Your manager";
         sendPushToUser(request.requesterUserId, {
             title: "Overtime request update",
             body: decision === "approved" ? `${by} approved your overtime request — now awaiting GM approval.` : `${by} rejected your overtime request.`,
@@ -1215,7 +1235,7 @@ router.put("/visit-reports/:id/manager-decision", authenticateToken, async (req,
             notifyAwaitingFactoryManager(request, { title: "Daily visits report update", noun: "daily visits report" });
             return res.json({ success: true });
         }
-        const by = stage === "factory_mgr" ? "The factory manager" : "Your manager";
+        const by = stage === "factory_mgr" ? "The second approver" : "Your manager";
         sendPushToUser(request.requesterUserId, {
             title: "Daily visits report update",
             body: decision === "approved" ? `${by} approved your daily visits report — now awaiting HR audit.` : `${by} rejected your daily visits report.`,
@@ -1704,9 +1724,9 @@ router.get("/manager-approvals", authenticateToken, async (req, res) => {
             ? { status: "pending_manager", requesterEmpNo: supervisedEmpNos }
             : { status: "pending_manager" };
 
-        // pending_factory_mgr isn't Supervisor_No-scoped either -- the
-        // factory manager sees every request waiting at his stage.
-        const fmWhere = { status: "pending_factory_mgr" };
+        // pending_factory_mgr isn't Supervisor_No-scoped either -- each second
+        // approver sees what waits on them (see secondStageWhereForCaller).
+        const fmWhere = { ...(await secondStageWhereForCaller(req)), status: "pending_factory_mgr" };
         const [leaveMgr, attendanceMgr, transportMgr, overtimeMgr, leaveFm, attendanceFm, transportFm, overtimeFm, overtimeGm, visitsMgr, visitsFm] = await Promise.all([
             skipManagerStage ? [] : HrLeaveRequest.findAll({ where, order: [["createdAt", "ASC"]] }),
             skipManagerStage ? [] : HrAttendanceCorrectionRequest.findAll({ where, order: [["createdAt", "ASC"]], include: [{ model: HrAttendanceCorrectionRow, as: "rows" }] }),
@@ -1794,7 +1814,7 @@ router.get("/manager-approvals-history", authenticateToken, async (req, res) => 
             ? { managerDecidedAt: { [Op.ne]: null }, requesterEmpNo: supervisedEmpNos }
             : { managerDecidedAt: { [Op.ne]: null } };
 
-        const fmWhere = { factoryMgrDecidedAt: { [Op.ne]: null } };
+        const fmWhere = { ...(await secondStageWhereForCaller(req)), factoryMgrDecidedAt: { [Op.ne]: null } };
         const fmOrder = [["factoryMgrDecidedAt", "DESC"]];
         // Visit reports only when the client asks (?include=visit) --
         // this is one mixed list, and an app version that doesn't know the
@@ -1809,7 +1829,7 @@ router.get("/manager-approvals-history", authenticateToken, async (req, res) => 
             // this is every overtime request the GM has ever decided on,
             // gated purely on whether the caller IS the GM.
             isGm ? HrOvertimeRequest.findAll({ where: { gmDecidedAt: { [Op.ne]: null } }, order: [["gmDecidedAt", "DESC"]] }) : [],
-            // Every request the factory manager has decided at his own
+            // Every request this second approver has decided at their own
             // stage -- not Supervisor_No-scoped, same as the GM bucket.
             isFactoryMgr ? HrLeaveRequest.findAll({ where: fmWhere, order: fmOrder }) : [],
             isFactoryMgr ? HrAttendanceCorrectionRequest.findAll({ where: fmWhere, order: fmOrder, include: [{ model: HrAttendanceCorrectionRow, as: "rows" }] }) : [],
