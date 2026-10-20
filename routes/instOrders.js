@@ -10,8 +10,7 @@ import { InstTeamVacation } from '../models/InstTeamVacation.js';
 import { InstOrderScheduleDay } from '../models/InstOrderScheduleDay.js';
 import { ProjectMapCache } from '../models/ProjectMapCache.js';
 import { User } from '../models/User.js';
-import { recordComponentAction, getUnitCompletionStats, markUnitComplete } from '../services/instOrderComponents.js';
-import { mapWithConcurrencyLimit } from '../utils/concurrency.js';
+import { recordComponentAction, getUnitCompletionStatsBulk, markUnitComplete } from '../services/instOrderComponents.js';
 import { isShortMapLink, extractCoords, extractPlaceName, resolveShortMapLink } from '../services/resolveMapLink.js';
 import { reverseGeocodeArea } from '../services/reverseGeocode.js';
 import { toDateOnlyString } from '../utils/dateOnly.js';
@@ -1522,21 +1521,10 @@ router.get('/assigned-components', async (req, res) => {
             projectName: fixArabic(r.projectName),
         }));
 
-        // One Stock lookup per unit -- getUnitCompletionStats re-resolves the
-        // unit's project/UNO itself (already have it in `row` above, but
-        // reusing the shared function keeps this in sync with the mobile
-        // scan-task endpoint's identical stats rather than two slightly-
-        // different implementations). Throttled to a fixed number in flight
-        // at once -- a bare Promise.all here fired one SQL Server + one
-        // MySQL request per item (2000+ concurrently once real data piled
-        // up), blowing well past the mssql pool's default max of 10 and
-        // 500ing the whole request on the first pool-acquire timeout.
-        const statsEntries = await mapWithConcurrencyLimit(
-            items,
-            8,
-            async (row) => [row.instOrderItemId, await getUnitCompletionStats(row.instOrderItemId)],
-        );
-        const statsByItem = new Map(statsEntries);
+        // All units' stats in a handful of batched queries (see
+        // getUnitCompletionStatsBulk) -- the per-unit version cost 3-4 DB
+        // round trips per unit, 30s+ for ~5400 units.
+        const statsByItem = await getUnitCompletionStatsBulk(items.map((row) => row.instOrderItemId));
 
         const orders = {};
         items.forEach(row => {

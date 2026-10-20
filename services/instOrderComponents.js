@@ -424,8 +424,84 @@ export async function getUnitCompletionStats(instOrderItemId) {
     const materials = unit ? await fetchAllocatedMaterials(unit) : [];
 
     const components = await InstOrderComponent.findAll({ where: { instOrderItemId }, raw: true });
-    const componentsByBarcode = new Map(components.map((c) => [String(c.barcode), c]));
     const confirmerNames = await resolveConfirmerNames(components.map((c) => c.confirmedByUserId));
+    return buildUnitStats(unit, materials, components, confirmerNames);
+}
+
+// Same result as getUnitCompletionStats for many units at once, for GET
+// /instOrders/assigned-components. Calling the single-unit version per unit
+// meant 3-4 MySQL round trips per unit plus a regex-normalized scan of the
+// project's whole Stock list per unit -- with ~5400 units that took 30s+
+// even idle, and overlapping page loads exhausted the DB pools (500s).
+// Here: one units query, one Stock query per distinct project (indexed by
+// normalized unit/barcode once), one components query, one users query.
+export async function getUnitCompletionStatsBulk(instOrderItemIds) {
+    const ids = [...new Set(instOrderItemIds)];
+    const result = new Map();
+    if (!ids.length) return result;
+
+    const units = await sequelize.query(`
+        SELECT iod.id AS instOrderItemId, j.projectNo, COALESCE(m.unitIdDetail, iod.unitNo) AS unitNo, iod.itemName, iod.status AS taskStatus, iod.sourceBarcode, iod.taskCompletedAt
+        FROM IIT_Petra.instOrderItems iod
+        JOIN IIT_Petra.instReqDet d ON d.instReqDetId = iod.instReqDetId
+        JOIN IIT_Petra.instReqMaster rm ON rm.instReqMasterId = d.instReqMasterId
+        JOIN IIT_Petra.project j ON j.projectId = rm.projectId
+        LEFT JOIN IIT_Petra.masterControl m ON m.rowId = iod.rowId
+        WHERE iod.id IN (:ids)
+    `, { replacements: { ids }, type: QueryTypes.SELECT });
+    const unitById = new Map();
+    units.forEach((u) => { if (!unitById.has(u.instOrderItemId)) unitById.set(u.instOrderItemId, u); });
+
+    // Per project: Stock rows keyed by normalized UNO and by barcode, built
+    // once, so each unit's lookup is O(1) instead of a full project scan.
+    const projects = [...new Set(units.map((u) => normalizeProjectNo(u.projectNo)).filter(Boolean))];
+    const stockIndex = new Map(); // project -> { byUnit, byBarcode }
+    for (const wantProject of projects) {
+        const rows = await fetchProjectStockRows(wantProject);
+        const byUnit = new Map();
+        const byBarcode = new Map();
+        for (const r of rows) {
+            if (normalizeProjectNo(r.projNo) !== wantProject) continue;
+            const key = normalizeUnitNo(r.UNO);
+            if (key) {
+                if (!byUnit.has(key)) byUnit.set(key, []);
+                byUnit.get(key).push(r);
+            }
+            const bc = String(r.barcode);
+            if (!byBarcode.has(bc)) byBarcode.set(bc, []);
+            byBarcode.get(bc).push(r);
+        }
+        stockIndex.set(wantProject, { byUnit, byBarcode });
+    }
+
+    const materialsFor = (unit) => {
+        if (!unit?.projectNo || !unit?.unitNo) return [];
+        const idx = stockIndex.get(normalizeProjectNo(unit.projectNo));
+        if (!idx) return [];
+        if (unit.unitNo === UNASSIGNED_UNIT_NO) {
+            return unit.sourceBarcode ? idx.byBarcode.get(String(unit.sourceBarcode)) || [] : [];
+        }
+        const wantUnit = normalizeUnitNo(unit.unitNo);
+        return wantUnit ? idx.byUnit.get(wantUnit) || [] : [];
+    };
+
+    const allComponents = await InstOrderComponent.findAll({ where: { instOrderItemId: ids }, raw: true });
+    const componentsByItem = new Map();
+    allComponents.forEach((c) => {
+        if (!componentsByItem.has(c.instOrderItemId)) componentsByItem.set(c.instOrderItemId, []);
+        componentsByItem.get(c.instOrderItemId).push(c);
+    });
+    const confirmerNames = await resolveConfirmerNames(allComponents.map((c) => c.confirmedByUserId));
+
+    for (const id of ids) {
+        const unit = unitById.get(id) || null;
+        result.set(id, buildUnitStats(unit, unit ? materialsFor(unit) : [], componentsByItem.get(id) || [], confirmerNames));
+    }
+    return result;
+}
+
+function buildUnitStats(unit, materials, components, confirmerNames) {
+    const componentsByBarcode = new Map(components.map((c) => [String(c.barcode), c]));
 
     // A component confirmed/flagged in the past can end up with a barcode
     // that no longer appears in Stock's current allocation for this unit
