@@ -1007,6 +1007,49 @@ function haversineKm(a, b) {
     return 2 * R * Math.asin(Math.sqrt(h));
 }
 
+// Road distance/route through a day's GPS points via the self-hosted OSRM
+// (WSL on this server, Jordan car profile -- see C:\osrm\install-osrm.ps1).
+// Points closer than ROAD_MIN_STEP_KM to the previous kept point are
+// dropped so GPS drift while parked adds nothing. Returns null when OSRM is
+// unreachable/fails, and the caller falls back to straight-line distance.
+const OSRM_URL = process.env.OSRM_URL || 'http://localhost:5000';
+const ROAD_MIN_STEP_KM = 0.05;
+const OSRM_MAX_WAYPOINTS = 100;
+const OSRM_TIMEOUT_MS = 8000;
+// Past days never change, so their road result is kept in memory.
+const roadRouteCache = new Map(); // `${teamId}|${date}` -> result
+const ROAD_CACHE_MAX = 500;
+
+async function roadRouteThrough(pings) {
+    const kept = [];
+    for (const p of pings) {
+        if (!kept.length || haversineKm(kept[kept.length - 1], p) >= ROAD_MIN_STEP_KM) kept.push(p);
+    }
+    if (kept.length < 2) return { distanceKm: 0, path: [] };
+
+    let meters = 0;
+    const path = [];
+    // Chunks overlap by one point so consecutive legs connect.
+    for (let i = 0; i < kept.length - 1; i += OSRM_MAX_WAYPOINTS - 1) {
+        const chunk = kept.slice(i, i + OSRM_MAX_WAYPOINTS);
+        const coords = chunk.map((p) => `${Number(p.longitude).toFixed(6)},${Number(p.latitude).toFixed(6)}`).join(';');
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), OSRM_TIMEOUT_MS);
+        try {
+            const r = await fetch(`${OSRM_URL}/route/v1/driving/${coords}?overview=full&geometries=geojson`, { signal: controller.signal });
+            const body = await r.json();
+            if (body.code !== 'Ok' || !body.routes?.length) return null;
+            meters += body.routes[0].distance;
+            body.routes[0].geometry.coordinates.forEach(([lng, lat]) => path.push([lat, lng]));
+        } catch {
+            return null;
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+    return { distanceKm: Math.round((meters / 1000) * 10) / 10, path };
+}
+
 router.get('/team/day/:teamId', authenticateToken, requirePermission(PERMISSIONS.INSTALLATION_REPORTS), async (req, res) => {
     try {
         const teamId = parseInt(req.params.teamId, 10);
@@ -1059,8 +1102,19 @@ router.get('/team/day/:teamId', authenticateToken, requirePermission(PERMISSIONS
             )
             : [{ installed: 0, issues: 0 }];
 
-        let distanceKm = 0;
-        for (let i = 1; i < pings.length; i++) distanceKm += haversineKm(pings[i - 1], pings[i]);
+        let straightKm = 0;
+        for (let i = 1; i < pings.length; i++) straightKm += haversineKm(pings[i - 1], pings[i]);
+
+        const cacheKey = `${teamId}|${date}`;
+        const isPastDay = date < jordanDayRange().date;
+        let road = isPastDay ? roadRouteCache.get(cacheKey) : undefined;
+        if (road === undefined) {
+            road = await roadRouteThrough(pings);
+            if (road && isPastDay) {
+                if (roadRouteCache.size >= ROAD_CACHE_MAX) roadRouteCache.delete(roadRouteCache.keys().next().value);
+                roadRouteCache.set(cacheKey, road);
+            }
+        }
 
         // Project visits: each inProject paired with the next outProject
         // (before any later inProject). An arrival with no departure is
@@ -1098,6 +1152,8 @@ router.get('/team/day/:teamId', authenticateToken, requirePermission(PERMISSIONS
                 date,
                 team: { id: team.id, name: team.name },
                 path,
+                // Road-following line ([lat, lng]) when OSRM answered.
+                roadPath: road ? road.path : null,
                 checkpoints,
                 visits,
                 summary: {
@@ -1105,7 +1161,11 @@ router.get('/team/day/:teamId', authenticateToken, requirePermission(PERMISSIONS
                     firstSeen: pings[0]?.ping_time || null,
                     lastSeen: pings[pings.length - 1]?.ping_time || null,
                     pings: pings.length,
-                    distanceKm: Math.round(distanceKm * 10) / 10,
+                    // Road distance when OSRM answered, else straight-line
+                    // (distanceSource tells the UI which).
+                    distanceKm: road ? road.distanceKm : Math.round(straightKm * 10) / 10,
+                    distanceSource: road ? 'road' : 'straight',
+                    straightDistanceKm: Math.round(straightKm * 10) / 10,
                     projectsVisited: new Set(checkpoints.filter((c) => c.type === 'inProject' && c.projectNo).map((c) => c.projectNo)).size,
                     installed: Number(work?.installed) || 0,
                     issues: Number(work?.issues) || 0,
