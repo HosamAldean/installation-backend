@@ -540,7 +540,11 @@ async function assertOwnsItem(reqUser, instOrderItemId) {
 // Upserts a team's live location, silently skipping if teamId doesn't
 // reference a real row in instTeams (e.g. stale teamId on an office/admin
 // account) — inserting would otherwise violate the FK constraint.
-async function upsertTeamLocation(teamId, lat, lng) {
+// ageSeconds: how long before "now" the fix was actually taken (offline-
+// queued pings replayed later -- see POST /location's capturedAt). Stored
+// as UTC_TIMESTAMP() minus that age so it stays on the DB clock like live
+// pings, rather than mixing in the phone's own clock.
+async function upsertTeamLocation(teamId, lat, lng, ageSeconds = 0) {
     if (!teamId || typeof lat !== 'number' || typeof lng !== 'number') return;
     // Reject (0,0) "null island" and other clearly-invalid fixes server-side
     // — this has recurred multiple times from client-side bugs (hardcoded
@@ -563,13 +567,13 @@ async function upsertTeamLocation(teamId, lat, lng) {
         `
         INSERT INTO IIT_Petra.instTeamLocations
         (team_id, latitude, longitude, ping_time)
-        VALUES (:team_id, :lat, :lng, UTC_TIMESTAMP())
+        VALUES (:team_id, :lat, :lng, DATE_SUB(UTC_TIMESTAMP(), INTERVAL :age SECOND))
         ON DUPLICATE KEY UPDATE
             latitude = VALUES(latitude),
             longitude = VALUES(longitude),
-            ping_time = UTC_TIMESTAMP();
+            ping_time = VALUES(ping_time);
         `,
-        { replacements: { team_id: teamId, lat, lng }, type: QueryTypes.INSERT }
+        { replacements: { team_id: teamId, lat, lng, age: ageSeconds }, type: QueryTypes.INSERT }
     );
 }
 
@@ -1058,6 +1062,30 @@ router.get('/team/day/:teamId', authenticateToken, requirePermission(PERMISSIONS
         let distanceKm = 0;
         for (let i = 1; i < pings.length; i++) distanceKm += haversineKm(pings[i - 1], pings[i]);
 
+        // Project visits: each inProject paired with the next outProject
+        // (before any later inProject). An arrival with no departure is
+        // "onSite" when it's today, otherwise a missing check-out.
+        const isToday = date === jordanDayRange().date;
+        const visits = [];
+        let open = null;
+        // Still on site today: minutes so far.
+        const closeVisit = (leftAt) => {
+            const until = leftAt ? new Date(leftAt) : (isToday ? new Date() : null);
+            const minutes = until ? Math.max(0, Math.round((until - new Date(open.arrivedAt)) / 60_000)) : null;
+            visits.push({ ...open, leftAt, minutes, status: leftAt ? 'done' : (isToday ? 'onSite' : 'noDeparture') });
+            open = null;
+        };
+        for (const c of checkpoints) {
+            if (c.type === 'inProject') {
+                if (open) closeVisit(null);
+                open = { projectNo: c.projectNo, projectName: c.projectName, arrivedAt: c.time };
+            } else if (c.type === 'outProject' && open) {
+                closeVisit(c.time);
+            }
+        }
+        if (open) closeVisit(null);
+        const minutesOnSite = visits.reduce((sum, v) => sum + (v.minutes || 0), 0);
+
         // Thin very dense days for drawing (keeps first and last point).
         const step = Math.ceil(pings.length / MAX_DAY_PATH_POINTS) || 1;
         const path = pings
@@ -1071,7 +1099,9 @@ router.get('/team/day/:teamId', authenticateToken, requirePermission(PERMISSIONS
                 team: { id: team.id, name: team.name },
                 path,
                 checkpoints,
+                visits,
                 summary: {
+                    minutesOnSite,
                     firstSeen: pings[0]?.ping_time || null,
                     lastSeen: pings[pings.length - 1]?.ping_time || null,
                     pings: pings.length,
@@ -1973,10 +2003,21 @@ router.post("/location", authenticateToken, async (req, res) => {
             return res.status(400).json({ success: false, code: "NO_TEAM_ASSIGNED", message: "No team assigned to this user" });
         }
 
+        // capturedAt (ms epoch, sent by app 1.0.9+): when the phone took the
+        // fix. Offline-queued pings are replayed together once the network
+        // is back; stamping them all with the arrival time stacked several
+        // positions on one timestamp (duplicate markers, wrong route
+        // timing). Age is clamped to 0..7 days to tolerate a bad phone clock;
+        // older apps send nothing and get the arrival time as before.
+        const capturedAt = Number(req.body.capturedAt);
+        const ageSeconds = Number.isFinite(capturedAt) && capturedAt > 0
+            ? Math.min(Math.max(0, Math.round((Date.now() - capturedAt) / 1000)), 7 * 24 * 3600)
+            : 0;
+
         // upsertTeamLocation silently no-ops if teamId doesn't reference a
         // real instTeams row (e.g. a stale teamId on an office/admin account),
         // avoiding an FK-constraint error for accounts not on a real field team.
-        await upsertTeamLocation(teamId, lat, lng);
+        await upsertTeamLocation(teamId, lat, lng, ageSeconds);
         res.json({ success: true });
     } catch (err) {
         console.error("LOCATION PING ERROR:", err);

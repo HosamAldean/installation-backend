@@ -10,7 +10,7 @@ import { InstTeamVacation } from '../models/InstTeamVacation.js';
 import { InstOrderScheduleDay } from '../models/InstOrderScheduleDay.js';
 import { ProjectMapCache } from '../models/ProjectMapCache.js';
 import { User } from '../models/User.js';
-import { recordComponentAction, getUnitCompletionStatsBulk, markUnitComplete } from '../services/instOrderComponents.js';
+import { recordComponentAction, getUnitCompletionStatsBulk, summarizeUnitStats, markUnitComplete } from '../services/instOrderComponents.js';
 import { isShortMapLink, extractCoords, extractPlaceName, resolveShortMapLink } from '../services/resolveMapLink.js';
 import { reverseGeocodeArea } from '../services/reverseGeocode.js';
 import { toDateOnlyString } from '../utils/dateOnly.js';
@@ -1525,6 +1525,9 @@ router.get('/assigned-components', async (req, res) => {
         // getUnitCompletionStatsBulk) -- the per-unit version cost 3-4 DB
         // round trips per unit, 30s+ for ~5400 units.
         const statsByItem = await getUnitCompletionStatsBulk(items.map((row) => row.instOrderItemId));
+        // Overview carries counts only (see summarizeUnitStats); ?full=1
+        // keeps the old per-material lists.
+        const full = req.query.full === '1';
 
         const orders = {};
         items.forEach(row => {
@@ -1550,7 +1553,9 @@ router.get('/assigned-components', async (req, res) => {
                 assignment: row.assignmentId
                     ? { instOrderItemId: row.instOrderItemId, instOrderId: row.instOrderId, teamId: row.assignmentTeamId }
                     : null,
-                stats: statsByItem.get(row.instOrderItemId),
+                stats: full
+                    ? statsByItem.get(row.instOrderItemId)
+                    : summarizeUnitStats(statsByItem.get(row.instOrderItemId)),
             });
         });
 
@@ -1619,10 +1624,54 @@ router.get('/assigned-components', async (req, res) => {
             updatedAt: c.updatedAt,
         }));
 
-        res.json({ success: true, data: { orders, teams, checkpoints, recentComponentUpdates } });
+        // Latest team check-in per project over the last 7 days -- counts as
+        // project activity in the page's "active this week" filter even when
+        // no material was scanned (teams on site but not installing yet).
+        const recentCheckins = await sequelize3.query(
+            `SELECT j.projectNo, MAX(c.createdAt) AS lastCheckin
+             FROM IIT_Petra.instTeamCheckpoints c
+             JOIN IIT_Petra.instOrders o ON o.Id = c.order_id
+             JOIN IIT_Petra.instReqMaster m ON m.instReqMasterId = o.instReqMasterId
+             JOIN IIT_Petra.project j ON j.projectId = m.projectId
+             WHERE c.createdAt >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 7 DAY)
+             GROUP BY j.projectNo`,
+            { type: QueryTypes.SELECT }
+        );
+        const projectLastCheckin = Object.fromEntries(
+            recentCheckins.map((r) => [String(r.projectNo), r.lastCheckin])
+        );
+
+        res.json({ success: true, data: { orders, teams, checkpoints, recentComponentUpdates, projectLastCheckin } });
     } catch (err) {
         console.error('❌ FETCH ASSIGNED COMPONENTS ERROR:', err);
         res.status(500).json({ success: false, message: 'Error fetching assigned orders' });
+    }
+});
+
+// GET /instOrders/assigned-components/materials?instOrderId=X
+// Per-material lists for one order's units, keyed by instOrderItemId --
+// loaded when the order is opened on ManageOrdersComponentsPage, since the
+// overview above no longer carries them. Same supervisor scoping.
+router.get('/assigned-components/materials', async (req, res) => {
+    try {
+        const instOrderId = parseInt(req.query.instOrderId, 10);
+        if (!instOrderId) return res.status(400).json({ success: false, message: 'instOrderId required' });
+        const isScoped = req.user.role === 'installation_supervisor';
+        const empNo = req.user.assignedEmpNo ? parseInt(req.user.assignedEmpNo) : null;
+        const rows = await sequelize.query(`
+            SELECT iod.id
+            FROM IIT_Petra.instOrderItems iod
+            LEFT JOIN IIT_Petra.instReqAssignments ira ON ira.instReqDetId = iod.instReqDetId AND ira.instOrderId = iod.instOrderId
+            WHERE iod.instOrderId = :instOrderId
+            ${isScoped ? 'AND ira.teamId IN (SELECT id FROM IIT_Petra.instTeams WHERE supervisor_emp_no = :empNo)' : ''}
+        `, { replacements: { instOrderId, empNo }, type: QueryTypes.SELECT });
+        const statsByItem = await getUnitCompletionStatsBulk(rows.map((r) => r.id));
+        const materials = {};
+        statsByItem.forEach((stats, id) => { materials[id] = stats.materials; });
+        res.json({ success: true, data: materials });
+    } catch (err) {
+        console.error('❌ FETCH ORDER MATERIALS ERROR:', err);
+        res.status(500).json({ success: false, message: 'Error fetching order materials' });
     }
 });
 
