@@ -872,11 +872,20 @@ router.get('/team/locations', authenticateToken, requirePermission(PERMISSIONS.I
       SELECT l.id, l.team_id, l.latitude, l.longitude, l.ping_time, t.name AS team_name, t.color
       FROM IIT_Petra.instTeamLocations l
       INNER JOIN IIT_Petra.instTeams t ON t.id = l.team_id
+      -- One row per team: several pings can share the same latest
+      -- ping_time (e.g. an offline batch flushed at once), which returned
+      -- the team several times and duplicated its map marker -- the
+      -- highest id among those ties wins.
       INNER JOIN (
-        SELECT team_id, MAX(ping_time) AS max_ping
-        FROM IIT_Petra.instTeamLocations
-        GROUP BY team_id
-      ) latest ON latest.team_id = l.team_id AND latest.max_ping = l.ping_time
+        SELECT l2.team_id, MAX(l2.id) AS id
+        FROM IIT_Petra.instTeamLocations l2
+        INNER JOIN (
+          SELECT team_id, MAX(ping_time) AS max_ping
+          FROM IIT_Petra.instTeamLocations
+          GROUP BY team_id
+        ) m ON m.team_id = l2.team_id AND m.max_ping = l2.ping_time
+        GROUP BY l2.team_id
+      ) latest ON latest.id = l.id
       ${isScoped ? 'WHERE t.supervisor_emp_no = :empNo' : ''}
       ORDER BY t.name
       `,
