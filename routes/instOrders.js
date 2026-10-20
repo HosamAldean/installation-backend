@@ -1624,7 +1624,24 @@ router.get('/assigned-components', async (req, res) => {
             updatedAt: c.updatedAt,
         }));
 
-        res.json({ success: true, data: { orders, teams, checkpoints, recentComponentUpdates } });
+        // Latest team check-in per project over the last 7 days -- counts as
+        // project activity in the page's "active this week" filter even when
+        // no material was scanned (teams on site but not installing yet).
+        const recentCheckins = await sequelize3.query(
+            `SELECT j.projectNo, MAX(c.createdAt) AS lastCheckin
+             FROM IIT_Petra.instTeamCheckpoints c
+             JOIN IIT_Petra.instOrders o ON o.Id = c.order_id
+             JOIN IIT_Petra.instReqMaster m ON m.instReqMasterId = o.instReqMasterId
+             JOIN IIT_Petra.project j ON j.projectId = m.projectId
+             WHERE c.createdAt >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 7 DAY)
+             GROUP BY j.projectNo`,
+            { type: QueryTypes.SELECT }
+        );
+        const projectLastCheckin = Object.fromEntries(
+            recentCheckins.map((r) => [String(r.projectNo), r.lastCheckin])
+        );
+
+        res.json({ success: true, data: { orders, teams, checkpoints, recentComponentUpdates, projectLastCheckin } });
     } catch (err) {
         console.error('❌ FETCH ASSIGNED COMPONENTS ERROR:', err);
         res.status(500).json({ success: false, message: 'Error fetching assigned orders' });
