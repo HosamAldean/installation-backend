@@ -540,7 +540,11 @@ async function assertOwnsItem(reqUser, instOrderItemId) {
 // Upserts a team's live location, silently skipping if teamId doesn't
 // reference a real row in instTeams (e.g. stale teamId on an office/admin
 // account) — inserting would otherwise violate the FK constraint.
-async function upsertTeamLocation(teamId, lat, lng) {
+// ageSeconds: how long before "now" the fix was actually taken (offline-
+// queued pings replayed later -- see POST /location's capturedAt). Stored
+// as UTC_TIMESTAMP() minus that age so it stays on the DB clock like live
+// pings, rather than mixing in the phone's own clock.
+async function upsertTeamLocation(teamId, lat, lng, ageSeconds = 0) {
     if (!teamId || typeof lat !== 'number' || typeof lng !== 'number') return;
     // Reject (0,0) "null island" and other clearly-invalid fixes server-side
     // — this has recurred multiple times from client-side bugs (hardcoded
@@ -563,13 +567,13 @@ async function upsertTeamLocation(teamId, lat, lng) {
         `
         INSERT INTO IIT_Petra.instTeamLocations
         (team_id, latitude, longitude, ping_time)
-        VALUES (:team_id, :lat, :lng, UTC_TIMESTAMP())
+        VALUES (:team_id, :lat, :lng, DATE_SUB(UTC_TIMESTAMP(), INTERVAL :age SECOND))
         ON DUPLICATE KEY UPDATE
             latitude = VALUES(latitude),
             longitude = VALUES(longitude),
-            ping_time = UTC_TIMESTAMP();
+            ping_time = VALUES(ping_time);
         `,
-        { replacements: { team_id: teamId, lat, lng }, type: QueryTypes.INSERT }
+        { replacements: { team_id: teamId, lat, lng, age: ageSeconds }, type: QueryTypes.INSERT }
     );
 }
 
@@ -1999,10 +2003,21 @@ router.post("/location", authenticateToken, async (req, res) => {
             return res.status(400).json({ success: false, code: "NO_TEAM_ASSIGNED", message: "No team assigned to this user" });
         }
 
+        // capturedAt (ms epoch, sent by app 1.0.9+): when the phone took the
+        // fix. Offline-queued pings are replayed together once the network
+        // is back; stamping them all with the arrival time stacked several
+        // positions on one timestamp (duplicate markers, wrong route
+        // timing). Age is clamped to 0..7 days to tolerate a bad phone clock;
+        // older apps send nothing and get the arrival time as before.
+        const capturedAt = Number(req.body.capturedAt);
+        const ageSeconds = Number.isFinite(capturedAt) && capturedAt > 0
+            ? Math.min(Math.max(0, Math.round((Date.now() - capturedAt) / 1000)), 7 * 24 * 3600)
+            : 0;
+
         // upsertTeamLocation silently no-ops if teamId doesn't reference a
         // real instTeams row (e.g. a stale teamId on an office/admin account),
         // avoiding an FK-constraint error for accounts not on a real field team.
-        await upsertTeamLocation(teamId, lat, lng);
+        await upsertTeamLocation(teamId, lat, lng, ageSeconds);
         res.json({ success: true });
     } catch (err) {
         console.error("LOCATION PING ERROR:", err);
