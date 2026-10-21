@@ -19,7 +19,13 @@ const SQL_DB = process.env.MSSQL1_DB;
 // direction 2026-10-15; it used to fall to general hr. Ittihad
 // (Comp_num=10) is a genuinely separate company with its own employee-
 // numbering scheme.
-const FACTORY_WHERE = "Comp_num = 1 AND (Work_place BETWEEN 6000 AND 6999 OR Work_place = 8001)";
+// Individual exceptions that stay with general hr despite a factory work
+// place (so also no factory-manager stage): 100608 (Warehouses 6200, ERP
+// supervisor in Accounting) -- manager -> general hr, per explicit
+// direction 2026-10-21.
+const FACTORY_EXCLUDED_EMP_NOS = [100608];
+const FACTORY_WHERE = "Comp_num = 1 AND (Work_place BETWEEN 6000 AND 6999 OR Work_place = 8001)"
+    + ` AND Emp_num NOT IN (${FACTORY_EXCLUDED_EMP_NOS.join(",")})`;
 const ITTIHAD_WHERE = "Comp_num = 10";
 // Everyone not in either of the above two.
 const GENERAL_WHERE = `NOT (${FACTORY_WHERE}) AND Comp_num <> 10`;
