@@ -1009,12 +1009,17 @@ function haversineKm(a, b) {
 
 // Road distance/route through a day's GPS points via the self-hosted OSRM
 // (WSL on this server, Jordan car profile -- see C:\osrm\install-osrm.ps1).
+// Uses map matching (/match), not /route: routing through every ping
+// snaps highway pings to the opposite carriageway and adds kilometres of
+// U-turn loops (a 43 km straight-line day came out as 236 km). /match fits
+// the whole trace to the road network using the ping timestamps.
 // Points closer than ROAD_MIN_STEP_KM to the previous kept point are
 // dropped so GPS drift while parked adds nothing. Returns null when OSRM is
 // unreachable/fails, and the caller falls back to straight-line distance.
 const OSRM_URL = process.env.OSRM_URL || 'http://localhost:5000';
 const ROAD_MIN_STEP_KM = 0.05;
-const OSRM_MAX_WAYPOINTS = 100;
+const OSRM_MAX_WAYPOINTS = 100; // osrm-routed's default --max-matching-size
+const OSRM_MATCH_RADIUS_M = 50; // phone GPS accuracy in the city
 const OSRM_TIMEOUT_MS = 8000;
 // Past days never change, so their road result is kept in memory.
 const roadRouteCache = new Map(); // `${teamId}|${date}` -> result
@@ -1033,14 +1038,29 @@ async function roadRouteThrough(pings) {
     for (let i = 0; i < kept.length - 1; i += OSRM_MAX_WAYPOINTS - 1) {
         const chunk = kept.slice(i, i + OSRM_MAX_WAYPOINTS);
         const coords = chunk.map((p) => `${Number(p.longitude).toFixed(6)},${Number(p.latitude).toFixed(6)}`).join(';');
+        // OSRM wants strictly increasing timestamps; pings can share a second.
+        const timestamps = [];
+        for (const p of chunk) {
+            const t = Math.floor(new Date(p.ping_time).getTime() / 1000);
+            timestamps.push(timestamps.length && t <= timestamps[timestamps.length - 1] ? timestamps[timestamps.length - 1] + 1 : t);
+        }
+        const radiuses = chunk.map(() => OSRM_MATCH_RADIUS_M).join(';');
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), OSRM_TIMEOUT_MS);
         try {
-            const r = await fetch(`${OSRM_URL}/route/v1/driving/${coords}?overview=full&geometries=geojson`, { signal: controller.signal });
+            // gaps=ignore: pings are minutes apart, and splitting at each gap
+            // would drop the distance between the pieces.
+            const r = await fetch(
+                `${OSRM_URL}/match/v1/driving/${coords}?overview=full&geometries=geojson`
+                + `&timestamps=${timestamps.join(';')}&radiuses=${radiuses}&gaps=ignore&tidy=true`,
+                { signal: controller.signal }
+            );
             const body = await r.json();
-            if (body.code !== 'Ok' || !body.routes?.length) return null;
-            meters += body.routes[0].distance;
-            body.routes[0].geometry.coordinates.forEach(([lng, lat]) => path.push([lat, lng]));
+            if (body.code !== 'Ok' || !body.matchings?.length) return null;
+            for (const m of body.matchings) {
+                meters += m.distance;
+                m.geometry.coordinates.forEach(([lng, lat]) => path.push([lat, lng]));
+            }
         } catch {
             return null;
         } finally {
