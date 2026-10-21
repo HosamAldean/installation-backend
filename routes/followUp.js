@@ -1013,13 +1013,21 @@ function haversineKm(a, b) {
 // snaps highway pings to the opposite carriageway and adds kilometres of
 // U-turn loops (a 43 km straight-line day came out as 236 km). /match fits
 // the whole trace to the road network using the ping timestamps.
+// Timestamps are left out of a chunk when they imply an impossible speed:
+// apps before 1.0.9 don't send capturedAt, so an offline-queued batch is
+// stored with its upload time (dozens of points within seconds), and OSRM
+// rejects "15 km in 1 second" as unmatchable. A chunk OSRM still can't match
+// counts as straight line, so one bad stretch doesn't drop the whole day.
 // Points closer than ROAD_MIN_STEP_KM to the previous kept point are
 // dropped so GPS drift while parked adds nothing. Returns null when OSRM is
-// unreachable/fails, and the caller falls back to straight-line distance.
+// unreachable or nothing matched, and the caller falls back to straight-line
+// distance.
 const OSRM_URL = process.env.OSRM_URL || 'http://localhost:5000';
 const ROAD_MIN_STEP_KM = 0.05;
 const OSRM_MAX_WAYPOINTS = 100; // osrm-routed's default --max-matching-size
 const OSRM_MATCH_RADIUS_M = 50; // phone GPS accuracy in the city
+const OSRM_MAX_REAL_KMH = 180;
+const OSRM_BATCH_HOP_SHARE = 0.2;
 const OSRM_TIMEOUT_MS = 8000;
 // Past days never change, so their road result is kept in memory.
 const roadRouteCache = new Map(); // `${teamId}|${date}` -> result
@@ -1033,15 +1041,24 @@ async function roadRouteThrough(pings) {
     if (kept.length < 2) return { distanceKm: 0, path: [] };
 
     let meters = 0;
+    let matchedAny = false;
     const path = [];
     // Chunks overlap by one point so consecutive legs connect.
     for (let i = 0; i < kept.length - 1; i += OSRM_MAX_WAYPOINTS - 1) {
         const chunk = kept.slice(i, i + OSRM_MAX_WAYPOINTS);
         const coords = chunk.map((p) => `${Number(p.longitude).toFixed(6)},${Number(p.latitude).toFixed(6)}`).join(';');
+        const times = chunk.map((p) => Math.floor(new Date(p.ping_time).getTime() / 1000));
+        // A stray GPS jump or two duplicate-second pings are normal; a queued
+        // batch makes most hops impossible.
+        let impossibleHops = 0;
+        for (let j = 1; j < chunk.length; j++) {
+            const hours = Math.max(times[j] - times[j - 1], 1) / 3600;
+            if (haversineKm(chunk[j - 1], chunk[j]) / hours > OSRM_MAX_REAL_KMH) impossibleHops++;
+        }
+        const realTimes = impossibleHops < OSRM_BATCH_HOP_SHARE * (chunk.length - 1);
         // OSRM wants strictly increasing timestamps; pings can share a second.
         const timestamps = [];
-        for (const p of chunk) {
-            const t = Math.floor(new Date(p.ping_time).getTime() / 1000);
+        for (const t of times) {
             timestamps.push(timestamps.length && t <= timestamps[timestamps.length - 1] ? timestamps[timestamps.length - 1] + 1 : t);
         }
         const radiuses = chunk.map(() => OSRM_MATCH_RADIUS_M).join(';');
@@ -1052,14 +1069,19 @@ async function roadRouteThrough(pings) {
             // would drop the distance between the pieces.
             const r = await fetch(
                 `${OSRM_URL}/match/v1/driving/${coords}?overview=full&geometries=geojson`
-                + `&timestamps=${timestamps.join(';')}&radiuses=${radiuses}&gaps=ignore&tidy=true`,
+                + `${realTimes ? `&timestamps=${timestamps.join(';')}` : ''}&radiuses=${radiuses}&gaps=ignore&tidy=true`,
                 { signal: controller.signal }
             );
             const body = await r.json();
-            if (body.code !== 'Ok' || !body.matchings?.length) return null;
-            for (const m of body.matchings) {
-                meters += m.distance;
-                m.geometry.coordinates.forEach(([lng, lat]) => path.push([lat, lng]));
+            if (body.code === 'Ok' && body.matchings?.length) {
+                matchedAny = true;
+                for (const m of body.matchings) {
+                    meters += m.distance;
+                    m.geometry.coordinates.forEach(([lng, lat]) => path.push([lat, lng]));
+                }
+            } else {
+                for (let j = 1; j < chunk.length; j++) meters += haversineKm(chunk[j - 1], chunk[j]) * 1000;
+                chunk.forEach((p) => path.push([Number(p.latitude), Number(p.longitude)]));
             }
         } catch {
             return null;
@@ -1067,6 +1089,7 @@ async function roadRouteThrough(pings) {
             clearTimeout(timer);
         }
     }
+    if (!matchedAny) return null;
     return { distanceKm: Math.round((meters / 1000) * 10) / 10, path };
 }
 
