@@ -4,6 +4,14 @@ import sql from 'mssql';
 import dotenv from 'dotenv';
 dotenv.config();
 
+// Shared by every MySQL connection below. Opening a connection to this
+// MariaDB is slow (0.5-6.5 s measured 2026-10-22: skip_name_resolve is OFF,
+// so the server reverse-DNS-resolves this machine on every connect), and
+// Sequelize's default pool closes a connection after only 10 s idle -- so
+// after any short pause the next request paid that whole handshake. Keep
+// a couple warm and let idle ones live 10 minutes (wait_timeout is 8 h).
+const MYSQL_POOL = { max: 10, min: 2, idle: 10 * 60 * 1000, acquire: 60 * 1000, evict: 60 * 1000 };
+
 // ======================
 // MySQL (main)
 // ======================
@@ -15,6 +23,7 @@ export const sequelize = new Sequelize(
         host: process.env.DB_HOST,
         dialect: 'mysql',
         logging: false,
+        pool: MYSQL_POOL,
         dialectOptions: {
             charset: 'latin1',
             collate: 'latin1_swedish_ci',
@@ -46,6 +55,7 @@ export const sequelize2 = new Sequelize(
         dialect: 'mysql',
         port: Number(process.env.DB_PORT || 3306),
         logging: false,
+        pool: MYSQL_POOL,
         define: {
             timestamps: false // we'll set timestamps per model where needed
         }
@@ -78,6 +88,7 @@ export const sequelize2PetraErp = new Sequelize(
         dialect: 'mysql',
         port: Number(process.env.DB_PORT || 3306),
         logging: false,
+        pool: MYSQL_POOL,
         dialectOptions: {
             charset: 'latin1',
             collate: 'latin1_swedish_ci',
@@ -114,6 +125,7 @@ export const sequelizeUtf8 = new Sequelize(
         dialect: 'mysql',
         port: Number(process.env.DB_PORT || 3306),
         logging: false,
+        pool: MYSQL_POOL,
         dialectOptions: {
             charset: 'utf8mb4',
         },
@@ -133,6 +145,7 @@ export const sequelize3 = new Sequelize(
         dialect: 'mysql',
         port: Number(process.env.DB_PORT || 3306),
         logging: false,
+        pool: MYSQL_POOL,
         dialectOptions: {
             charset: 'latin1',
             collate: 'latin1_swedish_ci',
