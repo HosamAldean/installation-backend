@@ -742,6 +742,14 @@ router.post('/reservations/:id/items/:lineId/confirm', requireReserve, async (re
         const qtyToReserve = req.body?.qtyToReserve !== undefined && req.body.qtyToReserve !== null
             ? Number(req.body.qtyToReserve)
             : undefined;
+        // confirmOneLine clamps to 0..requested, but a non-number would
+        // reach it as NaN and be stored as the line's quantities.
+        if (qtyToReserve !== undefined && (!Number.isFinite(qtyToReserve) || qtyToReserve < 0)) {
+            return res.status(400).json({ message: 'qtyToReserve must be a number, 0 or more' });
+        }
+        if (qtyToReserve !== undefined && qtyToReserve > Number(line.qtyRequested)) {
+            return res.status(400).json({ message: `Cannot reserve more than the ${line.qtyRequested} requested` });
+        }
         // Optional -- storekeeper override: buy the exact requested color
         // directly on a painted ALM line's shortfall PO instead of the
         // default mill-finish-then-coat routing. See confirmOneLine's own
