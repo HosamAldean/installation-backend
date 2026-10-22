@@ -17,6 +17,11 @@ import { postLedgerMovement, applyReceiptCost, getPhysicalBalance, normalizeColo
 import { denyStore } from '../services/matWhStoreAccess.js';
 
 const router = express.Router();
+// Shares the /api/materials-warehouse mount with the other warehouse
+// routers: only guard its own two paths, let everything else through to
+// the next router (same fix as routes/materialsWarehouse.js, 2026-10-22).
+const OWN_FIRST_SEGMENTS = new Set(['opening-balance', 'reconciliation-check']);
+router.use((req, res, next) => (OWN_FIRST_SEGMENTS.has(req.path.split('/')[1]) ? next() : next('router')));
 router.use(authenticateToken, requirePermission(PERMISSIONS.MATERIALS_WAREHOUSE_MASTER_DATA));
 
 // Seeds starting physical stock for one item+store(+color+length) as of

@@ -15,6 +15,10 @@ import { MatWhItem } from '../models/MatWhItem.js';
 
 const router = express.Router();
 const requireItemCost = requirePermission(PERMISSIONS.MATERIALS_WAREHOUSE_ITEM_COST);
+// Shares the /api/materials-warehouse mount with the other warehouse
+// routers: only guard /item-cost, let everything else through to the next
+// router (same fix as routes/materialsWarehouse.js, 2026-10-22).
+router.use((req, res, next) => (req.path.split('/')[1] === 'item-cost' ? next() : next('router')));
 router.use(authenticateToken, requireItemCost);
 
 // Rows carry the item's code/name, so the page doesn't have to resolve
