@@ -57,17 +57,26 @@ export async function createWithGeneratedNo(model, field, prefix, values, transa
     return row;
 }
 
-// reservationNo is user-entered (per explicit request), not generated --
-// the route validates it's present before calling this; the model's own
-// `unique: true` still catches a real collision.
+// reservationNo is user-entered on the store's Reservations page (per
+// explicit request); the model's own `unique: true` still catches a real
+// collision. Production's request page sends none, so one is generated
+// (PRQ-000123, 2026-10-22).
 export async function createReservationHeader({ reservationNo, projectId, projectNo, projectName, projectManager, requestedByName, reservedUntilDate, notes, createdBy }) {
-    return MatWhReservationHeader.create({
-        reservationNo,
+    const values = {
         projectId, projectNo: projectNo ?? null, projectName: projectName ?? null,
         projectManager: projectManager ?? null, requestedByName: requestedByName ?? null,
         reservationDate: new Date(),
         reservedUntilDate: reservedUntilDate ?? null, notes: notes ?? null,
         status: 'draft', createdBy: createdBy ?? null,
+    };
+    if (reservationNo) return MatWhReservationHeader.create({ reservationNo, ...values });
+    // Same insert-then-rename as createWithGeneratedNo, but with a short
+    // placeholder: reservationNo is only 20 characters.
+    return sequelizeUtf8.transaction(async (t) => {
+        const placeholder = `TMP${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+        const row = await MatWhReservationHeader.create({ reservationNo: placeholder, ...values }, { transaction: t });
+        await row.update({ reservationNo: `PRQ-${String(row.id).padStart(6, '0')}` }, { transaction: t });
+        return row;
     });
 }
 

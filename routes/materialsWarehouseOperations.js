@@ -23,6 +23,7 @@ import { MatWhCoatingInvoice } from '../models/MatWhCoatingInvoice.js';
 import { MatWhPurchaseOrder } from '../models/MatWhPurchaseOrder.js';
 import { MatWhPurchaseOrderItem } from '../models/MatWhPurchaseOrderItem.js';
 import { MatWhStockLedger } from '../models/MatWhStockLedger.js';
+import { User } from '../models/User.js';
 import { postLedgerMovement, getAvailableToReserve, getAlreadyReserved, getPendingQty, getPhysicalBalance, normalizeColor, getAvailableColorsForItem, lockRow, lockItems, currentAvgCost, addValueToStock } from '../services/matWhLedger.js';
 import { denyStore, getAllowedStoreIds } from '../services/matWhStoreAccess.js';
 import { normalizeRequestKey, findRequestKey, claimRequestKey } from '../services/matWhRequestKeys.js';
@@ -64,12 +65,38 @@ function requireAnyOf(...keys) {
     };
 }
 
+// Production's side of a reservation (2026-10-22): building and submitting
+// a project request, plus the lookups that needs. Everything a store
+// decides (confirm/reject/substitute/release/transfer) stays .reserve-only.
+const requireReserveOrProduction = requireAnyOf(
+    PERMISSIONS.MATERIALS_WAREHOUSE_RESERVE,
+    PERMISSIONS.MATERIALS_WAREHOUSE_PRODUCTION_REQUEST,
+);
+
+// True when the caller reaches reservations only through
+// .production_request -- they see and edit just the requests they created.
+// Admin, store staff (.reserve) and store managers see every request.
+async function isProductionOnlyCaller(user) {
+    if (user.role === 'admin') return false;
+    const granted = await getPermissionsForRole(user.role);
+    return !granted.includes(PERMISSIONS.MATERIALS_WAREHOUSE_RESERVE)
+        && !granted.includes(PERMISSIONS.MATERIALS_WAREHOUSE_STORE_MANAGER);
+}
+
+async function denyNotOwnRequest(req, res, header) {
+    if (!(await isProductionOnlyCaller(req.user))) return false;
+    if (header.createdBy === req.user.userId) return false;
+    res.status(403).json({ message: 'This request belongs to another user' });
+    return true;
+}
+
 // ============================================================
 // Stock balance / ledger (read)
 // ============================================================
 
 router.get('/stock-balance', requireAnyOf(
     PERMISSIONS.MATERIALS_WAREHOUSE_RESERVE,
+    PERMISSIONS.MATERIALS_WAREHOUSE_PRODUCTION_REQUEST,
     PERMISSIONS.MATERIALS_WAREHOUSE_ISSUE,
     PERMISSIONS.MATERIALS_WAREHOUSE_RECEIVE,
 ), async (req, res) => {
@@ -128,6 +155,7 @@ router.get('/stock-balance', requireAnyOf(
 
 router.get('/store-lookup', requireAnyOf(
     PERMISSIONS.MATERIALS_WAREHOUSE_RESERVE,
+    PERMISSIONS.MATERIALS_WAREHOUSE_PRODUCTION_REQUEST,
     PERMISSIONS.MATERIALS_WAREHOUSE_ISSUE,
     PERMISSIONS.MATERIALS_WAREHOUSE_RECEIVE,
 ), async (req, res) => {
@@ -140,6 +168,7 @@ router.get('/store-lookup', requireAnyOf(
 // reservation/issue/receive flow already uses.
 router.get('/item-lookup', requireAnyOf(
     PERMISSIONS.MATERIALS_WAREHOUSE_RESERVE,
+    PERMISSIONS.MATERIALS_WAREHOUSE_PRODUCTION_REQUEST,
     PERMISSIONS.MATERIALS_WAREHOUSE_ISSUE,
     PERMISSIONS.MATERIALS_WAREHOUSE_RECEIVE,
     PERMISSIONS.MATERIALS_WAREHOUSE_PURCHASE_ORDERS,
@@ -164,6 +193,7 @@ router.get('/item-lookup', requireAnyOf(
 // rows, too many to ship to the client whole like the 574-row color list.
 router.get('/item-search', requireAnyOf(
     PERMISSIONS.MATERIALS_WAREHOUSE_RESERVE,
+    PERMISSIONS.MATERIALS_WAREHOUSE_PRODUCTION_REQUEST,
     PERMISSIONS.MATERIALS_WAREHOUSE_ISSUE,
     PERMISSIONS.MATERIALS_WAREHOUSE_RECEIVE,
     PERMISSIONS.MATERIALS_WAREHOUSE_PURCHASE_ORDERS,
@@ -289,6 +319,7 @@ router.get('/available-colors', requireAnyOf(
 // page actually needs has no such ceiling.
 router.get('/items-by-ids', requireAnyOf(
     PERMISSIONS.MATERIALS_WAREHOUSE_RESERVE,
+    PERMISSIONS.MATERIALS_WAREHOUSE_PRODUCTION_REQUEST,
     PERMISSIONS.MATERIALS_WAREHOUSE_ISSUE,
     PERMISSIONS.MATERIALS_WAREHOUSE_RECEIVE,
     PERMISSIONS.MATERIALS_WAREHOUSE_PURCHASE_ORDERS,
@@ -321,6 +352,7 @@ router.get('/items-by-ids', requireAnyOf(
 // right above instead.
 router.get('/color-lookup', requireAnyOf(
     PERMISSIONS.MATERIALS_WAREHOUSE_RESERVE,
+    PERMISSIONS.MATERIALS_WAREHOUSE_PRODUCTION_REQUEST,
     PERMISSIONS.MATERIALS_WAREHOUSE_ISSUE,
     PERMISSIONS.MATERIALS_WAREHOUSE_RECEIVE,
     PERMISSIONS.MATERIALS_WAREHOUSE_PURCHASE_ORDERS,
@@ -388,6 +420,7 @@ router.get('/color-lookup', requireAnyOf(
 
 router.get('/projects/search', requireAnyOf(
     PERMISSIONS.MATERIALS_WAREHOUSE_RESERVE,
+    PERMISSIONS.MATERIALS_WAREHOUSE_PRODUCTION_REQUEST,
 ), async (req, res) => {
     const q = String(req.query.q || '').trim();
     if (q.length < 2) return res.json({ items: [] });
@@ -452,10 +485,12 @@ router.get('/stock-ledger', requireReports, async (req, res) => {
 router.get('/reservations', requireAnyOf(
     PERMISSIONS.MATERIALS_WAREHOUSE_RESERVE,
     PERMISSIONS.MATERIALS_WAREHOUSE_STORE_MANAGER,
+    PERMISSIONS.MATERIALS_WAREHOUSE_PRODUCTION_REQUEST,
 ), async (req, res) => {
     const where = {};
     if (req.query.projectId) where.projectId = req.query.projectId;
     if (req.query.status) where.status = req.query.status;
+    if (await isProductionOnlyCaller(req.user)) where.createdBy = req.user.userId;
     const rows = await MatWhReservationHeader.findAll({ where, order: [['id', 'DESC']] });
     res.json({ items: rows });
 });
@@ -463,9 +498,11 @@ router.get('/reservations', requireAnyOf(
 router.get('/reservations/:id', requireAnyOf(
     PERMISSIONS.MATERIALS_WAREHOUSE_RESERVE,
     PERMISSIONS.MATERIALS_WAREHOUSE_STORE_MANAGER,
+    PERMISSIONS.MATERIALS_WAREHOUSE_PRODUCTION_REQUEST,
 ), async (req, res) => {
     const header = await MatWhReservationHeader.findByPk(req.params.id);
     if (!header) return res.status(404).json({ message: 'Not found' });
+    if (await denyNotOwnRequest(req, res, header)) return;
     const items = await MatWhReservationItem.findAll({
         where: { reservationHeaderId: header.id }, order: [['id', 'ASC']],
     });
@@ -486,15 +523,15 @@ router.get('/reservations/:id', requireAnyOf(
     res.json({ ...header.toJSON(), items: itemsWithTargetColor });
 });
 
-router.post('/reservations', requireReserve, async (req, res) => {
+// reservationNo is optional: production's request page doesn't ask for
+// one, so a blank number is generated (PRQ-000123). The store's own
+// Reservations page still types its number in.
+router.post('/reservations', requireReserveOrProduction, async (req, res) => {
     const { reservationNo, projectId, projectNo, projectName, projectManager, requestedByName, reservedUntilDate, notes } = req.body;
-    if (!reservationNo || !String(reservationNo).trim()) {
-        return res.status(400).json({ message: 'reservationNo is required' });
-    }
     if (!projectId) return res.status(400).json({ message: 'projectId is required' });
     try {
         const header = await createReservationHeader({
-            reservationNo: String(reservationNo).trim(),
+            reservationNo: reservationNo ? String(reservationNo).trim() : null,
             projectId, projectNo, projectName, projectManager, requestedByName, reservedUntilDate, notes,
             createdBy: req.user.userId,
         });
@@ -512,9 +549,10 @@ router.post('/reservations', requireReserve, async (req, res) => {
 // requested qty is already known to exceed what's available -- confirm can
 // still cover a shortfall with an auto-PO, but a line shouldn't silently
 // invite one for a typo'd quantity before the storekeeper even looks at it.
-router.post('/reservations/:id/items', requireReserve, async (req, res) => {
+router.post('/reservations/:id/items', requireReserveOrProduction, async (req, res) => {
     const header = await MatWhReservationHeader.findByPk(req.params.id);
     if (!header) return res.status(404).json({ message: 'Reservation not found' });
+    if (await denyNotOwnRequest(req, res, header)) return;
     if (header.status !== 'draft') {
         return res.status(409).json({ message: `Cannot add items to a reservation in status '${header.status}'` });
     }
@@ -554,9 +592,10 @@ router.post('/reservations/:id/items', requireReserve, async (req, res) => {
 // evidence of ever being in); an item with no known stores at all is
 // store-flexible, any real store accepted, per direct decision (never
 // block reserving an item just because nobody's recorded where it lives).
-router.post('/reservations/:id/items/bulk', requireReserve, async (req, res) => {
+router.post('/reservations/:id/items/bulk', requireReserveOrProduction, async (req, res) => {
     const header = await MatWhReservationHeader.findByPk(req.params.id);
     if (!header) return res.status(404).json({ message: 'Reservation not found' });
+    if (await denyNotOwnRequest(req, res, header)) return;
     if (header.status !== 'draft') {
         return res.status(409).json({ message: `Cannot add items to a reservation in status '${header.status}'` });
     }
@@ -635,9 +674,10 @@ router.post('/reservations/:id/items/bulk', requireReserve, async (req, res) => 
     });
 });
 
-router.delete('/reservations/:id/items/:lineId', requireReserve, async (req, res) => {
+router.delete('/reservations/:id/items/:lineId', requireReserveOrProduction, async (req, res) => {
     const header = await MatWhReservationHeader.findByPk(req.params.id);
     if (!header) return res.status(404).json({ message: 'Reservation not found' });
+    if (await denyNotOwnRequest(req, res, header)) return;
     if (header.status !== 'draft') {
         return res.status(409).json({ message: `Cannot remove items from a reservation in status '${header.status}'` });
     }
@@ -652,7 +692,10 @@ router.delete('/reservations/:id/items/:lineId', requireReserve, async (req, res
 // Locks the header (no more item add/remove) and sends every line to its
 // own store for an independent confirm/reject decision -- WM 10-21's "sent
 // to store" moment.
-router.post('/reservations/:id/submit', requireReserve, async (req, res) => {
+router.post('/reservations/:id/submit', requireReserveOrProduction, async (req, res) => {
+    const header = await MatWhReservationHeader.findByPk(req.params.id);
+    if (!header) return res.status(404).json({ message: 'Reservation not found' });
+    if (await denyNotOwnRequest(req, res, header)) return;
     try {
         const header = await submitReservation(Number(req.params.id));
         res.json(header);
@@ -953,6 +996,147 @@ router.get('/issue-candidates', requireIssue, async (req, res) => {
         };
     });
     res.json({ items: candidates });
+});
+
+// Issue by Project (2026-10-22, replaces the web's Issue by Item page): the
+// store picks a project and works through every request production sent
+// for it -- confirm what's pending, then issue what's reserved. Only
+// requests still in play (submitted/confirmed) and only lines in stores
+// the caller may act on (services/matWhStoreAccess.js).
+const OPEN_REQUEST_STATUSES = ['submitted', 'confirmed'];
+const OPEN_LINE_STATUSES = ['pending', 'confirmed', 'partially_confirmed'];
+
+router.get('/issue-by-project/projects', requireAnyOf(
+    PERMISSIONS.MATERIALS_WAREHOUSE_RESERVE,
+    PERMISSIONS.MATERIALS_WAREHOUSE_ISSUE,
+), async (req, res) => {
+    const headers = await MatWhReservationHeader.findAll({ where: { status: OPEN_REQUEST_STATUSES } });
+    if (headers.length === 0) return res.json({ items: [] });
+    const allowed = await getAllowedStoreIds(req.user);
+    const lines = await MatWhReservationItem.findAll({
+        where: {
+            reservationHeaderId: headers.map((h) => h.id),
+            status: OPEN_LINE_STATUSES,
+            ...(allowed ? { storeId: [...allowed] } : {}),
+        },
+        attributes: ['reservationHeaderId', 'status', 'qtyReserved'],
+    });
+    const headerById = new Map(headers.map((h) => [h.id, h]));
+    const byProject = new Map();
+    for (const l of lines) {
+        const h = headerById.get(l.reservationHeaderId);
+        if (!byProject.has(h.projectId)) {
+            byProject.set(h.projectId, {
+                projectId: h.projectId, projectNo: h.projectNo, projectName: h.projectName,
+                requestIds: new Set(), toConfirm: 0, toIssue: 0, lastRequestDate: null,
+            });
+        }
+        const p = byProject.get(h.projectId);
+        p.requestIds.add(h.id);
+        if (l.status === 'pending') p.toConfirm++;
+        else if (Number(l.qtyReserved) > 0) p.toIssue++;
+        if (!p.lastRequestDate || h.reservationDate > p.lastRequestDate) p.lastRequestDate = h.reservationDate;
+    }
+    const items = [...byProject.values()]
+        .map(({ requestIds, ...p }) => ({ ...p, requestCount: requestIds.size }))
+        .sort((a, b) => new Date(b.lastRequestDate) - new Date(a.lastRequestDate));
+    res.json({ items });
+});
+
+router.get('/issue-by-project', requireAnyOf(
+    PERMISSIONS.MATERIALS_WAREHOUSE_RESERVE,
+    PERMISSIONS.MATERIALS_WAREHOUSE_ISSUE,
+), async (req, res) => {
+    const projectId = Number(req.query.projectId);
+    if (!projectId) return res.status(400).json({ message: 'projectId is required' });
+
+    const headers = await MatWhReservationHeader.findAll({
+        where: { projectId, status: OPEN_REQUEST_STATUSES }, order: [['id', 'ASC']],
+    });
+    if (headers.length === 0) return res.json({ requests: [], lines: [] });
+    const allowed = await getAllowedStoreIds(req.user);
+    const lines = await MatWhReservationItem.findAll({
+        where: {
+            reservationHeaderId: headers.map((h) => h.id),
+            ...(allowed ? { storeId: [...allowed] } : {}),
+        },
+        order: [['reservationHeaderId', 'ASC'], ['id', 'ASC']],
+    });
+
+    const creatorIds = [...new Set(headers.map((h) => h.createdBy).filter(Boolean))];
+    const creators = creatorIds.length
+        ? await User.findAll({ where: { userId: creatorIds }, attributes: ['userId', 'username', 'firstName', 'lastName'] })
+        : [];
+    const creatorNameById = new Map(creators.map((u) => [
+        u.userId, [u.firstName, u.lastName].filter(Boolean).join(' ') || u.username,
+    ]));
+
+    const itemIds = [...new Set(lines.map((l) => l.itemId))];
+    const storeIds = [...new Set(lines.map((l) => l.storeId))];
+    const [items, stores, itemStores, variants] = await Promise.all([
+        itemIds.length ? MatWhItem.findAll({ where: { id: itemIds } }) : [],
+        storeIds.length ? MatWhStore.findAll({ where: { id: storeIds } }) : [],
+        itemIds.length ? MatWhItemStore.findAll({ where: { itemId: itemIds, storeId: storeIds } }) : [],
+        itemIds.length ? MatWhItemVariant.findAll({ where: { itemId: itemIds, isActive: true } }) : [],
+    ]);
+    const itemById = new Map(items.map((i) => [i.id, i]));
+    const storeById = new Map(stores.map((s) => [s.id, s]));
+    const itemStoreByKey = new Map(itemStores.map((s) => [`${s.itemId}|${s.storeId}`, s]));
+    const headerById = new Map(headers.map((h) => [h.id, h]));
+
+    const out = [];
+    for (const l of lines) {
+        const item = itemById.get(l.itemId);
+        const itemStore = itemStoreByKey.get(`${l.itemId}|${l.storeId}`);
+        // What the store could still reserve for a line it hasn't decided.
+        const available = l.status === 'pending'
+            ? await getAvailableToReserve(l.storeId, l.itemId, l.color ?? undefined, l.lengthMm ?? undefined)
+            : null;
+        // Pre-fills an aluminium line's issue barcode when exactly one
+        // variant matches its color/length (same rule as /variant-barcode).
+        const matches = variants.filter((v) => v.itemId === l.itemId
+            && normalizeColor(v.color ?? null) === normalizeColor(l.color ?? null)
+            && (l.lengthMm == null || Number(v.lengthMm) === Number(l.lengthMm)));
+        out.push({
+            lineId: l.id,
+            reservationHeaderId: l.reservationHeaderId,
+            reservationNo: headerById.get(l.reservationHeaderId)?.reservationNo ?? null,
+            itemId: l.itemId,
+            itemCode: item?.itemCode ?? null,
+            itemName: item?.itemName ?? null,
+            itemNameAr: item?.itemNameAr ?? null,
+            category: item?.category ?? null,
+            baseUnit: item?.baseUnit ?? null,
+            storeId: l.storeId,
+            storeName: storeById.get(l.storeId)?.storeName ?? null,
+            zone: itemStore?.zone ?? null,
+            locationColumn: itemStore?.locationColumn ?? null,
+            locationRow: itemStore?.locationRow ?? null,
+            color: l.color,
+            lengthMm: l.lengthMm,
+            qtyRequested: l.qtyRequested,
+            qtyReserved: l.qtyReserved,
+            qtyShortfall: l.qtyShortfall,
+            status: l.status,
+            available,
+            hasVariants: variants.some((v) => v.itemId === l.itemId),
+            suggestedBarcode: matches.length === 1 ? matches[0].barcode : null,
+            purchaseOrderId: l.purchaseOrderId,
+            rejectionReason: l.rejectionReason,
+            issuedBarcode: l.issuedBarcode,
+            issuePurpose: l.issuePurpose,
+        });
+    }
+
+    res.json({
+        project: { projectId, projectNo: headers[0].projectNo, projectName: headers[0].projectName },
+        requests: headers.map((h) => ({
+            id: h.id, reservationNo: h.reservationNo, status: h.status,
+            reservationDate: h.reservationDate, reservedUntilDate: h.reservedUntilDate, notes: h.notes,
+            requestedByName: h.requestedByName || creatorNameById.get(h.createdBy) || null,
+        })),
+        lines: out,
+    });
 });
 
 // Same action as the route above, reachable directly by line id -- the

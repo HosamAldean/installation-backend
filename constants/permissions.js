@@ -61,6 +61,11 @@ export const PERMISSIONS = Object.freeze({
     MATERIALS_WAREHOUSE_LANDING: 'materials_warehouse.landing',
     MATERIALS_WAREHOUSE_RECEIVE: 'materials_warehouse.receive',
     MATERIALS_WAREHOUSE_RESERVE: 'materials_warehouse.reserve',
+    // Production's side of a reservation (2026-10-22): create a project
+    // request, add items, check availability, submit it -- on its OWN
+    // requests only. Confirm/reject/issue stay with the store's .reserve
+    // and .issue.
+    MATERIALS_WAREHOUSE_PRODUCTION_REQUEST: 'materials_warehouse.production_request',
     MATERIALS_WAREHOUSE_ISSUE: 'materials_warehouse.issue',
     MATERIALS_WAREHOUSE_PURCHASE_ORDERS: 'materials_warehouse.purchase_orders',
     MATERIALS_WAREHOUSE_INVOICES: 'materials_warehouse.invoices',
@@ -297,11 +302,12 @@ export const PERMISSION_GROUPS = [
         // owning phase (WH.2/WH.3) ships the actual routes.
         module: 'materialsWarehouse',
         label: 'Materials Warehouse',
-        roles: ['material_user', 'accounting', 'accounting_manager', 'mix_employee', 'mix_manager'],
+        roles: ['material_user', 'production', 'accounting', 'accounting_manager', 'mix_employee', 'mix_manager'],
         items: [
             { key: PERMISSIONS.MATERIALS_WAREHOUSE_LANDING, labelKey: 'materialsWarehouseLanding' },
             { key: PERMISSIONS.MATERIALS_WAREHOUSE_RECEIVE, labelKey: 'materialsWarehouseReceive' },
             { key: PERMISSIONS.MATERIALS_WAREHOUSE_RESERVE, labelKey: 'materialsWarehouseReserve' },
+            { key: PERMISSIONS.MATERIALS_WAREHOUSE_PRODUCTION_REQUEST, labelKey: 'materialsWarehouseProductionRequest' },
             { key: PERMISSIONS.MATERIALS_WAREHOUSE_ISSUE, labelKey: 'materialsWarehouseIssue' },
             { key: PERMISSIONS.MATERIALS_WAREHOUSE_PURCHASE_ORDERS, labelKey: 'materialsWarehousePurchaseOrders' },
             { key: PERMISSIONS.MATERIALS_WAREHOUSE_INVOICES, labelKey: 'materialsWarehouseInvoices' },
