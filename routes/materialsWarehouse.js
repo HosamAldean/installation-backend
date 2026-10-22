@@ -35,6 +35,16 @@ import { normalizeRequestKey, runOnceWithKey } from '../services/matWhRequestKey
 import { AdminActionAudit } from '../models/AdminActionAudit.js';
 
 const router = express.Router();
+// This router is mounted first on /api/materials-warehouse, which every
+// other warehouse router shares -- so a plain router.use guard ran on ALL
+// of their requests too and 403'd anyone without .master_data (found
+// 2026-10-22 testing the production role). Requests for paths this router
+// doesn't serve skip straight to the next router.
+const OWN_FIRST_SEGMENTS = new Set([
+    'items', 'catalog', 'stores', 'user-vendor-assignments', 'store-access',
+    'qc-categories', 'categories', 'sub-categories', 'units', 'vendors',
+]);
+router.use((req, res, next) => (OWN_FIRST_SEGMENTS.has(req.path.split('/')[1]) ? next() : next('router')));
 router.use(authenticateToken, requirePermission(PERMISSIONS.MATERIALS_WAREHOUSE_MASTER_DATA));
 
 // Item photo upload -- same multer/filename/cleanup pattern as
