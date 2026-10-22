@@ -18,6 +18,10 @@ import { MatWhPurchaseOrder } from '../models/MatWhPurchaseOrder.js';
 import { getAvailableToReserve } from '../services/matWhLedger.js';
 
 const router = express.Router();
+// Shares the /api/materials-warehouse mount with the other warehouse
+// routers: only guard /reports, let everything else through to the next
+// router (same fix as routes/materialsWarehouse.js, 2026-10-22).
+router.use((req, res, next) => (req.path.split('/')[1] === 'reports' ? next() : next('router')));
 router.use(authenticateToken, requirePermission(PERMISSIONS.MATERIALS_WAREHOUSE_REPORTS));
 
 // ------------------------------------------------------------
