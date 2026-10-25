@@ -33,7 +33,7 @@ import { MatWhStore } from '../models/MatWhStore.js';
 import { MatWhItemStore } from '../models/MatWhItemStore.js';
 import { Vendor } from '../models/Vendor.js';
 import { User } from '../models/User.js';
-import { postLedgerMovement, applyReceiptCost, normalizeColor, lockRow } from '../services/matWhLedger.js';
+import { postLedgerMovement, applyReceiptCost, trueUpReceiptCost, normalizeColor, lockRow } from '../services/matWhLedger.js';
 import { denyStore } from '../services/matWhStoreAccess.js';
 import { normalizeRequestKey, findRequestKey, claimRequestKey } from '../services/matWhRequestKeys.js';
 import { createCoatingJob, requireVariantBarcode } from '../services/matWhReservations.js';
@@ -955,10 +955,20 @@ router.post('/supplier-invoices', requireInvoices, async (req, res) => {
                     // touches cost fields, never the quantity already
                     // posted.
                     if (grItem.ledgerEntryId) {
+                        // The ledger row's current cost, not the
+                        // provisional one, so a second invoice on the same
+                        // receipt only moves the average by the new gap.
+                        const ledgerRow = await MatWhStockLedger.findByPk(grItem.ledgerEntryId, { transaction: t });
                         await MatWhStockLedger.update(
                             { unitCost: finalUnitCost, totalCost: finalUnitCost * grItem.qtyAccepted },
                             { where: { id: grItem.ledgerEntryId }, transaction: t },
                         );
+                        if (ledgerRow) {
+                            await trueUpReceiptCost(
+                                grItem.itemId, ledgerRow.storeId, Number(grItem.qtyAccepted),
+                                ledgerRow.unitCost, finalUnitCost, t,
+                            );
+                        }
                     }
                 }
             }
