@@ -126,6 +126,85 @@ router.get('/reports/remaining-stock', async (req, res) => {
 });
 
 // ------------------------------------------------------------
+// Stock Value (2026-10-25) -- what each store is worth: physical balance
+// per item+store x that pair's currentCost (weighted average since
+// 2026-10-22). One row per store plus a grand total; lines without a cost
+// are counted, not guessed. With ?storeId=, also that store's items,
+// highest value first, paged (?page=&pageSize=&search=).
+// ------------------------------------------------------------
+router.get('/reports/stock-value', async (req, res) => {
+    const storeId = req.query.storeId ? parseInt(req.query.storeId) : null;
+    const balances = (where = '') => `
+        SELECT l.itemId, l.storeId,
+               SUM(CASE WHEN l.direction = 'in' THEN l.qty ELSE -l.qty END) AS balance
+        FROM matWhStockLedger l
+        ${where}
+        GROUP BY l.itemId, l.storeId
+        HAVING ABS(balance) > 0.000001
+    `;
+    const [stores] = await sequelizeUtf8.query(`
+        SELECT s.id AS storeId, s.storeCode, s.storeName, s.storeType,
+               COUNT(b.itemId) AS \`lines\`,
+               COALESCE(SUM(b.balance), 0) AS qty,
+               COALESCE(SUM(b.balance * c.currentCost), 0) AS value,
+               SUM(CASE WHEN b.itemId IS NOT NULL AND c.currentCost IS NULL THEN 1 ELSE 0 END) AS linesNoCost,
+               SUM(CASE WHEN b.balance < 0 THEN 1 ELSE 0 END) AS negativeLines
+        FROM matWhStores s
+        LEFT JOIN (${balances()}) b ON b.storeId = s.id
+        LEFT JOIN matWhItemCost c ON c.itemId = b.itemId AND c.storeId = b.storeId
+        WHERE s.isActive = 1
+        GROUP BY s.id, s.storeCode, s.storeName, s.storeType
+        ORDER BY s.storeCode
+    `);
+    const num = (v) => Math.round(Number(v || 0) * 1000) / 1000;
+    const storeRows = stores.map((s) => ({
+        storeId: s.storeId, storeCode: s.storeCode, storeName: s.storeName, storeType: s.storeType,
+        lines: Number(s.lines), qty: num(s.qty), value: num(s.value),
+        linesNoCost: Number(s.linesNoCost || 0), negativeLines: Number(s.negativeLines || 0),
+    }));
+    const totals = storeRows.reduce((t, s) => ({
+        lines: t.lines + s.lines, qty: num(t.qty + s.qty), value: num(t.value + s.value),
+        linesNoCost: t.linesNoCost + s.linesNoCost, negativeLines: t.negativeLines + s.negativeLines,
+    }), { lines: 0, qty: 0, value: 0, linesNoCost: 0, negativeLines: 0 });
+
+    if (!storeId) return res.json({ stores: storeRows, totals });
+
+    const search = String(req.query.search || '').trim();
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const pageSize = Math.min(500, Math.max(1, parseInt(req.query.pageSize) || 50));
+    const replacements = { storeId, limit: pageSize, offset: (page - 1) * pageSize };
+    let searchSql = '';
+    if (search) {
+        searchSql = 'AND (i.itemCode LIKE :search OR i.itemName LIKE :search OR i.itemNameAr LIKE :search)';
+        replacements.search = `%${search}%`;
+    }
+    const itemsSql = `
+        FROM (${balances('WHERE l.storeId = :storeId')}) b
+        JOIN matWhItems i ON i.id = b.itemId
+        LEFT JOIN matWhItemCost c ON c.itemId = b.itemId AND c.storeId = b.storeId
+        WHERE 1 = 1 ${searchSql}
+    `;
+    const [[countRow]] = await sequelizeUtf8.query(`SELECT COUNT(*) AS n ${itemsSql}`, { replacements });
+    const [items] = await sequelizeUtf8.query(`
+        SELECT b.itemId, i.itemCode, i.itemName, i.itemNameAr, i.baseUnit, b.balance,
+               c.currentCost, b.balance * c.currentCost AS value
+        ${itemsSql}
+        ORDER BY (c.currentCost IS NULL), value DESC, i.itemCode
+        LIMIT :limit OFFSET :offset
+    `, { replacements });
+    res.json({
+        stores: storeRows, totals,
+        items: items.map((r) => ({
+            itemId: r.itemId, itemCode: r.itemCode, itemName: r.itemName, itemNameAr: r.itemNameAr,
+            baseUnit: r.baseUnit, balance: num(r.balance),
+            currentCost: r.currentCost != null ? Number(r.currentCost) : null,
+            value: r.value != null ? num(r.value) : null,
+        })),
+        total: Number(countRow.n), page, pageSize,
+    });
+});
+
+// ------------------------------------------------------------
 // In/Out -- ledger activity over a date range.
 // ------------------------------------------------------------
 router.get('/reports/in-out', async (req, res) => {
