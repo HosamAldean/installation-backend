@@ -285,6 +285,45 @@ export async function addValueToStock(itemId, storeId, extraValue, transaction) 
     return { itemId, storeId, onHand, oldAvg: previousAvg, newAvg, added: extraValue };
 }
 
+// A supplier invoice's price differs from the receipt's provisional cost:
+// move the average by the difference on the part of that receipt still in
+// stock (whatever was already issued went out at the old figure). Can go
+// either way, unlike addValueToStock. A receipt posted with no cost at
+// all (oldUnitCost null) never entered the average, so it is blended in
+// now. lastCost becomes the invoiced price.
+export async function trueUpReceiptCost(itemId, storeId, qtyReceived, oldUnitCost, newUnitCost, transaction) {
+    if (newUnitCost == null || !(qtyReceived > 0)) return null;
+    const newCost = Number(newUnitCost);
+    if (oldUnitCost != null && Math.abs(newCost - Number(oldUnitCost)) < 1e-9) return null;
+    const [created] = await MatWhItemCost.findOrCreate({
+        where: { itemId, storeId },
+        defaults: { lastCost: null, weightedAvgCost: null, onHandQty: 0 },
+        transaction,
+    });
+    const row = await lockRow(MatWhItemCost, created.id, transaction);
+    const onHand = await getPhysicalBalance(storeId, itemId, undefined, undefined, transaction);
+    const stillHere = Math.min(qtyReceived, Math.max(0, onHand));
+    const previousAvg = row.weightedAvgCost ?? null;
+    let newAvg = previousAvg;
+    if (onHand > 0 && stillHere > 0) {
+        if (oldUnitCost == null || previousAvg == null) {
+            newAvg = previousAvg == null
+                ? newCost
+                : ((onHand - stillHere) * previousAvg + stillHere * newCost) / onHand;
+        } else {
+            newAvg = Math.max(0, previousAvg + ((newCost - Number(oldUnitCost)) * stillHere) / onHand);
+        }
+    }
+    await row.update({
+        lastCost: newCost,
+        weightedAvgCost: newAvg,
+        onHandQty: onHand,
+        currentCost: row.costMethod === 'weightedAvg' ? newAvg : newCost,
+        lastUpdated: new Date(),
+    }, { transaction });
+    return { itemId, storeId, onHand, oldAvg: previousAvg, newAvg };
+}
+
 export async function applyReceiptCost(itemId, storeId, qtyAccepted, unitCost, transaction) {
     if (!qtyAccepted || unitCost == null) return;
 
