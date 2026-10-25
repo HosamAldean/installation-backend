@@ -1111,6 +1111,9 @@ router.get('/issue-by-project', requireAnyOf(
             reservationNo: headerById.get(l.reservationHeaderId)?.reservationNo ?? null,
             itemId: l.itemId,
             itemCode: item?.itemCode ?? null,
+            // Item-level (SKU) barcode, so the phone can match an accessory scan
+            // without a lookup -- variant-lookup only knows variant barcodes.
+            itemBarcode: item?.barcode ?? null,
             itemName: item?.itemName ?? null,
             itemNameAr: item?.itemNameAr ?? null,
             category: item?.category ?? null,
