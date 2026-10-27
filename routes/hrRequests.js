@@ -31,7 +31,7 @@ import {
     HrVisitReportRow,
 } from "../models/index.js";
 import { isSupervisorOf, getSupervisedEmpNos, hasRealSupervisor, getEmpNosWithoutRealSupervisor, getSupervisorUserId, getFallbackManagerUserIds, isGeneralManager } from "../utils/supervisorLookup.js";
-import { isHrScopedRole, getHrQueueEmpNos, isInHrQueueScope, getHrReviewerUserIds, getFinanceReviewerUserIds, getGmReviewerUserIds, getSecondApproverEmpNo, getSecondApprovalSourceEmpNos, secondStageApproverFor, isSecondApproverEmpNo, getUserIdsForEmpNo, INSTALLATION_SECOND_APPROVER_EMP_NO, isEligibleForVisitReport } from "../utils/hrScope.js";
+import { isHrScopedRole, isInHrScope, getHrQueueEmpNos, isInHrQueueScope, getHrReviewerUserIds, getFinanceReviewerUserIds, getGmReviewerUserIds, getSecondApproverEmpNo, getSecondApprovalSourceEmpNos, secondStageApproverFor, isSecondApproverEmpNo, getUserIdsForEmpNo, INSTALLATION_SECOND_APPROVER_EMP_NO, isEligibleForVisitReport } from "../utils/hrScope.js";
 import { resolveEmployeeNames, resolveVacationBalances } from "../utils/employeeLookup.js";
 import { resolveUserNames } from "../utils/userLookup.js";
 import { resolveProjectLabels, withProjectDisplay } from "../utils/projectLookup.js";
@@ -276,6 +276,19 @@ const ATTACHMENT_REQUIRED_MESSAGE = {
 // nobody bothers scrolling the wheel) -- so fromTime alone isn't trustworthy
 // as the real start of the departure.
 const MIN_DEPARTURE_MINUTES = 15;
+
+// Factory-HR employees (hr_factory scope) can't file a leave or departure
+// for a day before today (Amman time) -- per explicit direction
+// 2026-10-27. Sick leave is exempt: it's normally filed after the sick
+// day. Everyone else is unaffected.
+const PAST_DATE_MESSAGE = "لا يمكن تقديم طلب بتاريخ سابق لليوم / A request can't start before today";
+
+async function factoryPastDateError(empNo, kind, leaveType, fromDate) {
+    if (!fromDate || (kind === "leave" && leaveType === "sick")) return null;
+    const today = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Amman" });
+    if (String(fromDate).slice(0, 10) >= today) return null;
+    return (await isInHrScope("hr_factory", empNo)) ? PAST_DATE_MESSAGE : null;
+}
 
 // Real per-employee shift-start time for a given date, resolved the same
 // way the ERP's own attendance system does: PayEmp -> that day's assigned
@@ -532,6 +545,10 @@ router.post("/leave-requests", authenticateToken, attachmentUpload.single("attac
                 message: ATTACHMENT_REQUIRED_MESSAGE[leaveType],
             });
         }
+    }
+    const pastDateError = await factoryPastDateError(empNo, kind, leaveType, fromDate);
+    if (pastDateError) {
+        return res.status(400).json({ success: false, message: pastDateError });
     }
     try {
         const request = await HrLeaveRequest.create({
@@ -1376,6 +1393,10 @@ router.put("/leave-requests/:id", authenticateToken, attachmentUpload.single("at
         }
         if (request.status !== "pending_manager") {
             return res.status(400).json({ success: false, message: "This request has already entered review and can no longer be edited" });
+        }
+        const pastDateError = await factoryPastDateError(request.requesterEmpNo, kind, leaveType, fromDate);
+        if (pastDateError) {
+            return res.status(400).json({ success: false, message: pastDateError });
         }
         if (kind === "leave" && LEAVE_TYPES_REQUIRING_ATTACHMENT.has(leaveType) && !req.file && !request.attachmentUrl) {
             return res.status(400).json({
