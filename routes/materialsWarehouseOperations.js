@@ -198,6 +198,8 @@ router.get('/item-search', requireAnyOf(
     PERMISSIONS.MATERIALS_WAREHOUSE_RECEIVE,
     PERMISSIONS.MATERIALS_WAREHOUSE_PURCHASE_ORDERS,
     PERMISSIONS.MATERIALS_WAREHOUSE_PURCHASING,
+    // The phone's no-barcode item picker -- a stock count's extra item.
+    PERMISSIONS.MATERIALS_WAREHOUSE_STOCK_COUNT,
 ), async (req, res) => {
     const q = String(req.query.q || '').trim();
     if (!q) return res.json({ items: [] });
@@ -225,6 +227,39 @@ router.get('/item-search', requireAnyOf(
     res.json({
         items: items.map((i) => ({ ...i.toJSON(), storeIds: storesByItem.get(i.id) || [] })),
     });
+});
+
+// What a store actually holds, by item + color + length, filtered by
+// partial code/name -- the phone's "pick without barcode" list for
+// transfers and write-offs (and anywhere else a scan would otherwise be
+// the only way in), since store barcoding isn't finished (2026-10-27).
+router.get('/stock-pick', requireAnyOf(
+    PERMISSIONS.MATERIALS_WAREHOUSE_RESERVE,
+    PERMISSIONS.MATERIALS_WAREHOUSE_ISSUE,
+    PERMISSIONS.MATERIALS_WAREHOUSE_RECEIVE,
+    PERMISSIONS.MATERIALS_WAREHOUSE_TRANSFER,
+    PERMISSIONS.MATERIALS_WAREHOUSE_WRITEOFF,
+    PERMISSIONS.MATERIALS_WAREHOUSE_STOCK_COUNT,
+), async (req, res) => {
+    const storeId = Number(req.query.storeId);
+    if (!storeId) return res.status(400).json({ message: 'storeId is required' });
+    if (await denyStore(req, res, storeId)) return;
+    const q = String(req.query.q || '').trim();
+    const like = `%${q}%`;
+    const rows = await sequelizeUtf8.query(
+        `SELECT l.itemId, i.itemCode, i.itemName, i.itemNameAr, i.baseUnit, l.color, l.lengthMm,
+                SUM(CASE WHEN l.direction = 'in' THEN l.qty ELSE -l.qty END) AS onHand
+           FROM matWhStockLedger l
+           JOIN matWhItems i ON i.id = l.itemId
+          WHERE l.storeId = :storeId
+            ${q ? 'AND (i.itemCode LIKE :like OR i.itemName LIKE :like OR i.itemNameAr LIKE :like)' : ''}
+          GROUP BY l.itemId, l.color, l.lengthMm
+         HAVING onHand > 0
+          ORDER BY i.itemCode, l.color, l.lengthMm
+          LIMIT 50`,
+        { replacements: { storeId, like }, type: sequelizeUtf8.QueryTypes.SELECT },
+    );
+    res.json({ items: rows.map((r) => ({ ...r, onHand: Number(r.onHand) })) });
 });
 
 // Resolves a physical piece's real barcode to its (item, color, length) --
