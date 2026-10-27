@@ -642,7 +642,14 @@ const ISSUE_PURPOSES = ['factory_production', 'general_purpose'];
 // this same-day follow-up asked for ("purchase and coating requests need
 // validation...barcode") -- Issue (already shipped), goods-receipt lines,
 // and a coating job's own confirm-send/receive.
+//
+// Store barcoding isn't finished yet (2026-10-27), so a missing barcode is
+// accepted unless MATWH_BARCODE_REQUIRED=1 -- a barcode that IS given is
+// still checked below. Turn the flag on once every bar carries one.
+export const MATWH_BARCODE_REQUIRED = process.env.MATWH_BARCODE_REQUIRED === '1';
+
 export async function requireVariantBarcode(itemId, expectedColor, expectedLengthMm, barcode, actionLabel) {
+    if (!MATWH_BARCODE_REQUIRED && !String(barcode || '').trim()) return;
     const item = await MatWhItem.findByPk(itemId);
     if (item?.category !== 'ALM') return;
     const variantCount = await MatWhItemVariant.count({ where: { itemId, isActive: true } });

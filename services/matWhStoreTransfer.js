@@ -16,6 +16,7 @@ import {
     postLedgerMovement, applyReceiptCost, getAvailableToReserve, normalizeColor, lockItems,
 } from './matWhLedger.js';
 import { findRequestKey, claimRequestKey } from './matWhRequestKeys.js';
+import { MATWH_BARCODE_REQUIRED } from './matWhReservations.js';
 
 const EPS = 0.000001;
 
@@ -228,7 +229,7 @@ export async function lookupBarcode(transferId, code) {
 async function assertBarcodeMatches(line, barcode, variantItemIds) {
     const code = String(barcode || '').trim();
     if (!code) {
-        if (variantItemIds.has(line.itemId)) {
+        if (MATWH_BARCODE_REQUIRED && variantItemIds.has(line.itemId)) {
             throw httpError(400, 'Scan the item barcode to confirm what arrived');
         }
         return;
