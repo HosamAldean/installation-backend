@@ -33,6 +33,8 @@ import {
     confirmReservationLine, rejectReservationLine,
     issueReservationLine, computeHeaderStatus,
     createWithGeneratedNo, requireVariantBarcode, splitOffRemainder, reserveCoatedReturn,
+    approveProductionRequest, rejectProductionRequest,
+    managerApproveLines, managerRejectLine, decideCoatingRequest,
 } from '../services/matWhReservations.js';
 
 const router = express.Router();
@@ -43,6 +45,11 @@ const requireIssue = requirePermission(PERMISSIONS.MATERIALS_WAREHOUSE_ISSUE);
 const requireReceive = requirePermission(PERMISSIONS.MATERIALS_WAREHOUSE_RECEIVE);
 const requireReports = requirePermission(PERMISSIONS.MATERIALS_WAREHOUSE_REPORTS);
 const requireInvoices = requirePermission(PERMISSIONS.MATERIALS_WAREHOUSE_INVOICES);
+const requireStoreManager = requirePermission(PERMISSIONS.MATERIALS_WAREHOUSE_STORE_MANAGER);
+// Coating jobs that may be named to a vendor and sent: approved by the
+// store manager, or older than that approval step.
+const APPROVED_COATING = ['approved', 'not_required'];
+const requireProductionApprove = requirePermission(PERMISSIONS.MATERIALS_WAREHOUSE_PRODUCTION_APPROVE);
 
 // A handful of read endpoints here are legitimately needed by more than
 // one role (checking availability before reserving vs. before issuing).
@@ -75,12 +82,24 @@ const requireReserveOrProduction = requireAnyOf(
 
 // True when the caller reaches reservations only through
 // .production_request -- they see and edit just the requests they created.
-// Admin, store staff (.reserve) and store managers see every request.
+// Admin, store staff (.reserve), store managers and production managers
+// (.production_approve) see every request.
 async function isProductionOnlyCaller(user) {
     if (user.role === 'admin') return false;
     const granted = await getPermissionsForRole(user.role);
     return !granted.includes(PERMISSIONS.MATERIALS_WAREHOUSE_RESERVE)
-        && !granted.includes(PERMISSIONS.MATERIALS_WAREHOUSE_STORE_MANAGER);
+        && !granted.includes(PERMISSIONS.MATERIALS_WAREHOUSE_STORE_MANAGER)
+        && !granted.includes(PERMISSIONS.MATERIALS_WAREHOUSE_PRODUCTION_APPROVE);
+}
+
+// A production-only submitter's request waits for a production manager
+// (2026-10-29); store staff, admin and approvers submit straight to the
+// stores.
+async function needsProductionApproval(user) {
+    if (user.role === 'admin') return false;
+    const granted = await getPermissionsForRole(user.role);
+    return !granted.includes(PERMISSIONS.MATERIALS_WAREHOUSE_RESERVE)
+        && !granted.includes(PERMISSIONS.MATERIALS_WAREHOUSE_PRODUCTION_APPROVE);
 }
 
 async function denyNotOwnRequest(req, res, header) {
@@ -526,6 +545,7 @@ router.get('/reservations', requireAnyOf(
     PERMISSIONS.MATERIALS_WAREHOUSE_RESERVE,
     PERMISSIONS.MATERIALS_WAREHOUSE_STORE_MANAGER,
     PERMISSIONS.MATERIALS_WAREHOUSE_PRODUCTION_REQUEST,
+    PERMISSIONS.MATERIALS_WAREHOUSE_PRODUCTION_APPROVE,
 ), async (req, res) => {
     const where = {};
     if (req.query.projectId) where.projectId = req.query.projectId;
@@ -546,6 +566,7 @@ router.get('/reservations/:id', requireAnyOf(
     PERMISSIONS.MATERIALS_WAREHOUSE_RESERVE,
     PERMISSIONS.MATERIALS_WAREHOUSE_STORE_MANAGER,
     PERMISSIONS.MATERIALS_WAREHOUSE_PRODUCTION_REQUEST,
+    PERMISSIONS.MATERIALS_WAREHOUSE_PRODUCTION_APPROVE,
 ), async (req, res) => {
     const header = await MatWhReservationHeader.findByPk(req.params.id);
     if (!header) return res.status(404).json({ message: 'Not found' });
@@ -752,11 +773,111 @@ router.post('/reservations/:id/submit', requireReserveOrProduction, async (req, 
     if (!header) return res.status(404).json({ message: 'Reservation not found' });
     if (await denyNotOwnRequest(req, res, header)) return;
     try {
-        const header = await submitReservation(Number(req.params.id));
+        const header = await submitReservation(Number(req.params.id), await needsProductionApproval(req.user));
         res.json(header);
     } catch (err) {
         res.status(err.status || 500).json({ message: err.message || 'Failed to submit reservation' });
     }
+});
+
+// Production manager's decision on a request waiting at 'pending_approval'.
+router.post('/reservations/:id/production-approve', requireProductionApprove, async (req, res) => {
+    try {
+        res.json(await approveProductionRequest(Number(req.params.id), req.user.userId));
+    } catch (err) {
+        res.status(err.status || 500).json({ message: err.message || 'Failed to approve request' });
+    }
+});
+
+router.post('/reservations/:id/production-reject', requireProductionApprove, async (req, res) => {
+    try {
+        res.json(await rejectProductionRequest(Number(req.params.id), req.user.userId, req.body?.reason));
+    } catch (err) {
+        res.status(err.status || 500).json({ message: err.message || 'Failed to reject request' });
+    }
+});
+
+// Store manager's approval before issue -- every line waiting on this
+// request in the manager's stores, or just one line.
+router.post('/reservations/:id/manager-approve', requireStoreManager, async (req, res) => {
+    try {
+        res.json(await managerApproveLines(Number(req.params.id), req.user.userId, null, await getAllowedStoreIds(req.user)));
+    } catch (err) {
+        res.status(err.status || 500).json({ message: err.message || 'Failed to approve' });
+    }
+});
+
+router.post('/reservations/:id/items/:lineId/manager-approve', requireStoreManager, async (req, res) => {
+    const line = await MatWhReservationItem.findOne({ where: { id: req.params.lineId, reservationHeaderId: req.params.id } });
+    if (!line) return res.status(404).json({ message: 'Line not found' });
+    if (await denyStore(req, res, line.storeId)) return;
+    try {
+        res.json(await managerApproveLines(Number(req.params.id), req.user.userId, [line.id]));
+    } catch (err) {
+        res.status(err.status || 500).json({ message: err.message || 'Failed to approve' });
+    }
+});
+
+router.post('/reservations/:id/items/:lineId/manager-reject', requireStoreManager, async (req, res) => {
+    const line = await MatWhReservationItem.findOne({ where: { id: req.params.lineId, reservationHeaderId: req.params.id } });
+    if (!line) return res.status(404).json({ message: 'Line not found' });
+    if (await denyStore(req, res, line.storeId)) return;
+    try {
+        res.json(await managerRejectLine(line.id, req.user.userId, req.body?.reason));
+    } catch (err) {
+        res.status(err.status || 500).json({ message: err.message || 'Failed to reject' });
+    }
+});
+
+// The store manager's queue (dashboard): store requests with lines
+// waiting for approval before issue, and coating requests waiting for
+// approval, both limited to the manager's stores.
+router.get('/manager-approvals', requireStoreManager, async (req, res) => {
+    const allowed = await getAllowedStoreIds(req.user);
+    const lines = await MatWhReservationItem.findAll({
+        where: { managerApprovalStatus: 'pending_manager', status: ['confirmed', 'partially_confirmed'], ...storeWhere(allowed) },
+        attributes: ['reservationHeaderId', 'storeId'],
+    });
+    const lineCount = new Map();
+    for (const l of lines) lineCount.set(l.reservationHeaderId, (lineCount.get(l.reservationHeaderId) || 0) + 1);
+    const headers = lineCount.size > 0
+        ? await MatWhReservationHeader.findAll({ where: { id: [...lineCount.keys()] }, order: [['id', 'ASC']] })
+        : [];
+
+    const jobs = await MatWhExternalProcessing.findAll({
+        where: { approvalStatus: 'pending_manager', status: 'draft', ...storeWhere(allowed) },
+        order: [['id', 'ASC']],
+    });
+    const sourceLineIds = [...new Set(jobs.map((j) => j.sourceReservationItemId).filter(Boolean))];
+    const sourceLines = sourceLineIds.length > 0 ? await MatWhReservationItem.findAll({ where: { id: sourceLineIds } }) : [];
+    const lineById = new Map(sourceLines.map((l) => [l.id, l]));
+    const jobHeaderIds = [...new Set(sourceLines.map((l) => l.reservationHeaderId))];
+    const jobHeaders = jobHeaderIds.length > 0 ? await MatWhReservationHeader.findAll({ where: { id: jobHeaderIds } }) : [];
+    const jobHeaderById = new Map(jobHeaders.map((h) => [h.id, h]));
+    const stores = await MatWhStore.findAll({ where: { id: [...new Set(jobs.map((j) => j.storeId)), -1] } });
+    const storeById = new Map(stores.map((s) => [s.id, s]));
+    const groups = new Map();
+    for (const j of jobs) {
+        const header = jobHeaderById.get(lineById.get(j.sourceReservationItemId)?.reservationHeaderId);
+        if (!groups.has(j.requestNo)) {
+            groups.set(j.requestNo, {
+                requestNo: j.requestNo, storeName: storeById.get(j.storeId)?.storeName ?? null,
+                reservationNo: header?.reservationNo ?? null, projectNo: header?.projectNo ?? null,
+                projectName: header?.projectName ?? null, jobs: 0, qty: 0, firstJobId: j.id,
+            });
+        }
+        const g = groups.get(j.requestNo);
+        g.jobs += 1;
+        g.qty += Number(j.qtySent) || 0;
+    }
+
+    res.json({
+        reservations: headers.map((h) => ({
+            id: h.id, reservationNo: h.reservationNo, projectNo: h.projectNo, projectName: h.projectName,
+            requestedByName: h.requestedByName, linesWaiting: lineCount.get(h.id),
+        })),
+        coating: [...groups.values()],
+    });
 });
 
 // Bulk convenience: every still-pending line at once.
@@ -889,7 +1010,7 @@ router.post('/reservations/:id/items/:lineId/substitute', requireReserve, async 
             reservationHeaderId: line.reservationHeaderId, itemId, storeId: line.storeId,
             color: color || null, lengthMm: lengthMm ?? null,
             qtyRequested: qty, qtyReserved: qty, qtyShortfall: 0,
-            status: 'confirmed', reservedBy: req.user.userId, reservedDate: new Date(),
+            status: 'confirmed', reservedBy: req.user.userId, reservedDate: new Date(), managerApprovalStatus: 'pending_manager',
             substitutesLineId: line.id,
         }, { transaction: t });
 
@@ -1007,6 +1128,7 @@ router.get('/issue-candidates', requireIssue, async (req, res) => {
             itemId,
             status: { [Op.in]: ['confirmed', 'partially_confirmed'] },
             qtyReserved: { [Op.gt]: 0 },
+            managerApprovalStatus: { [Op.ne]: 'pending_manager' },
             ...storeWhere(await getAllowedStoreIds(req.user)),
         },
     });
@@ -1083,7 +1205,7 @@ router.get('/issue-by-project/projects', requireAnyOf(
             status: OPEN_LINE_STATUSES,
             ...(allowed ? { storeId: [...allowed] } : {}),
         },
-        attributes: ['reservationHeaderId', 'status', 'qtyReserved'],
+        attributes: ['reservationHeaderId', 'status', 'qtyReserved', 'managerApprovalStatus'],
     });
     const headerById = new Map(headers.map((h) => [h.id, h]));
     const byProject = new Map();
@@ -1098,7 +1220,7 @@ router.get('/issue-by-project/projects', requireAnyOf(
         const p = byProject.get(h.projectId);
         p.requestIds.add(h.id);
         if (l.status === 'pending') p.toConfirm++;
-        else if (Number(l.qtyReserved) > 0) p.toIssue++;
+        else if (Number(l.qtyReserved) > 0 && l.managerApprovalStatus !== 'pending_manager') p.toIssue++;
         if (!p.lastRequestDate || h.reservationDate > p.lastRequestDate) p.lastRequestDate = h.reservationDate;
     }
     const items = [...byProject.values()]
@@ -1192,6 +1314,7 @@ router.get('/issue-by-project', requireAnyOf(
             rejectionReason: l.rejectionReason,
             issuedBarcode: l.issuedBarcode,
             issuePurpose: l.issuePurpose,
+            managerApprovalStatus: l.managerApprovalStatus,
         });
     }
 
@@ -1400,6 +1523,7 @@ router.get('/external-processing', requireAnyOf(
     const allowed = await getAllowedStoreIds(req.user);
     const where = { ...storeWhere(allowed) };
     if (req.query.status) where.status = req.query.status;
+    if (req.query.approvalStatus) where.approvalStatus = req.query.approvalStatus;
     if (req.query.storeId) where.storeId = canActOnStore(allowed, req.query.storeId) ? req.query.storeId : -1;
     if (req.query.processVendorId) where.processVendorId = req.query.processVendorId;
     // Lets ReceiveByItem.tsx pull a scanned item's own sent-but-not-yet-
@@ -1465,6 +1589,12 @@ router.get('/external-processing', requireAnyOf(
     res.json({ items });
 });
 
+// 2026-10-29: this no longer sends anything by itself -- it raises a
+// draft coating request waiting for the store manager (approvalStatus
+// 'pending_manager'), and stock leaves only on a later confirm-send once
+// approved. The availability check here is an early warning; confirm-send
+// checks again at the moment of the real send.
+//
 // Ad-hoc manual send (ExternalProcessing.tsx's own "Send Out" dialog) --
 // the one path into this table that isn't auto-generated from a
 // reservation shortfall. Per the module-wide color+length scoping audit
@@ -1500,21 +1630,15 @@ router.post('/external-processing', requireIssue, async (req, res) => {
 
         const row = await createWithGeneratedNo(MatWhExternalProcessing, 'requestNo', 'COAT', {
             itemId, storeId, processVendorId: processVendorId ?? null, qtySent,
-            lengthMm, sourceColor,
-            sentDate: new Date(), sentBy: req.user.userId,
-        }, t);
-        await postLedgerMovement({
-            storeId, itemId, qty: qtySent, direction: 'out', docType: 'external_send',
-            refType: 'external_processing', refId: row.id, performedBy: req.user.userId,
-            unitCost: (await currentAvgCost(itemId, storeId, t)) ?? undefined,
-            color: sourceColor, lengthMm,
+            lengthMm, sourceColor, status: 'draft', approvalStatus: 'pending_manager',
+            sentDate: null, sentBy: null,
         }, t);
         await t.commit();
         res.status(201).json(row);
     } catch (err) {
         await t.rollback();
-        console.error('External send failed:', err);
-        res.status(500).json({ message: 'Failed to send for processing' });
+        console.error('Coating request failed:', err);
+        res.status(500).json({ message: 'Failed to raise the coating request' });
     }
 });
 
@@ -1618,7 +1742,10 @@ router.post('/external-processing/:id/confirm-send', requireIssue, async (req, r
     if (row.status !== 'draft') {
         return res.status(409).json({ message: `Cannot confirm-send a job in status '${row.status}'` });
     }
-    const { processVendorId } = req.body;
+    if (!APPROVED_COATING.includes(row.approvalStatus)) {
+        return res.status(409).json({ message: 'Waiting for store manager approval' });
+    }
+    const processVendorId = req.body.processVendorId || row.processVendorId;
     if (!processVendorId) {
         return res.status(400).json({ message: 'processVendorId is required' });
     }
@@ -1659,7 +1786,7 @@ router.post('/external-processing/:id/confirm-send', requireIssue, async (req, r
     // would double-count this exact job against itself (only relevant when
     // sourceColor normalizes to mill -- see getAvailableToReserve's own
     // comment on excludeLineId).
-    const sourceColor = normalizeColor(req.body.sourceColor ? String(req.body.sourceColor) : null);
+    const sourceColor = normalizeColor(req.body.sourceColor ? String(req.body.sourceColor) : row.sourceColor);
 
     // No barcode gate here anymore -- per direct request. The explicit
     // color picker (validated server-side against GET /available-colors'
@@ -1756,8 +1883,12 @@ router.post('/external-processing/group/:requestNo/request-vendor', requireIssue
         return res.status(404).json({ message: 'No draft coating jobs found for this request number' });
     }
     if (await denyStore(req, res, ...new Set(rows.map((r) => r.storeId)))) return;
-    await MatWhExternalProcessing.update({ processVendorId }, { where: { requestNo, status: 'draft' } });
-    res.json({ updated: rows.map((r) => r.id) });
+    const approved = rows.filter((r) => APPROVED_COATING.includes(r.approvalStatus));
+    if (approved.length === 0) {
+        return res.status(409).json({ message: 'Waiting for store manager approval' });
+    }
+    await MatWhExternalProcessing.update({ processVendorId }, { where: { id: approved.map((r) => r.id) } });
+    res.json({ updated: approved.map((r) => r.id) });
 });
 
 router.post('/external-processing/group/:requestNo/confirm-send', requireIssue, async (req, res) => {
@@ -1774,13 +1905,18 @@ router.post('/external-processing/group/:requestNo/confirm-send', requireIssue, 
     // own processVendorId is only required as a fallback for a group that
     // skipped that step entirely, matching the pre-existing behavior for
     // every group that doesn't use the new request/acknowledge flow.
-    const processVendorId = rows[0].processVendorId || req.body.processVendorId;
+    const processVendorId = rows.find((r) => APPROVED_COATING.includes(r.approvalStatus) && r.processVendorId)?.processVendorId
+        || req.body.processVendorId;
     if (!processVendorId) {
         return res.status(400).json({ message: 'processVendorId is required' });
     }
 
-    const ready = rows.filter((row) => Number(row.qtySent) > 0);
-    const skipped = rows.filter((row) => !(Number(row.qtySent) > 0));
+    const approvedRows = rows.filter((row) => APPROVED_COATING.includes(row.approvalStatus));
+    if (approvedRows.length === 0) {
+        return res.status(409).json({ message: 'Waiting for store manager approval' });
+    }
+    const ready = approvedRows.filter((row) => Number(row.qtySent) > 0);
+    const skipped = rows.filter((row) => !ready.includes(row));
     if (ready.length === 0) {
         return res.status(409).json({ message: 'No item in this group has received material yet -- nothing to send' });
     }
@@ -1790,7 +1926,7 @@ router.post('/external-processing/group/:requestNo/confirm-send', requireIssue, 
     // stock of" override as the single-job route, just one per job since a
     // group can hold several different items/colors.
     const sourceColors = req.body.sourceColors || {};
-    const sourceColorFor = (row) => normalizeColor(sourceColors[row.id] ? String(sourceColors[row.id]) : null);
+    const sourceColorFor = (row) => normalizeColor(sourceColors[row.id] ? String(sourceColors[row.id]) : row.sourceColor);
 
     // Per direct request: sending the group doesn't have to mean sending
     // every ready job's full received quantity -- an entry here (clamped
@@ -1886,6 +2022,24 @@ router.post('/external-processing/group/:requestNo/confirm-send', requireIssue, 
         updated: toSend.map((row) => row.id),
         skipped: [...skipped, ...heldBack].map((row) => row.id),
     });
+});
+
+// Store manager's decision on a coating request (2026-10-29) -- every job
+// on this requestNo still waiting, within the manager's stores.
+router.post('/external-processing/group/:requestNo/manager-approve', requireStoreManager, async (req, res) => {
+    try {
+        res.json(await decideCoatingRequest(req.params.requestNo, req.user.userId, true, null, await getAllowedStoreIds(req.user)));
+    } catch (err) {
+        res.status(err.status || 500).json({ message: err.message || 'Failed to approve' });
+    }
+});
+
+router.post('/external-processing/group/:requestNo/manager-reject', requireStoreManager, async (req, res) => {
+    try {
+        res.json(await decideCoatingRequest(req.params.requestNo, req.user.userId, false, req.body?.reason, await getAllowedStoreIds(req.user)));
+    } catch (err) {
+        res.status(err.status || 500).json({ message: err.message || 'Failed to reject' });
+    }
 });
 
 // ============================================================

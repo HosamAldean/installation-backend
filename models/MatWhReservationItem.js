@@ -95,6 +95,15 @@ export const MatWhReservationItem = sequelizeUtf8.define('MatWhReservationItem',
     // auto-generated PO (which is left untouched, same "don't implicitly
     // touch an already-raised PO" precedent as releasing a reservation).
     substitutesLineId: { type: DataTypes.INTEGER, allowNull: true },
+    // Store manager's approval before issue (2026-10-29): a store confirm
+    // sets 'pending_manager', and the line can't be issued until a
+    // .store_manager holder approves it ('approved') -- or rejects it, which
+    // also sets status 'rejected' with the reason fields above.
+    // 'not_required' is the default for lines confirmed before this
+    // existed, which stay issuable as they were.
+    managerApprovalStatus: { type: DataTypes.STRING(20), allowNull: false, defaultValue: 'not_required' },
+    managerApprovedBy: { type: DataTypes.INTEGER, allowNull: true },
+    managerApprovedDate: { type: DataTypes.DATE, allowNull: true },
 }, {
     tableName: 'matWhReservationItems',
     timestamps: true,

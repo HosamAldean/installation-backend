@@ -28,6 +28,8 @@ import { PERMISSIONS } from '../constants/permissions.js';
 import { MatWhExternalProcessing } from '../models/MatWhExternalProcessing.js';
 import { MatWhCoatingInvoice } from '../models/MatWhCoatingInvoice.js';
 import { MatWhUserVendorAssignment } from '../models/MatWhUserVendorAssignment.js';
+
+const VISIBLE_APPROVAL = ['approved', 'not_required'];
 import { MatWhItem } from '../models/MatWhItem.js';
 
 const router = express.Router();
@@ -102,7 +104,9 @@ router.get('/requests', async (req, res) => {
     const vendorIds = await getMyVendorIds(req);
     if (!requireVendorIds(res, vendorIds)) return;
 
-    const where = {};
+    // A request the store manager hasn't approved (or rejected) never
+    // reaches Mix (2026-10-29).
+    const where = { approvalStatus: { [Op.in]: VISIBLE_APPROVAL } };
     if (vendorIds !== null) where.processVendorId = { [Op.in]: vendorIds };
     const rows = await MatWhExternalProcessing.findAll({
         where,
@@ -124,7 +128,7 @@ async function getMyGroupRows(req, res) {
     if (!requireVendorIds(res, vendorIds)) return null;
 
     const { requestNo } = req.params;
-    const rows = await MatWhExternalProcessing.findAll({ where: { requestNo } });
+    const rows = await MatWhExternalProcessing.findAll({ where: { requestNo, approvalStatus: { [Op.in]: VISIBLE_APPROVAL } } });
     const inScope = vendorIds === null || rows.every((r) => vendorIds.includes(r.processVendorId));
     if (rows.length === 0 || !inScope) {
         res.status(404).json({ message: 'Not found' });

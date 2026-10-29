@@ -61,6 +61,16 @@ export const MatWhReservationHeader = sequelizeUtf8.define('MatWhReservationHead
     previousProjectName: { type: DataTypes.STRING(255), allowNull: true },
     transferredBy: { type: DataTypes.INTEGER, allowNull: true },
     transferredDate: { type: DataTypes.DATE, allowNull: true },
+    // Production manager's decision (2026-10-29). A request submitted by a
+    // production-only user goes draft -> pending_approval first; approve
+    // moves it on to 'submitted' (the stores), reject ends it as
+    // 'rejected' with the reason below. Store staff, admin and approvers
+    // themselves submit straight to 'submitted', so these stay null.
+    productionApprovedBy: { type: DataTypes.INTEGER, allowNull: true },
+    productionApprovedDate: { type: DataTypes.DATE, allowNull: true },
+    productionRejectedBy: { type: DataTypes.INTEGER, allowNull: true },
+    productionRejectedDate: { type: DataTypes.DATE, allowNull: true },
+    productionRejectionReason: { type: DataTypes.STRING(500), allowNull: true },
 }, {
     tableName: 'matWhReservationHeaders',
     timestamps: true,

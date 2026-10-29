@@ -66,6 +66,10 @@ export const PERMISSIONS = Object.freeze({
     // requests only. Confirm/reject/issue stay with the store's .reserve
     // and .issue.
     MATERIALS_WAREHOUSE_PRODUCTION_REQUEST: 'materials_warehouse.production_request',
+    // Production manager (2026-10-29): approves or rejects a production
+    // request before it reaches the stores. Holders see every request and
+    // submit their own straight to the stores.
+    MATERIALS_WAREHOUSE_PRODUCTION_APPROVE: 'materials_warehouse.production_approve',
     MATERIALS_WAREHOUSE_ISSUE: 'materials_warehouse.issue',
     MATERIALS_WAREHOUSE_PURCHASE_ORDERS: 'materials_warehouse.purchase_orders',
     MATERIALS_WAREHOUSE_INVOICES: 'materials_warehouse.invoices',
@@ -309,6 +313,7 @@ export const PERMISSION_GROUPS = [
             { key: PERMISSIONS.MATERIALS_WAREHOUSE_RECEIVE, labelKey: 'materialsWarehouseReceive' },
             { key: PERMISSIONS.MATERIALS_WAREHOUSE_RESERVE, labelKey: 'materialsWarehouseReserve' },
             { key: PERMISSIONS.MATERIALS_WAREHOUSE_PRODUCTION_REQUEST, labelKey: 'materialsWarehouseProductionRequest' },
+            { key: PERMISSIONS.MATERIALS_WAREHOUSE_PRODUCTION_APPROVE, labelKey: 'materialsWarehouseProductionApprove' },
             { key: PERMISSIONS.MATERIALS_WAREHOUSE_ISSUE, labelKey: 'materialsWarehouseIssue' },
             { key: PERMISSIONS.MATERIALS_WAREHOUSE_PURCHASE_ORDERS, labelKey: 'materialsWarehousePurchaseOrders' },
             { key: PERMISSIONS.MATERIALS_WAREHOUSE_INVOICES, labelKey: 'materialsWarehouseInvoices' },
