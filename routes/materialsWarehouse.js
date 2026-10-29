@@ -22,6 +22,7 @@ import { sequelizeUtf8 } from '../config/db.js';
 import { MatWhStore } from '../models/MatWhStore.js';
 import { MatWhItem } from '../models/MatWhItem.js';
 import { MatWhUserStoreAssignment } from '../models/MatWhUserStoreAssignment.js';
+import { getAllowedStoreIds, storeWhere, canActOnStore, STORE_ROLES } from '../services/matWhStoreAccess.js';
 import { User } from '../models/User.js';
 import { MatWhUserVendorAssignment } from '../models/MatWhUserVendorAssignment.js';
 import { MatWhQcCategory } from '../models/MatWhQcCategory.js';
@@ -141,14 +142,22 @@ router.get('/catalog', async (req, res) => {
 // registry. Kept as one small helper here rather than a full registry +
 // router.param('type', ...) like lookups.js, since these 5 aren't a fixed
 // <table>Id/<table>Name shape and each has its own real field list.
-function crudRoutes(path, model, pkField, searchFields = []) {
+// storeField: the column holding a store id, for a table a store-scoped
+// user only sees their own stores' rows of (services/matWhStoreAccess.js).
+function crudRoutes(path, model, pkField, searchFields = [], storeField = null) {
+    // Another store's row answers 404, the same as not existing.
+    const hiddenRow = async (req, row) => storeField && !canActOnStore(await getAllowedStoreIds(req.user), row[storeField]);
+
     router.get(`/${path}`, async (req, res) => {
         const page = Math.max(1, parseInt(req.query.page) || 1);
         const pageSize = Math.min(200, Math.max(1, parseInt(req.query.pageSize) || 50));
         const search = String(req.query.search || '').trim();
-        const where = search && searchFields.length
-            ? { [Op.or]: searchFields.map((f) => ({ [f]: { [Op.like]: `%${search}%` } })) }
-            : undefined;
+        const where = {
+            ...(search && searchFields.length
+                ? { [Op.or]: searchFields.map((f) => ({ [f]: { [Op.like]: `%${search}%` } })) }
+                : {}),
+            ...(storeField ? storeWhere(await getAllowedStoreIds(req.user), storeField) : {}),
+        };
         const { count, rows } = await model.findAndCountAll({
             where,
             limit: pageSize,
@@ -160,11 +169,15 @@ function crudRoutes(path, model, pkField, searchFields = []) {
 
     router.get(`/${path}/:id`, async (req, res) => {
         const row = await model.findByPk(req.params.id);
-        if (!row) return res.status(404).json({ message: 'Not found' });
+        if (!row || await hiddenRow(req, row)) return res.status(404).json({ message: 'Not found' });
         res.json(row);
     });
 
     router.post(`/${path}`, async (req, res) => {
+        // A store-scoped user couldn't see a store they add
+        if (path === 'stores' && await getAllowedStoreIds(req.user) !== null) {
+            return res.status(403).json({ message: 'Only an admin can add stores' });
+        }
         const attrs = Object.keys(model.getAttributes()).filter((a) => a !== pkField);
         const values = {};
         for (const a of attrs) if (req.body[a] !== undefined) values[a] = req.body[a];
@@ -193,7 +206,7 @@ function crudRoutes(path, model, pkField, searchFields = []) {
 
     router.patch(`/${path}/:id`, async (req, res) => {
         const row = await model.findByPk(req.params.id);
-        if (!row) return res.status(404).json({ message: 'Not found' });
+        if (!row || await hiddenRow(req, row)) return res.status(404).json({ message: 'Not found' });
 
         const attrs = Object.keys(model.getAttributes()).filter((a) => a !== pkField);
         const updates = {};
@@ -213,13 +226,13 @@ function crudRoutes(path, model, pkField, searchFields = []) {
 
     router.delete(`/${path}/:id`, async (req, res) => {
         const row = await model.findByPk(req.params.id);
-        if (!row) return res.status(404).json({ message: 'Not found' });
+        if (!row || await hiddenRow(req, row)) return res.status(404).json({ message: 'Not found' });
         await row.destroy();
         res.json({ message: 'deleted' });
     });
 }
 
-crudRoutes('stores', MatWhStore, 'id', ['storeCode', 'storeName', 'storeNameAr']);
+crudRoutes('stores', MatWhStore, 'id', ['storeCode', 'storeName', 'storeNameAr'], 'id');
 crudRoutes('items', MatWhItem, 'id', ['itemCode', 'itemName', 'itemNameAr', 'barcode']);
 crudRoutes('user-vendor-assignments', MatWhUserVendorAssignment, 'id');
 
@@ -235,6 +248,7 @@ function requireAdmin(req, res, next) {
 
 // Every non-admin user whose role holds any Materials Warehouse permission,
 // plus anyone who already has an assignment row, with their store ids.
+// storeRole: a store role, for whom no stores means none rather than all.
 router.get('/store-access', requireAdmin, async (req, res) => {
     const grants = await sequelizeUtf8.query(
         "SELECT DISTINCT role FROM PermissionGrants WHERE permissionKey LIKE 'materials_warehouse.%'",
@@ -263,6 +277,7 @@ router.get('/store-access', requireAdmin, async (req, res) => {
             userId: u.userId, username: u.username, role: u.role,
             name: [u.firstName, u.lastName].filter(Boolean).join(' ') || null,
             storeIds: storeIdsByUser.get(u.userId) || [],
+            storeRole: STORE_ROLES.has(u.role),
         })),
     });
 });
@@ -276,7 +291,8 @@ async function logStoreAccessChange(req, user, before, after) {
         if (before.join(",") === after.join(",")) return;
         const stores = await MatWhStore.findAll({ where: { id: [...before, ...after] }, attributes: ["id", "storeCode"] });
         const codeById = new Map(stores.map((s) => [s.id, s.storeCode]));
-        const label = (ids) => (ids.length ? ids.map((id) => codeById.get(id) ?? id).join(", ") : "all stores");
+        const none = STORE_ROLES.has(user.role) ? "no stores" : "all stores";
+        const label = (ids) => (ids.length ? ids.map((id) => codeById.get(id) ?? id).join(", ") : none);
         await AdminActionAudit.create({
             module: "matwh_store_access",
             entityType: "user",
@@ -291,8 +307,9 @@ async function logStoreAccessChange(req, user, before, after) {
     }
 }
 
-// Replace one user's whole store set; an empty list means every store
-// again (the default).
+// Replace one user's whole store set. An empty list means no store for a
+// store role, every store for anyone else (services/matWhStoreAccess.js).
+// Also called by the Users page right after creating a storekeeper.
 router.put('/store-access/:userId', requireAdmin, async (req, res) => {
     const userId = Number(req.params.userId);
     const storeIds = [...new Set((req.body?.storeIds || []).map(Number))];
@@ -334,7 +351,7 @@ crudRoutes('vendors', Vendor, 'vendorId', ['vendorName', 'vendorDesc']);
 router.get('/items/:id/stores', async (req, res) => {
     const item = await MatWhItem.findByPk(req.params.id);
     if (!item) return res.status(404).json({ message: 'Item not found' });
-    const rows = await MatWhItemStore.findAll({ where: { itemId: item.id } });
+    const rows = await MatWhItemStore.findAll({ where: { itemId: item.id, ...storeWhere(await getAllowedStoreIds(req.user)) } });
     res.json({
         storeIds: rows.map((r) => r.storeId),
         // Per-store general location (WH gap #9) -- keyed by storeId so the
@@ -371,7 +388,11 @@ router.put('/items/:id/stores', async (req, res) => {
             .map((s) => [s.storeId, s]),
     );
 
-    const existing = await MatWhItemStore.findAll({ where: { itemId: item.id } });
+    // A store-scoped user only sees and changes their own stores' rows;
+    // the item's other stores are left as they are.
+    const allowed = await getAllowedStoreIds(req.user);
+    for (const id of [...submitted.keys()]) if (!canActOnStore(allowed, id)) submitted.delete(id);
+    const existing = await MatWhItemStore.findAll({ where: { itemId: item.id, ...storeWhere(allowed) } });
     const existingByStoreId = new Map(existing.map((r) => [r.storeId, r]));
 
     const toRemove = existing.filter((r) => !submitted.has(r.storeId));
@@ -387,7 +408,7 @@ router.put('/items/:id/stores', async (req, res) => {
         }
     }
 
-    const rows = await MatWhItemStore.findAll({ where: { itemId: item.id } });
+    const rows = await MatWhItemStore.findAll({ where: { itemId: item.id, ...storeWhere(allowed) } });
     res.json({
         storeIds: rows.map((r) => r.storeId),
         stores: rows.map((r) => ({

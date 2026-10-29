@@ -25,7 +25,7 @@ import { MatWhPurchaseOrderItem } from '../models/MatWhPurchaseOrderItem.js';
 import { MatWhStockLedger } from '../models/MatWhStockLedger.js';
 import { User } from '../models/User.js';
 import { postLedgerMovement, getAvailableToReserve, getAlreadyReserved, getPendingQty, getPhysicalBalance, normalizeColor, getAvailableColorsForItem, lockRow, lockItems, currentAvgCost, addValueToStock } from '../services/matWhLedger.js';
-import { denyStore, getAllowedStoreIds } from '../services/matWhStoreAccess.js';
+import { denyStore, getAllowedStoreIds, storeWhere, filterStores, canActOnStore } from '../services/matWhStoreAccess.js';
 import { normalizeRequestKey, findRequestKey, claimRequestKey } from '../services/matWhRequestKeys.js';
 import {
     createReservationHeader, submitReservation,
@@ -103,6 +103,7 @@ router.get('/stock-balance', requireAnyOf(
     const storeId = parseInt(req.query.storeId);
     const itemId = parseInt(req.query.itemId);
     if (!storeId || !itemId) return res.status(400).json({ message: 'storeId and itemId are required' });
+    if (await denyStore(req, res, storeId)) return;
     // excludeLineId lets a reservation line already counted in
     // alreadyReserved exclude itself when re-checking availability while
     // being edited (not yet used by the frontend, but avoids the line
@@ -159,7 +160,8 @@ router.get('/store-lookup', requireAnyOf(
     PERMISSIONS.MATERIALS_WAREHOUSE_ISSUE,
     PERMISSIONS.MATERIALS_WAREHOUSE_RECEIVE,
 ), async (req, res) => {
-    const rows = await MatWhStore.findAll({ where: { isActive: true }, order: [['storeName', 'ASC']] });
+    const allowed = await getAllowedStoreIds(req.user);
+    const rows = await MatWhStore.findAll({ where: { isActive: true, ...storeWhere(allowed, 'id') }, order: [['storeName', 'ASC']] });
     res.json({ items: rows });
 });
 
@@ -181,7 +183,8 @@ router.get('/item-lookup', requireAnyOf(
     // storeIds: which real store(s) this item is actually kept in (see
     // MatWhItemStore.js) -- empty means no evidence either way, treated as
     // store-flexible by the caller (any store selectable), never a guess.
-    const itemStores = await MatWhItemStore.findAll({ where: { itemId: item.id }, attributes: ['storeId'] });
+    const allowed = await getAllowedStoreIds(req.user);
+    const itemStores = await MatWhItemStore.findAll({ where: { itemId: item.id, ...storeWhere(allowed) }, attributes: ['storeId'] });
     res.json({ ...item.toJSON(), storeIds: itemStores.map((s) => s.storeId) });
 });
 
@@ -216,7 +219,7 @@ router.get('/item-search', requireAnyOf(
         limit: 30,
     });
     const itemStores = await MatWhItemStore.findAll({
-        where: { itemId: items.map((i) => i.id) },
+        where: { itemId: items.map((i) => i.id), ...storeWhere(await getAllowedStoreIds(req.user)) },
         attributes: ['itemId', 'storeId'],
     });
     const storesByItem = new Map();
@@ -336,6 +339,7 @@ router.get('/available-colors', requireAnyOf(
     const itemId = Number(req.query.itemId);
     const storeId = Number(req.query.storeId);
     if (!itemId || !storeId) return res.status(400).json({ message: 'itemId and storeId are required' });
+    if (await denyStore(req, res, storeId)) return;
     const lengthMm = req.query.lengthMm ? Number(req.query.lengthMm) : undefined;
 
     const colors = await getAvailableColorsForItem(storeId, itemId, lengthMm);
@@ -494,8 +498,9 @@ router.get('/projects/search', requireAnyOf(
 router.get('/stock-ledger', requireReports, async (req, res) => {
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const pageSize = Math.min(200, Math.max(1, parseInt(req.query.pageSize) || 50));
-    const where = {};
-    if (req.query.storeId) where.storeId = req.query.storeId;
+    const allowed = await getAllowedStoreIds(req.user);
+    const where = { ...storeWhere(allowed) };
+    if (req.query.storeId) where.storeId = canActOnStore(allowed, req.query.storeId) ? req.query.storeId : -1;
     if (req.query.itemId) where.itemId = req.query.itemId;
     if (req.query.docType) where.docType = req.query.docType;
 
@@ -526,6 +531,13 @@ router.get('/reservations', requireAnyOf(
     if (req.query.projectId) where.projectId = req.query.projectId;
     if (req.query.status) where.status = req.query.status;
     if (await isProductionOnlyCaller(req.user)) where.createdBy = req.user.userId;
+    // A store-scoped caller sees requests with a line in one of their
+    // stores, plus their own.
+    const allowed = await getAllowedStoreIds(req.user);
+    if (allowed !== null) {
+        const lines = await MatWhReservationItem.findAll({ where: storeWhere(allowed), attributes: ['reservationHeaderId'] });
+        where[Op.or] = [{ id: [...new Set(lines.map((l) => l.reservationHeaderId)), -1] }, { createdBy: req.user.userId }];
+    }
     const rows = await MatWhReservationHeader.findAll({ where, order: [['id', 'DESC']] });
     res.json({ items: rows });
 });
@@ -538,9 +550,17 @@ router.get('/reservations/:id', requireAnyOf(
     const header = await MatWhReservationHeader.findByPk(req.params.id);
     if (!header) return res.status(404).json({ message: 'Not found' });
     if (await denyNotOwnRequest(req, res, header)) return;
-    const items = await MatWhReservationItem.findAll({
+    let items = await MatWhReservationItem.findAll({
         where: { reservationHeaderId: header.id }, order: [['id', 'ASC']],
     });
+    // Store-scoped: only the lines of the caller's stores (all of them on
+    // their own request); none at all -> not theirs to see.
+    if (header.createdBy !== req.user.userId) {
+        const allowed = await getAllowedStoreIds(req.user);
+        const own = filterStores(allowed, items, 'storeId');
+        if (allowed !== null && items.length > 0 && own.length === 0) return res.status(404).json({ message: 'Not found' });
+        items = own;
+    }
 
     // Surface each line's linked PO item's targetColor, if any -- lets the
     // UI explain why a partially_confirmed line's auto-PO shows color: null
@@ -987,6 +1007,7 @@ router.get('/issue-candidates', requireIssue, async (req, res) => {
             itemId,
             status: { [Op.in]: ['confirmed', 'partially_confirmed'] },
             qtyReserved: { [Op.gt]: 0 },
+            ...storeWhere(await getAllowedStoreIds(req.user)),
         },
     });
     if (lines.length === 0) return res.json({ items: [] });
@@ -1354,7 +1375,7 @@ router.post('/feasibility-checks', requireReserve, async (req, res) => {
 });
 
 router.get('/feasibility-checks', requireReserve, async (req, res) => {
-    const where = {};
+    const where = { ...storeWhere(await getAllowedStoreIds(req.user)) };
     if (req.query.projectId) where.projectId = req.query.projectId;
     if (req.query.itemId) where.itemId = req.query.itemId;
     const rows = await MatWhFeasibilityCheck.findAll({ where, order: [['id', 'DESC']] });
@@ -1376,9 +1397,10 @@ router.get('/external-processing', requireAnyOf(
     // vendor's requests, not just storekeepers who can also send/receive.
     PERMISSIONS.MATERIALS_WAREHOUSE_INVOICES,
 ), async (req, res) => {
-    const where = {};
+    const allowed = await getAllowedStoreIds(req.user);
+    const where = { ...storeWhere(allowed) };
     if (req.query.status) where.status = req.query.status;
-    if (req.query.storeId) where.storeId = req.query.storeId;
+    if (req.query.storeId) where.storeId = canActOnStore(allowed, req.query.storeId) ? req.query.storeId : -1;
     if (req.query.processVendorId) where.processVendorId = req.query.processVendorId;
     // Lets ReceiveByItem.tsx pull a scanned item's own sent-but-not-yet-
     // received-back coating jobs alongside its PO candidates, per direct

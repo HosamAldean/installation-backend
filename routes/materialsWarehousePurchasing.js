@@ -34,7 +34,7 @@ import { MatWhItemStore } from '../models/MatWhItemStore.js';
 import { Vendor } from '../models/Vendor.js';
 import { User } from '../models/User.js';
 import { postLedgerMovement, applyReceiptCost, trueUpReceiptCost, normalizeColor, lockRow } from '../services/matWhLedger.js';
-import { denyStore } from '../services/matWhStoreAccess.js';
+import { denyStore, getAllowedStoreIds, storeWhere, canActOnStore } from '../services/matWhStoreAccess.js';
 import { normalizeRequestKey, findRequestKey, claimRequestKey } from '../services/matWhRequestKeys.js';
 import { createCoatingJob, requireVariantBarcode } from '../services/matWhReservations.js';
 import { MatWhReservationItem } from '../models/MatWhReservationItem.js';
@@ -98,10 +98,19 @@ function requirePurchaseOrdersReadAccess(req, res, next) {
 // Purchase Orders
 // ============================================================
 
+// A store-scoped caller (services/matWhStoreAccess.js) only sees purchase
+// orders for their own stores, and the receipts/invoices hanging off them.
+async function scopedPoWhere(req, field = 'purchaseOrderId') {
+    const allowed = await getAllowedStoreIds(req.user);
+    if (allowed === null) return {};
+    const pos = await MatWhPurchaseOrder.findAll({ where: storeWhere(allowed, 'destinationStoreId'), attributes: ['id'] });
+    return { [field]: [...pos.map((p) => p.id), -1] };
+}
+
 router.get('/purchase-orders', requirePurchaseOrdersReadAccess, async (req, res) => {
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const pageSize = Math.min(200, Math.max(1, parseInt(req.query.pageSize) || 50));
-    const where = {};
+    const where = { ...storeWhere(await getAllowedStoreIds(req.user), 'destinationStoreId') };
     if (req.query.status) where.status = req.query.status;
     if (req.query.vendorId) where.vendorId = req.query.vendorId;
     // Lets the Store Manager dashboard ask for exactly what's awaiting
@@ -121,7 +130,7 @@ router.get('/purchase-orders', requirePurchaseOrdersReadAccess, async (req, res)
 
 router.get('/purchase-orders/:id', requirePurchaseOrdersReadAccess, async (req, res) => {
     const po = await MatWhPurchaseOrder.findByPk(req.params.id);
-    if (!po) return res.status(404).json({ message: 'Not found' });
+    if (!po || !canActOnStore(await getAllowedStoreIds(req.user), po.destinationStoreId)) return res.status(404).json({ message: 'Not found' });
     const items = await MatWhPurchaseOrderItem.findAll({ where: { purchaseOrderId: po.id } });
     res.json({ ...po.toJSON(), items });
 });
@@ -461,8 +470,8 @@ router.post('/purchase-orders/:id/manager-confirm', requireStoreManager, async (
 // ============================================================
 
 router.get('/goods-receipts', requireReceive, async (req, res) => {
-    const where = {};
-    if (req.query.purchaseOrderId) where.purchaseOrderId = req.query.purchaseOrderId;
+    const where = { ...(await scopedPoWhere(req)) };
+    if (req.query.purchaseOrderId) where[Op.and] = [{ purchaseOrderId: req.query.purchaseOrderId }];
     if (req.query.invoiceStatus) where.invoiceStatus = req.query.invoiceStatus;
     const rows = await MatWhGoodsReceipt.findAll({ where, order: [['id', 'DESC']] });
 
@@ -492,7 +501,7 @@ router.get('/goods-receipts/overdue-invoices', requireReceive, async (req, res) 
     const days = Math.max(1, parseInt(req.query.days) || 7);
     const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
     const rows = await MatWhGoodsReceipt.findAll({
-        where: { invoiceStatus: 'pending', receivedDate: { [Op.lt]: cutoff } },
+        where: { invoiceStatus: 'pending', receivedDate: { [Op.lt]: cutoff }, ...(await scopedPoWhere(req)) },
         order: [['receivedDate', 'ASC']],
     });
     res.json({ items: rows, thresholdDays: days });
@@ -500,7 +509,8 @@ router.get('/goods-receipts/overdue-invoices', requireReceive, async (req, res) 
 
 router.get('/goods-receipts/:id', requireReceive, async (req, res) => {
     const gr = await MatWhGoodsReceipt.findByPk(req.params.id);
-    if (!gr) return res.status(404).json({ message: 'Not found' });
+    const grPo = gr ? await MatWhPurchaseOrder.findByPk(gr.purchaseOrderId) : null;
+    if (!gr || (grPo && !canActOnStore(await getAllowedStoreIds(req.user), grPo.destinationStoreId))) return res.status(404).json({ message: 'Not found' });
     const items = await MatWhGoodsReceiptItem.findAll({ where: { goodsReceiptId: gr.id } });
     res.json({ ...gr.toJSON(), items });
 });
@@ -544,6 +554,7 @@ router.get('/goods-receipt-candidates', requireReceive, async (req, res) => {
     let matchedPo = null;
     if (poNo) {
         matchedPo = await MatWhPurchaseOrder.findOne({ where: { poNo } });
+        if (matchedPo && !canActOnStore(await getAllowedStoreIds(req.user), matchedPo.destinationStoreId)) matchedPo = null;
         if (!matchedPo) return res.json({ items: [], poFound: false });
         poItems = await MatWhPurchaseOrderItem.findAll({ where: { purchaseOrderId: matchedPo.id } });
     } else {
@@ -561,7 +572,10 @@ router.get('/goods-receipt-candidates', requireReceive, async (req, res) => {
     // every line is fully received (received/invoiced can happen in either
     // order and repeat, per this module's own status design).
     const pos = await MatWhPurchaseOrder.findAll({
-        where: { id: poItems.map((i) => i.purchaseOrderId), status: { [Op.notIn]: ['draft', 'closed'] } },
+        where: {
+            id: poItems.map((i) => i.purchaseOrderId), status: { [Op.notIn]: ['draft', 'closed'] },
+            ...storeWhere(await getAllowedStoreIds(req.user), 'destinationStoreId'),
+        },
     });
     const poById = new Map(pos.map((p) => [p.id, p]));
 
@@ -882,8 +896,8 @@ router.get('/goods-receipt-items/:id/qc-results', requireReceive, async (req, re
 // ============================================================
 
 router.get('/supplier-invoices', requireInvoices, async (req, res) => {
-    const where = {};
-    if (req.query.purchaseOrderId) where.purchaseOrderId = req.query.purchaseOrderId;
+    const where = { ...(await scopedPoWhere(req)) };
+    if (req.query.purchaseOrderId) where[Op.and] = [{ purchaseOrderId: req.query.purchaseOrderId }];
     const rows = await MatWhSupplierInvoice.findAll({ where, order: [['id', 'DESC']] });
     res.json({ items: rows });
 });

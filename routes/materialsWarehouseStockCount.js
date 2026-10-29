@@ -21,7 +21,7 @@ import { MatWhStockCountLine } from '../models/MatWhStockCountLine.js';
 import { MatWhStore } from '../models/MatWhStore.js';
 import { MatWhItem } from '../models/MatWhItem.js';
 import { MatWhItemVariant } from '../models/MatWhItemVariant.js';
-import { denyStore } from '../services/matWhStoreAccess.js';
+import { denyStore, getAllowedStoreIds, storeWhere, canActOnStore } from '../services/matWhStoreAccess.js';
 import { normalizeRequestKey, runOnceWithKey } from '../services/matWhRequestKeys.js';
 import {
     createStockCount, countLine, addExtraLine, lookupBarcode, submitStockCount, cancelStockCount,
@@ -89,8 +89,9 @@ async function storeNames(storeIds) {
 // gated to reserve/issue/receive and so unreachable for a counter-only
 // role. Declared before /stock-counts/:id so 'options' isn't read as an id.
 router.get('/stock-counts/options', requireAnyStockCountAccess, async (req, res) => {
-    const storeId = req.query.storeId ? Number(req.query.storeId) : null;
-    const stores = await MatWhStore.findAll({ where: { isActive: true }, order: [['storeName', 'ASC']] });
+    const allowed = await getAllowedStoreIds(req.user);
+    const storeId = req.query.storeId && canActOnStore(allowed, req.query.storeId) ? Number(req.query.storeId) : null;
+    const stores = await MatWhStore.findAll({ where: { isActive: true, ...storeWhere(allowed, 'id') }, order: [['storeName', 'ASC']] });
     let categories = [];
     let zones = [];
     if (storeId) {
@@ -137,9 +138,10 @@ router.get('/stock-counts/item-search', requireAnyStockCountAccess, async (req, 
 });
 
 router.get('/stock-counts', requireAnyStockCountAccess, async (req, res) => {
-    const where = {};
+    const allowed = await getAllowedStoreIds(req.user);
+    const where = { ...storeWhere(allowed) };
     if (req.query.status) where.status = req.query.status;
-    if (req.query.storeId) where.storeId = Number(req.query.storeId);
+    if (req.query.storeId) where.storeId = canActOnStore(allowed, req.query.storeId) ? Number(req.query.storeId) : -1;
     const counts = await MatWhStockCount.findAll({ where, order: [['id', 'DESC']], limit: 200 });
     const ids = counts.map((c) => c.id);
     const [stores, progress] = await Promise.all([
@@ -169,7 +171,7 @@ router.get('/stock-counts', requireAnyStockCountAccess, async (req, res) => {
 
 router.get('/stock-counts/:id', requireAnyStockCountAccess, async (req, res) => {
     const count = await MatWhStockCount.findByPk(req.params.id);
-    if (!count) return res.status(404).json({ message: 'Not found' });
+    if (!count || !canActOnStore(await getAllowedStoreIds(req.user), count.storeId)) return res.status(404).json({ message: 'Not found' });
     const lines = await MatWhStockCountLine.findAll({
         where: { stockCountId: count.id },
         order: [['zone', 'ASC'], ['locationColumn', 'ASC'], ['locationRow', 'ASC'], ['id', 'ASC']],
@@ -225,7 +227,7 @@ router.post('/stock-counts', requireCount, async (req, res) => {
     }
 });
 
-router.get('/stock-counts/:id/lookup', requireAnyStockCountAccess, async (req, res) => {
+router.get('/stock-counts/:id/lookup', requireAnyStockCountAccess, requireCountStore, async (req, res) => {
     const code = String(req.query.barcode || '').trim();
     if (!code) return res.status(400).json({ message: 'barcode is required' });
     try {
