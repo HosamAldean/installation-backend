@@ -197,6 +197,7 @@ export const ASSIGNABLE_ROLES = [
     'employee',
     'shipping_manager',
     'material_user',
+    'store_manager',
     'sales',
     'sales_manager',
     'accounting',
@@ -302,7 +303,7 @@ export const PERMISSION_GROUPS = [
         // owning phase (WH.2/WH.3) ships the actual routes.
         module: 'materialsWarehouse',
         label: 'Materials Warehouse',
-        roles: ['material_user', 'production', 'accounting', 'accounting_manager', 'mix_employee', 'mix_manager'],
+        roles: ['material_user', 'store_manager', 'production', 'accounting', 'accounting_manager', 'mix_employee', 'mix_manager'],
         items: [
             { key: PERMISSIONS.MATERIALS_WAREHOUSE_LANDING, labelKey: 'materialsWarehouseLanding' },
             { key: PERMISSIONS.MATERIALS_WAREHOUSE_RECEIVE, labelKey: 'materialsWarehouseReceive' },
