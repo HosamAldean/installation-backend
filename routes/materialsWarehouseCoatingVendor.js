@@ -27,6 +27,7 @@ import { requirePermission } from '../middleware/permissions.js';
 import { PERMISSIONS } from '../constants/permissions.js';
 import { MatWhExternalProcessing } from '../models/MatWhExternalProcessing.js';
 import { MatWhCoatingInvoice } from '../models/MatWhCoatingInvoice.js';
+import { coatingInvoiceCandidates, createCoatingInvoice, withCoatingInvoiceLines } from '../services/matWhInvoices.js';
 import { MatWhUserVendorAssignment } from '../models/MatWhUserVendorAssignment.js';
 
 const VISIBLE_APPROVAL = ['approved', 'not_required'];
@@ -215,7 +216,12 @@ router.get('/group/:requestNo/invoices', async (req, res) => {
         where: { requestNo: req.params.requestNo },
         order: [['id', 'DESC']],
     });
-    res.json({ items: invoices });
+    // Lines and billable items (2026-10-29) -- the candidates carry no
+    // store/project fields, same as every other view in this portal.
+    res.json({
+        items: await withCoatingInvoiceLines(invoices),
+        candidates: await coatingInvoiceCandidates(req.params.requestNo),
+    });
 });
 
 // Step 5 -- mix_manager only. processVendorId is deliberately taken from
@@ -235,18 +241,22 @@ router.post('/group/:requestNo/invoices', requireInvoicePermission, async (req, 
     if (!vendorInvoiceNo) {
         return res.status(400).json({ message: 'vendorInvoiceNo is required' });
     }
-    const row = await MatWhCoatingInvoice.create({
-        requestNo: req.params.requestNo,
-        processVendorId: rows[0].processVendorId,
-        vendorInvoiceNo,
-        invDate: invDate || null,
-        invDueDate: invDueDate || null,
-        invReceivedDate: invReceivedDate ? new Date(invReceivedDate) : new Date(),
-        paintingCost: paintingCost !== undefined && paintingCost !== '' ? Number(paintingCost) : null,
-        notes: notes || null,
-        enteredBy: req.user.userId,
-    });
-    res.status(201).json(row);
+    try {
+        // Per-kg lines (req.body.lines) make paintingCost their sum.
+        const row = await createCoatingInvoice(req.params.requestNo, {
+            processVendorId: rows[0].processVendorId,
+            vendorInvoiceNo,
+            invDate: invDate || null,
+            invDueDate: invDueDate || null,
+            invReceivedDate: invReceivedDate ? new Date(invReceivedDate) : new Date(),
+            paintingCost: paintingCost !== undefined && paintingCost !== '' ? Number(paintingCost) : null,
+            notes: notes || null,
+            enteredBy: req.user.userId,
+        }, req.body.lines);
+        res.status(201).json(row);
+    } catch (err) {
+        res.status(err.status || 500).json({ message: err.message || 'Failed to save invoice' });
+    }
 });
 
 export default router;

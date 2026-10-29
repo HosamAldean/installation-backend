@@ -26,6 +26,8 @@ import { MatWhGoodsReceiptItem } from '../models/MatWhGoodsReceiptItem.js';
 import { MatWhQcResult } from '../models/MatWhQcResult.js';
 import { MatWhSupplierInvoice } from '../models/MatWhSupplierInvoice.js';
 import { MatWhSupplierInvoiceItem } from '../models/MatWhSupplierInvoiceItem.js';
+import { MatWhSupplierInvoiceExtra } from '../models/MatWhSupplierInvoiceExtra.js';
+import { computeSupplierInvoice } from '../services/matWhInvoices.js';
 import { MatWhStockLedger } from '../models/MatWhStockLedger.js';
 import { MatWhExternalProcessing } from '../models/MatWhExternalProcessing.js';
 import { MatWhItem } from '../models/MatWhItem.js';
@@ -132,7 +134,18 @@ router.get('/purchase-orders/:id', requirePurchaseOrdersReadAccess, async (req, 
     const po = await MatWhPurchaseOrder.findByPk(req.params.id);
     if (!po || !canActOnStore(await getAllowedStoreIds(req.user), po.destinationStoreId)) return res.status(404).json({ message: 'Not found' });
     const items = await MatWhPurchaseOrderItem.findAll({ where: { purchaseOrderId: po.id } });
-    res.json({ ...po.toJSON(), items });
+    // Accepted qty per PO line across this PO's receipts -- the invoice
+    // form defaults each line's invoiced qty to it (2026-10-29).
+    const grIds = (await MatWhGoodsReceipt.findAll({ where: { purchaseOrderId: po.id }, attributes: ['id'] })).map((g) => g.id);
+    const grItems = grIds.length > 0 ? await MatWhGoodsReceiptItem.findAll({ where: { goodsReceiptId: grIds } }) : [];
+    const receivedByPoItem = new Map();
+    for (const g of grItems) {
+        if (g.poItemId) receivedByPoItem.set(g.poItemId, (receivedByPoItem.get(g.poItemId) || 0) + Number(g.qtyAccepted));
+    }
+    res.json({
+        ...po.toJSON(),
+        items: items.map((i) => ({ ...i.toJSON(), qtyReceived: receivedByPoItem.get(i.id) ?? 0 })),
+    });
 });
 
 // Shared per-line shape validation -- same rule set the create route and
@@ -906,7 +919,23 @@ router.get('/supplier-invoices/:id', requireInvoices, async (req, res) => {
     const inv = await MatWhSupplierInvoice.findByPk(req.params.id);
     if (!inv) return res.status(404).json({ message: 'Not found' });
     const items = await MatWhSupplierInvoiceItem.findAll({ where: { supplierInvoiceId: inv.id } });
-    res.json({ ...inv.toJSON(), items });
+    const extras = await MatWhSupplierInvoiceExtra.findAll({ where: { supplierInvoiceId: inv.id }, order: [['id', 'ASC']] });
+    let priceWarnings = [];
+    try { priceWarnings = inv.priceWarnings ? JSON.parse(inv.priceWarnings) : []; } catch { /* keep [] */ }
+    res.json({ ...inv.toJSON(), items, extras, priceWarnings });
+});
+
+// The same numbers POST /supplier-invoices would save -- landed cost per
+// line, totals, and the price check against the PO -- without saving, so
+// the form can show them before the invoice is entered.
+router.post('/supplier-invoices/preview', requireInvoices, async (req, res) => {
+    const po = await MatWhPurchaseOrder.findByPk(req.body.purchaseOrderId);
+    if (!po) return res.status(404).json({ message: 'Purchase order not found' });
+    try {
+        res.json(await computeSupplierInvoice(po, req.body));
+    } catch (err) {
+        res.status(err.status || 500).json({ message: err.message || 'Failed to calculate invoice' });
+    }
 });
 
 // Creates the invoice and, if it names a goodsReceiptId, matches back to
@@ -929,28 +958,51 @@ router.post('/supplier-invoices', requireInvoices, async (req, res) => {
     const po = await MatWhPurchaseOrder.findByPk(purchaseOrderId);
     if (!po) return res.status(404).json({ message: 'Purchase order not found' });
 
+    // Landed cost, totals and the PO price check (2026-10-29) -- see
+    // services/matWhInvoices.js. Invalid input is a 400 before anything
+    // is written.
+    let calc;
+    try {
+        calc = await computeSupplierInvoice(po, req.body);
+    } catch (err) {
+        return res.status(err.status || 500).json({ message: err.message || 'Failed to calculate invoice' });
+    }
+
     const t = await sequelizeUtf8.transaction();
     try {
-        const netAmt = items.reduce((sum, i) => sum + Number(i.qty) * Number(i.unitPrice), 0);
         const matchStatus = goodsReceiptId ? 'matched' : 'unmatched';
 
         const inv = await MatWhSupplierInvoice.create({
             purchaseOrderId, goodsReceiptId: goodsReceiptId ?? null, vendorInvoiceNo,
-            invDate, invDueDate, netAmt, matchStatus,
+            invDate, invDueDate, netAmt: calc.netAmt, matchStatus,
             invReceivedDate: invReceivedDate ? new Date(invReceivedDate) : new Date(),
             enteredBy: req.user.userId,
+            currency: calc.currency, exchangeRate: calc.exchangeRate,
+            discountAmt: calc.discountAmt, vatRate: calc.vatRate, vatAmt: calc.vatAmt, grossAmt: calc.grossAmt,
+            extraCostsJod: calc.extraCostsJod, landedTotalJod: calc.landedTotalJod,
+            priceWarnings: calc.warnings.length ? JSON.stringify(calc.warnings) : null,
         }, { transaction: t });
 
-        const unitPriceByItemId = new Map();
-        for (const line of items) {
+        // A receipt line takes the landed cost of the invoice line for its
+        // own PO line first (keeps aluminium colour/length variants apart),
+        // else of the invoice line for the same item.
+        const costByPoItemId = new Map();
+        const costByItemId = new Map();
+        for (const line of calc.lines) {
             await MatWhSupplierInvoiceItem.create({
                 supplierInvoiceId: inv.id,
                 itemId: line.itemId,
                 qty: line.qty,
                 unitPrice: line.unitPrice,
-                lineAmt: Number(line.qty) * Number(line.unitPrice),
+                lineAmt: line.lineAmt,
+                poItemId: line.poItemId,
+                landedUnitCost: line.landedUnitCost,
             }, { transaction: t });
-            unitPriceByItemId.set(Number(line.itemId), Number(line.unitPrice));
+            if (line.poItemId) costByPoItemId.set(line.poItemId, line.landedUnitCost);
+            costByItemId.set(line.itemId, line.landedUnitCost);
+        }
+        for (const extra of calc.extras) {
+            await MatWhSupplierInvoiceExtra.create({ supplierInvoiceId: inv.id, ...extra }, { transaction: t });
         }
 
         if (goodsReceiptId) {
@@ -959,7 +1011,8 @@ router.post('/supplier-invoices', requireInvoices, async (req, res) => {
                 await gr.update({ invoiceStatus: 'matched' }, { transaction: t });
                 const grItems = await MatWhGoodsReceiptItem.findAll({ where: { goodsReceiptId }, transaction: t });
                 for (const grItem of grItems) {
-                    const finalUnitCost = unitPriceByItemId.get(grItem.itemId);
+                    const finalUnitCost = (grItem.poItemId && costByPoItemId.get(grItem.poItemId))
+                        ?? costByItemId.get(grItem.itemId);
                     if (finalUnitCost === undefined) continue;
                     await grItem.update({ finalUnitCost }, { transaction: t });
 
@@ -992,7 +1045,7 @@ router.post('/supplier-invoices', requireInvoices, async (req, res) => {
         }
 
         await t.commit();
-        res.status(201).json({ id: inv.id });
+        res.status(201).json({ id: inv.id, warnings: calc.warnings, landedTotalJod: calc.landedTotalJod });
     } catch (err) {
         await t.rollback();
         console.error('Error creating supplier invoice:', err);

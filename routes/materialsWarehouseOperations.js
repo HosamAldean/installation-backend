@@ -20,6 +20,8 @@ import { MatWhItemVariant } from '../models/MatWhItemVariant.js';
 import { MatWhFeasibilityCheck } from '../models/MatWhFeasibilityCheck.js';
 import { MatWhExternalProcessing } from '../models/MatWhExternalProcessing.js';
 import { MatWhCoatingInvoice } from '../models/MatWhCoatingInvoice.js';
+import { MatWhCoatingInvoiceItem } from '../models/MatWhCoatingInvoiceItem.js';
+import { coatingInvoiceCandidates, createCoatingInvoice, withCoatingInvoiceLines } from '../services/matWhInvoices.js';
 import { MatWhPurchaseOrder } from '../models/MatWhPurchaseOrder.js';
 import { MatWhPurchaseOrderItem } from '../models/MatWhPurchaseOrderItem.js';
 import { MatWhStockLedger } from '../models/MatWhStockLedger.js';
@@ -2110,7 +2112,13 @@ router.post('/external-processing/group/:requestNo/actual-finish', requireAnyOf(
 router.get('/external-processing/group/:requestNo/invoices', requireInvoices, async (req, res) => {
     const { requestNo } = req.params;
     const rows = await MatWhCoatingInvoice.findAll({ where: { requestNo }, order: [['id', 'DESC']] });
-    res.json({ items: rows, materialCostSuggested: await coatingMaterialCost(requestNo) });
+    res.json({
+        items: await withCoatingInvoiceLines(rows),
+        materialCostSuggested: await coatingMaterialCost(requestNo),
+        // What can be billed, one row per coated item (2026-10-29) -- the
+        // per-kg line form starts from these.
+        candidates: await coatingInvoiceCandidates(requestNo),
+    });
 });
 
 router.post('/external-processing/group/:requestNo/invoices', requireInvoices, async (req, res) => {
@@ -2122,14 +2130,18 @@ router.post('/external-processing/group/:requestNo/invoices', requireInvoices, a
     if (!vendorInvoiceNo) {
         return res.status(400).json({ message: 'vendorInvoiceNo is required' });
     }
-    const row = await MatWhCoatingInvoice.create({
-        requestNo, processVendorId: processVendorId ?? null, vendorInvoiceNo,
-        invDate: invDate || null, invDueDate: invDueDate || null,
-        invReceivedDate: invReceivedDate ? new Date(invReceivedDate) : new Date(),
-        paintingCost: paintingCost !== undefined && paintingCost !== '' ? Number(paintingCost) : null,
-        notes: notes || null, enteredBy: req.user.userId,
-    });
-    res.status(201).json(row);
+    try {
+        const row = await createCoatingInvoice(requestNo, {
+            processVendorId: processVendorId ?? null, vendorInvoiceNo,
+            invDate: invDate || null, invDueDate: invDueDate || null,
+            invReceivedDate: invReceivedDate ? new Date(invReceivedDate) : new Date(),
+            paintingCost: paintingCost !== undefined && paintingCost !== '' ? Number(paintingCost) : null,
+            notes: notes || null, enteredBy: req.user.userId,
+        }, req.body.lines);
+        res.status(201).json(row);
+    } catch (err) {
+        res.status(err.status || 500).json({ message: err.message || 'Failed to save invoice' });
+    }
 });
 
 // Warehouse verifying and approving one of Mix's invoices -- "the final
@@ -2180,7 +2192,21 @@ router.post('/external-processing/group/:requestNo/invoices/:invoiceId/approve',
         const jobs = await MatWhExternalProcessing.findAll({ where: { requestNo: req.params.requestNo }, transaction: t });
         const weightOf = (j) => Number(j.qtyReceived ?? 0) > 0 ? Number(j.qtyReceived) : Number(j.qtySent ?? 0);
         const totalWeight = jobs.reduce((sum, j) => sum + weightOf(j), 0);
-        if (paintingCost > 0 && totalWeight > 0) {
+        // An invoice with per-kg lines (2026-10-29) puts each line's amount
+        // on its own job's item+store; an older lump-sum invoice is still
+        // split over the jobs by quantity.
+        const lines = await MatWhCoatingInvoiceItem.findAll({ where: { coatingInvoiceId: inv.id }, transaction: t });
+        const jobById = new Map(jobs.map((j) => [j.id, j]));
+        if (lines.length > 0) {
+            await lockItems([...new Set(jobs.map((j) => j.itemId))], t);
+            for (const line of lines) {
+                const job = jobById.get(line.jobId);
+                const storeId = job?.storeId;
+                if (!storeId) continue;
+                const done = await addValueToStock(line.itemId, storeId, Number(line.lineAmt), t);
+                applied.push(done ?? { itemId: line.itemId, storeId, added: 0, skipped: 'nothing on hand' });
+            }
+        } else if (paintingCost > 0 && totalWeight > 0) {
             await lockItems([...new Set(jobs.map((j) => j.itemId))], t);
             for (const j of jobs) {
                 const share = paintingCost * (weightOf(j) / totalWeight);
