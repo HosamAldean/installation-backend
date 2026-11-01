@@ -3,7 +3,7 @@ import express from "express";
 import { sequelize, sequelize2, sequelize3, sequelizeUtf8, withSqlRetry } from "../config/db.js";
 import { QueryTypes } from "sequelize";
 import { authenticateToken } from "../middleware/auth.js";
-import { requirePermission } from "../middleware/permissions.js";
+import { requirePermission, getPermissionsForRole } from "../middleware/permissions.js";
 import { PERMISSIONS } from "../constants/permissions.js";
 import multer from "multer";
 import path from "path";
@@ -2089,6 +2089,12 @@ router.post("/location", authenticateToken, async (req, res) => {
         const { lat, lng } = req.body;
         if (typeof lat !== "number" || typeof lng !== "number") {
             return res.status(400).json({ success: false, message: "lat and lng (numbers) are required" });
+        }
+
+        // Only roles granted location tracking are tracked. Its own code so
+        // the app (1.0.9+) stops its background task instead of retrying.
+        if (!(await getPermissionsForRole(req.user.role)).includes(PERMISSIONS.FIELD_LOCATION_TRACKING)) {
+            return res.status(403).json({ success: false, code: "LOCATION_TRACKING_OFF", message: "Location tracking is off for this role" });
         }
 
         const teamId = await resolveTeamIdForUser(req.user);

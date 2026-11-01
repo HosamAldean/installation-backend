@@ -40,6 +40,10 @@ export const PERMISSIONS = Object.freeze({
     FIELD_SCAN_BARCODE: 'field.scan_barcode',
     FIELD_SCAN_TASK: 'field.scan_task',
     FIELD_MY_ORDER_COMPONENTS: 'field.my_order_components',
+    // The phone's background location tracking (every 30 minutes) -- only
+    // roles granted this are tracked (2026-10-29: installation users only
+    // by default, admin picks any other role on the Permissions page).
+    FIELD_LOCATION_TRACKING: 'field.location_tracking',
 
     // Shipping (shipping_manager, admin)
     SHIPPING_MAIN_STOCK: 'shipping.main_stock',
@@ -264,6 +268,16 @@ export const PERMISSION_GROUPS = [
             { key: PERMISSIONS.FIELD_SCAN_BARCODE, labelKey: 'fieldScanBarcode' },
             { key: PERMISSIONS.FIELD_SCAN_TASK, labelKey: 'fieldScanTask' },
             { key: PERMISSIONS.FIELD_MY_ORDER_COMPONENTS, labelKey: 'fieldMyOrderComponents' },
+        ],
+    },
+    {
+        module: 'locationTracking',
+        label: 'Location Tracking',
+        // Any role can be tracked; only installation_employee is seeded
+        // (see seed-location-tracking-permission-grant.js).
+        roles: ASSIGNABLE_ROLES,
+        items: [
+            { key: PERMISSIONS.FIELD_LOCATION_TRACKING, labelKey: 'locationTracking' },
         ],
     },
     {

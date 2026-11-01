@@ -6,8 +6,8 @@
 // find out a newer build exists. LATEST_VERSION_CODE must match the
 // versionCode actually baked into that APK (mobile/app.config.js's
 // android.versionCode).
-export const LATEST_VERSION_CODE = 8;
-export const LATEST_VERSION_NAME = "1.0.7";
+export const LATEST_VERSION_CODE = 10;
+export const LATEST_VERSION_NAME = "1.0.9";
 
 // Devices below this versionCode get a mandatory (non-dismissible) update
 // screen (HomeScreen) and, for any build new enough to report its version
@@ -17,7 +17,7 @@ export const LATEST_VERSION_NAME = "1.0.7";
 // tolerating older-but-still-supported versions. Lower this back below
 // LATEST_VERSION_CODE if a softer rollout (dismissible prompt only) is
 // ever wanted again for a specific release.
-export const MIN_SUPPORTED_VERSION_CODE = 8;
+export const MIN_SUPPORTED_VERSION_CODE = 10;
 
 // Full devtunnel URL, not a relative path -- an OLD installed app may have
 // its own API_BASE_URL baked in as the LAN address (see mobile/src/
@@ -36,7 +36,7 @@ export const MIN_SUPPORTED_VERSION_CODE = 8;
 // the new file from the old one. Keep this per-version naming for every
 // future release: rename the built APK to
 // `petra-mobile-v${LATEST_VERSION_NAME}.apk` before `gh release upload`.
-export const DOWNLOAD_URL = "https://github.com/HosamAldean/petra-mobile-releases/releases/download/v1.0.7/petra-mobile-v1.0.7.apk";
+export const DOWNLOAD_URL = "https://github.com/HosamAldean/petra-mobile-releases/releases/download/v1.0.9/petra-mobile-v1.0.9.apk";
 
 // What actually gets handed to a person (push notification body, the
 // login-rejection response, the in-app update modal/toast) instead of
@@ -52,6 +52,6 @@ export const UPDATE_PAGE_URL = "https://petralu.duckdns.org:4000/update";
 // <strong>What's new:</strong> paragraph. Update both strings together
 // with the version bump above every time a new release goes live.
 export const WHATS_NEW_EN =
-    "My HR Requests now show full request detail, including reviewer notes and hours for overtime/absence entries.";
+    "Materials store on the phone: stock count, receive and send store transfers, write-offs, returns from a project, and issue by project. Every screen now works with or without a barcode. HR: daily visits report (form 10-35) and the second-approval stage on your requests.";
 export const WHATS_NEW_AR =
-    "طلبات الموارد البشرية الخاصة بي تعرض الآن تفاصيل الطلب كاملة، بما فيها ملاحظات المراجع وساعات العمل الإضافي والغياب.";
+    "مستودع المواد على الهاتف: الجرد، استلام وإرسال تحويلات المخازن، طلبات الإتلاف، إرجاع المواد من المشروع، والصرف حسب المشروع. كل الشاشات تعمل الآن مع الباركود أو بدونه. الموارد البشرية: تقرير الزيارات اليومية (نموذج 10-35) ومرحلة الموافقة الثانية في طلباتك.";
