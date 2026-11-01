@@ -23,6 +23,11 @@ export const MatWhItemVariant = sequelizeUtf8.define('MatWhItemVariant', {
     // The real, physically-scannable barcode for this exact variant --
     // globally unique (a scan has to resolve to exactly one variant).
     barcode: { type: DataTypes.STRING(50), allowNull: false, unique: true },
+    // Alpha prices and weighs each colour/length on its own (2026-10-29).
+    // unitCost is the reference price for this variant; the item-level
+    // weighted average in matWhItemCost still comes from real receipts.
+    unitCost: { type: DataTypes.FLOAT, allowNull: true },
+    unitWeight: { type: DataTypes.FLOAT, allowNull: true },
     isActive: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: true },
 }, {
     tableName: 'matWhItemVariants',
