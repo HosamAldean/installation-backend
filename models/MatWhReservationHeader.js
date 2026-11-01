@@ -46,6 +46,9 @@ export const MatWhReservationHeader = sequelizeUtf8.define('MatWhReservationHead
     // actually reserved).
     status: { type: DataTypes.STRING(20), allowNull: false, defaultValue: 'draft' },
     notes: { type: DataTypes.STRING(500), allowNull: true },
+    // Set when the request was raised from a project material plan
+    // (MatWhProjectPlan, 2026-11-01).
+    projectPlanId: { type: DataTypes.INTEGER, allowNull: true },
     createdBy: { type: DataTypes.INTEGER, allowNull: true },
     confirmedBy: { type: DataTypes.INTEGER, allowNull: true },
     confirmedDate: { type: DataTypes.DATE, allowNull: true },

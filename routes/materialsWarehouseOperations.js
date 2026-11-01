@@ -96,8 +96,8 @@ async function isProductionOnlyCaller(user) {
 
 // A production-only submitter's request waits for a production manager
 // (2026-10-29); store staff, admin and approvers submit straight to the
-// stores.
-async function needsProductionApproval(user) {
+// stores. Also used by routes/materialsWarehouseProjectPlans.js.
+export async function needsProductionApproval(user) {
     if (user.role === 'admin') return false;
     const granted = await getPermissionsForRole(user.role);
     return !granted.includes(PERMISSIONS.MATERIALS_WAREHOUSE_RESERVE)
@@ -478,9 +478,13 @@ router.get('/color-lookup', requireAnyOf(
 // the connection with the right typeCast in the first place instead.
 // ============================================================
 
+// Store and production managers search too, for the project material
+// status page (routes/materialsWarehouseProjectPlans.js).
 router.get('/projects/search', requireAnyOf(
     PERMISSIONS.MATERIALS_WAREHOUSE_RESERVE,
     PERMISSIONS.MATERIALS_WAREHOUSE_PRODUCTION_REQUEST,
+    PERMISSIONS.MATERIALS_WAREHOUSE_STORE_MANAGER,
+    PERMISSIONS.MATERIALS_WAREHOUSE_PRODUCTION_APPROVE,
 ), async (req, res) => {
     const q = String(req.query.q || '').trim();
     if (q.length < 2) return res.json({ items: [] });
