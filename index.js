@@ -14,6 +14,7 @@ import compression from 'compression';
 import { monitorLog } from './middleware/monitorLog.js';
 import { blockIpMiddleware } from './middleware/ipBlock.js';
 import { startSecurityMonitor } from './services/securityMonitor.js';
+import { startItLicenseMonitor } from './services/itLicenseMonitor.js';
 import { LATEST_VERSION_CODE, LATEST_VERSION_NAME, MIN_SUPPORTED_VERSION_CODE, DOWNLOAD_URL, UPDATE_PAGE_URL, WHATS_NEW_EN, WHATS_NEW_AR } from './constants/mobileAppVersion.js';
 
 // import routes
@@ -65,6 +66,7 @@ import cr09TagsRouter from "./routes/cr09Tags.js";
 import permissionsRouter from "./routes/permissions.js";
 import auditRouter from "./routes/audit.js";
 import announcementsRouter from "./routes/announcements.js";
+import itLicensesRouter from "./routes/itLicenses.js";
 import hrRequestsRouter from "./routes/hrRequests.js";
 import payslipRouter from "./routes/payslip.js";
 import hrReportsRouter from "./routes/hrReports.js";
@@ -298,6 +300,7 @@ app.use("/api/cr09", cr09Router);
 app.use("/api/admin/permissions", permissionsRouter);
 app.use("/api/admin/audit", auditRouter);
 app.use("/api/announcements", announcementsRouter);
+app.use("/api/it-licenses", itLicensesRouter);
 app.use("/api/cr09/tags", cr09TagsRouter);
 app.use("/api/hr-requests", hrRequestsRouter);
 app.use("/api/payslip", payslipRouter);
@@ -503,5 +506,6 @@ import tls from "tls";
     }
 
     startSecurityMonitor();
+    startItLicenseMonitor();
 })();
 
