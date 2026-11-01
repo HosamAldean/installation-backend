@@ -16,7 +16,10 @@ const SQL_DB = process.env.MSSQL1_DB;
 // spanning Work_place 6000-6999 -- confirmed live against Pay_CompTree,
 // NOT a separate company. Factory HR also covers "إنتاج الحديد" (Iron
 // Production, Work_place 8001 -- the 3xxxxx employees), per explicit
-// direction 2026-10-15; it used to fall to general hr. Ittihad
+// direction 2026-10-15; it used to fall to general hr. MIX ("الشركة
+// الفنية", Comp_num=2 -- treatment/painting/wood staff) also moved to
+// factory HR, factory-manager stage and past-date rule included, per
+// explicit direction 2026-11-01; it used to fall to general hr. Ittihad
 // (Comp_num=10) is a genuinely separate company with its own employee-
 // numbering scheme.
 // Individual exceptions that stay with general hr despite a factory work
@@ -24,7 +27,7 @@ const SQL_DB = process.env.MSSQL1_DB;
 // supervisor in Accounting) -- manager -> general hr, per explicit
 // direction 2026-10-21.
 const FACTORY_EXCLUDED_EMP_NOS = [100608];
-const FACTORY_WHERE = "Comp_num = 1 AND (Work_place BETWEEN 6000 AND 6999 OR Work_place = 8001)"
+const FACTORY_WHERE = "((Comp_num = 1 AND (Work_place BETWEEN 6000 AND 6999 OR Work_place = 8001)) OR Comp_num = 2)"
     + ` AND Emp_num NOT IN (${FACTORY_EXCLUDED_EMP_NOS.join(",")})`;
 const ITTIHAD_WHERE = "Comp_num = 10";
 // Everyone not in either of the above two.
