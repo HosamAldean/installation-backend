@@ -182,6 +182,12 @@ export const PERMISSIONS = Object.freeze({
     // direct request, scoped the same way PATCH /:id already is (own
     // reports only, never a privileged account) -- see routes/users.js.
     USERS_RESET_PASSWORD: 'users.reset_password',
+
+    // IT section (it_manager / it_support, added 2026-11-03). IT licenses
+    // tracker (routes/itLicenses.js) -- the page, add/edit/renew and the
+    // expiry push reminders all follow this one key; it was hardcoded
+    // admin-only before.
+    IT_LICENSES: 'it.licenses',
 });
 
 // Every role that can be granted a permission. `admin` is deliberately
@@ -211,6 +217,8 @@ export const ASSIGNABLE_ROLES = [
     'hr_ittihad',
     'hr',
     'hr_manager',
+    'it_manager',
+    'it_support',
 ];
 
 // Grouped by module for the admin grant-matrix UI (frontend/src/pages/
@@ -389,6 +397,12 @@ export const PERMISSION_GROUPS = [
             { key: PERMISSIONS.USERS_CREATE, labelKey: 'usersCreate' },
             { key: PERMISSIONS.USERS_RESET_PASSWORD, labelKey: 'usersResetPassword' },
         ],
+    },
+    {
+        module: 'it',
+        label: 'IT',
+        roles: ['it_manager', 'it_support'],
+        items: [{ key: PERMISSIONS.IT_LICENSES, labelKey: 'itLicenses' }],
     },
 ];
 

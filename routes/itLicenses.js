@@ -1,13 +1,15 @@
 // backend/routes/itLicenses.js
 // IT licenses tracker (models/ItLicense.js) -- domains, SSL, software,
-// cloud subscriptions and their renewals. Hardcoded admin-only (not a
-// PermissionGrant key), per the user's direction 2026-11-01 ("for the IT
-// section just for the admin"). Reminders: services/itLicenseMonitor.js.
+// cloud subscriptions and their renewals. Admin-only at first (2026-11-01);
+// since 2026-11-03 gated by PERMISSIONS.IT_LICENSES so the it_manager /
+// it_support roles can be granted it. Reminders: services/itLicenseMonitor.js.
 import express from "express";
 import fs from "fs";
 import multer from "multer";
 import path from "path";
-import { authenticateToken, authorizeRoles } from "../middleware/auth.js";
+import { authenticateToken } from "../middleware/auth.js";
+import { requirePermission } from "../middleware/permissions.js";
+import { PERMISSIONS } from "../constants/permissions.js";
 import { ItLicense, IT_LICENSE_CATEGORIES } from "../models/ItLicense.js";
 import { ItLicenseRenewal } from "../models/ItLicenseRenewal.js";
 import { ItLicenseAttachment } from "../models/ItLicenseAttachment.js";
@@ -16,7 +18,7 @@ import { sequelize2 } from "../config/db.js";
 import { ammanToday, daysUntil } from "../services/itLicenseMonitor.js";
 
 const router = express.Router();
-router.use(authenticateToken, authorizeRoles("admin"));
+router.use(authenticateToken, requirePermission(PERMISSIONS.IT_LICENSES));
 
 // Invoice/receipt files -- same disk-storage + fileFilter pattern as the HR
 // leave attachments, but kept OUT of the public /uploads static folder
