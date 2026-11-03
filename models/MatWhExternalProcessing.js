@@ -41,7 +41,7 @@ export const MatWhExternalProcessing = sequelizeUtf8.define('MatWhExternalProces
     // when the 'out' ledger movement actually posts) -> received. A
     // manually-created job (the existing POST /external-processing) skips
     // 'draft' entirely and starts at 'sent', unchanged from before.
-    status: { type: DataTypes.STRING(20), allowNull: false, defaultValue: 'sent' }, // draft, sent, received
+    status: { type: DataTypes.STRING(20), allowNull: false, defaultValue: 'sent' }, // draft, sent, received, rejected (store manager turned the request down)
     sentBy: { type: DataTypes.INTEGER, allowNull: true },
     receivedBy: { type: DataTypes.INTEGER, allowNull: true },
     // What color this job is expected to come back as once coated --
@@ -108,6 +108,18 @@ export const MatWhExternalProcessing = sequelizeUtf8.define('MatWhExternalProces
     confirmedReceivedAt: { type: DataTypes.DATE, allowNull: true },
     confirmedReceivedBy: { type: DataTypes.INTEGER, allowNull: true },
     actualFinishDate: { type: DataTypes.DATEONLY, allowNull: true },
+    // Store manager's approval of the coating request (2026-10-29), per
+    // requestNo group. Every new job -- auto-raised or a manual Send Out --
+    // starts 'pending_manager': no vendor can be named, Mix's portal
+    // doesn't show it, and nothing can be sent until it's 'approved'.
+    // 'rejected' also sets status 'rejected'. 'not_required' is the default
+    // for jobs created before this existed.
+    approvalStatus: { type: DataTypes.STRING(20), allowNull: false, defaultValue: 'not_required' },
+    approvedBy: { type: DataTypes.INTEGER, allowNull: true },
+    approvedDate: { type: DataTypes.DATE, allowNull: true },
+    rejectedBy: { type: DataTypes.INTEGER, allowNull: true },
+    rejectedDate: { type: DataTypes.DATE, allowNull: true },
+    rejectionReason: { type: DataTypes.STRING(500), allowNull: true },
 }, {
     tableName: 'matWhExternalProcessing',
     timestamps: true,

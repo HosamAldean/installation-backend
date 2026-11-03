@@ -12,6 +12,7 @@
 // matWhStockLedger (see MatWhReservationItem.js) -- only the shortfall's
 // future goods receipt will, same as any other purchase order, and only
 // issuing a confirmed line (WM 10-22) actually moves stock.
+import { Op } from 'sequelize';
 import { sequelizeUtf8 } from '../config/db.js';
 import { MatWhReservationHeader } from '../models/MatWhReservationHeader.js';
 import { MatWhReservationItem } from '../models/MatWhReservationItem.js';
@@ -84,7 +85,11 @@ export async function createReservationHeader({ reservationNo, projectId, projec
 // actually hold each item -- draft -> submitted is a one-way door, same as
 // draft -> confirmed used to be, just renamed to reflect what's really
 // happening (WM 10-21's "sent to store", not yet anyone's decision).
-export async function submitReservation(headerId) {
+//
+// needsProductionApproval (2026-10-29): a production-only submitter's
+// request stops at 'pending_approval' until a .production_approve holder
+// decides it (approveProductionRequest / rejectProductionRequest below).
+export async function submitReservation(headerId, needsProductionApproval = false) {
     const header = await MatWhReservationHeader.findByPk(headerId);
     if (!header) {
         const err = new Error('Reservation not found');
@@ -102,8 +107,180 @@ export async function submitReservation(headerId) {
         err.status = 400;
         throw err;
     }
-    await header.update({ status: 'submitted' });
+    await header.update({ status: needsProductionApproval ? 'pending_approval' : 'submitted' });
     return header;
+}
+
+async function loadPendingApprovalHeader(headerId) {
+    const header = await MatWhReservationHeader.findByPk(headerId);
+    if (!header) {
+        const err = new Error('Reservation not found');
+        err.status = 404;
+        throw err;
+    }
+    if (header.status !== 'pending_approval') {
+        const err = new Error(`Cannot decide a request in status '${header.status}'`);
+        err.status = 409;
+        throw err;
+    }
+    return header;
+}
+
+// Production manager's approval -- the request goes on to the stores.
+export async function approveProductionRequest(headerId, approvedBy) {
+    const header = await loadPendingApprovalHeader(headerId);
+    await header.update({ status: 'submitted', productionApprovedBy: approvedBy, productionApprovedDate: new Date() });
+    return header;
+}
+
+// Production manager's rejection -- ends the request; every line is
+// rejected with the same reason, nothing was ever reserved.
+export async function rejectProductionRequest(headerId, rejectedBy, reason) {
+    if (!reason || !String(reason).trim()) {
+        const err = new Error('A rejection reason is required');
+        err.status = 400;
+        throw err;
+    }
+    const header = await loadPendingApprovalHeader(headerId);
+    const trimmedReason = String(reason).trim();
+    await sequelizeUtf8.transaction(async (t) => {
+        await MatWhReservationItem.update(
+            { status: 'rejected', rejectedBy, rejectedDate: new Date(), rejectionReason: trimmedReason },
+            { where: { reservationHeaderId: header.id, status: 'pending' }, transaction: t },
+        );
+        await header.update({
+            status: 'rejected', productionRejectedBy: rejectedBy, productionRejectedDate: new Date(),
+            productionRejectionReason: trimmedReason,
+        }, { transaction: t });
+    });
+    return header;
+}
+
+// Store manager's approval before issue (2026-10-29). lineIds null = every
+// line waiting on this header within the caller's stores (allowedStoreIds
+// null = every store).
+export async function managerApproveLines(headerId, approvedBy, lineIds = null, allowedStoreIds = null) {
+    const lines = (await MatWhReservationItem.findAll({
+        where: { reservationHeaderId: headerId, managerApprovalStatus: 'pending_manager' },
+    }))
+        .filter((l) => lineIds === null || lineIds.includes(l.id))
+        .filter((l) => allowedStoreIds === null || allowedStoreIds.has(l.storeId));
+    if (lines.length === 0) {
+        const err = new Error('Nothing waiting for your approval on this request');
+        err.status = 400;
+        throw err;
+    }
+    for (const line of lines) {
+        await line.update({ managerApprovalStatus: 'approved', managerApprovedBy: approvedBy, managerApprovedDate: new Date() });
+    }
+    return { approved: lines.map((l) => l.id) };
+}
+
+// Store manager turns down a confirmed line: it's rejected (the hold is
+// freed -- a rejected line no longer counts as reserved), any coating
+// request still waiting for it is rejected too, and an auto-PO already
+// raised is left alone, same as release.
+export async function managerRejectLine(lineId, rejectedBy, reason) {
+    if (!reason || !String(reason).trim()) {
+        const err = new Error('A rejection reason is required');
+        err.status = 400;
+        throw err;
+    }
+    const trimmedReason = String(reason).trim();
+    const t = await sequelizeUtf8.transaction();
+    try {
+        const line = await lockRow(MatWhReservationItem, lineId, t);
+        if (!line) {
+            const err = new Error('Reservation line not found');
+            err.status = 404;
+            throw err;
+        }
+        if (line.managerApprovalStatus !== 'pending_manager') {
+            const err = new Error('This line is not waiting for manager approval');
+            err.status = 409;
+            throw err;
+        }
+        await line.update({
+            status: 'rejected', managerApprovalStatus: 'rejected',
+            rejectedBy, rejectedDate: new Date(), rejectionReason: trimmedReason,
+            qtyPendingCoating: 0,
+        }, { transaction: t });
+        await MatWhExternalProcessing.update({
+            status: 'rejected', approvalStatus: 'rejected',
+            rejectedBy, rejectedDate: new Date(), rejectionReason: trimmedReason,
+        }, { where: { sourceReservationItemId: line.id, status: 'draft' }, transaction: t });
+        const header = await MatWhReservationHeader.findByPk(line.reservationHeaderId, { transaction: t });
+        const siblings = await MatWhReservationItem.findAll({ where: { reservationHeaderId: header.id }, transaction: t });
+        if (!siblings.some((l) => l.status === 'pending')) {
+            await header.update({ status: computeHeaderStatus(siblings) }, { transaction: t });
+        }
+        await t.commit();
+        return { line, header };
+    } catch (err) {
+        await t.rollback();
+        throw err;
+    }
+}
+
+// Store manager's decision on a coating request, per requestNo (only the
+// jobs still waiting -- a job added to an already-approved request later
+// waits on its own). Approval copies a vendor already named on the
+// request onto the newly approved jobs, so they travel with the rest.
+// Rejection gives a job's quantity back to its reservation line: a job
+// made from the store's own mill stock (no PO) becomes a shortfall on the
+// line; a job tied to a shortfall PO already counts there.
+export async function decideCoatingRequest(requestNo, decidedBy, approve, reason, allowedStoreIds = null) {
+    if (!approve && (!reason || !String(reason).trim())) {
+        const err = new Error('A rejection reason is required');
+        err.status = 400;
+        throw err;
+    }
+    const t = await sequelizeUtf8.transaction();
+    try {
+        const rows = (await MatWhExternalProcessing.findAll({
+            where: { requestNo, approvalStatus: 'pending_manager', status: 'draft' }, transaction: t, lock: t.LOCK.UPDATE,
+        })).filter((r) => allowedStoreIds === null || allowedStoreIds.has(r.storeId));
+        if (rows.length === 0) {
+            const err = new Error('Nothing on this coating request is waiting for your approval');
+            err.status = 409;
+            throw err;
+        }
+        if (approve) {
+            const named = await MatWhExternalProcessing.findOne({
+                where: { requestNo, approvalStatus: ['approved', 'not_required'], processVendorId: { [Op.ne]: null } },
+                transaction: t,
+            });
+            for (const row of rows) {
+                await row.update({
+                    approvalStatus: 'approved', approvedBy: decidedBy, approvedDate: new Date(),
+                    ...(named && !row.processVendorId ? { processVendorId: named.processVendorId } : {}),
+                }, { transaction: t });
+            }
+        } else {
+            const trimmedReason = String(reason).trim();
+            for (const row of rows) {
+                await row.update({
+                    status: 'rejected', approvalStatus: 'rejected',
+                    rejectedBy: decidedBy, rejectedDate: new Date(), rejectionReason: trimmedReason,
+                }, { transaction: t });
+                if (!row.sourceReservationItemId) continue;
+                const line = await lockRow(MatWhReservationItem, row.sourceReservationItemId, t);
+                if (!line || !['confirmed', 'partially_confirmed'].includes(line.status)) continue;
+                const qty = Number(row.qtySent) || 0;
+                const updates = { qtyPendingCoating: Math.max(0, Number(line.qtyPendingCoating || 0) - qty) };
+                if (!row.sourcePurchaseOrderItemId && qty > 0) {
+                    updates.qtyShortfall = Number(line.qtyShortfall || 0) + qty;
+                    updates.status = 'partially_confirmed';
+                }
+                await line.update(updates, { transaction: t });
+            }
+        }
+        await t.commit();
+        return { requestNo, decided: rows.map((r) => r.id), approved: !!approve };
+    } catch (err) {
+        await t.rollback();
+        throw err;
+    }
 }
 
 // Coating requests are grouped by (reservation, store) -- per direct
@@ -131,7 +308,10 @@ async function findExistingCoatingRequestNo(reservationHeaderId, storeId, t) {
 
 // Creates one coating job, reusing the reservation+store's shared
 // requestNo when one already exists, generating a fresh one otherwise.
+// Every new job waits for the store manager (approvalStatus, 2026-10-29)
+// unless the caller says otherwise.
 export async function createCoatingJob(reservationHeaderId, values, t) {
+    values = { approvalStatus: 'pending_manager', ...values };
     const sharedRequestNo = await findExistingCoatingRequestNo(reservationHeaderId, values.storeId, t);
     if (sharedRequestNo) {
         return MatWhExternalProcessing.create({ ...values, requestNo: sharedRequestNo }, { transaction: t });
@@ -159,6 +339,8 @@ export async function splitOffRemainder(row, sentQty, t) {
         sourcePurchaseOrderItemId: row.sourcePurchaseOrderItemId,
         isAutoGenerated: row.isAutoGenerated, status: 'draft',
         qtySent: remainder, processVendorId: null, sentBy: null, sentDate: null,
+        // The remainder of an approved request stays approved.
+        approvalStatus: row.approvalStatus, approvedBy: row.approvedBy, approvedDate: row.approvedDate,
     }, { transaction: t });
 }
 
@@ -252,7 +434,7 @@ async function confirmOneLine(line, header, confirmedBy, t, requestedQtyToReserv
 
     await line.update({
         qtyReserved, qtyPendingCoating, qtyShortfall, status,
-        reservedBy: confirmedBy, reservedDate: new Date(),
+        reservedBy: confirmedBy, reservedDate: new Date(), managerApprovalStatus: 'pending_manager',
     }, { transaction: t });
 
     if (qtyShortfall > 0) {
@@ -466,7 +648,7 @@ export async function confirmReservation(headerId, confirmedBy, allowedStoreIds 
 
             await line.update({
                 qtyReserved, qtyPendingCoating, qtyShortfall, status,
-                reservedBy: confirmedBy, reservedDate: new Date(),
+                reservedBy: confirmedBy, reservedDate: new Date(), managerApprovalStatus: 'pending_manager',
             }, { transaction: t });
 
             if (qtyShortfall > 0) {
@@ -704,6 +886,11 @@ export async function issueReservationLine(lineId, issuedBy, issuedBarcode, issu
     if (await findRequestKey(requestKey)) return currentState();
     if (!['confirmed', 'partially_confirmed'].includes(line.status)) {
         const err = new Error(`Cannot issue a line in status '${line.status}'`);
+        err.status = 409;
+        throw err;
+    }
+    if (line.managerApprovalStatus === 'pending_manager') {
+        const err = new Error('Waiting for store manager approval before it can be issued');
         err.status = 409;
         throw err;
     }
