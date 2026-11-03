@@ -1,12 +1,16 @@
 // backend/services/itLicenseMonitor.js
 // Expiry reminders for the IT licenses tracker (models/ItLicense.js).
-// Checks hourly; each active license is pushed to every active admin once
+// Checks hourly; each active license is pushed to every active admin, and
+// every active user whose role holds PERMISSIONS.IT_LICENSES, once
 // per threshold -- its own remindDaysBefore, then 14/7/3/1 days and the
 // expiry day -- and weekly after it has expired until it's renewed or
 // cancelled. lastReminderDays on the row makes this idempotent across
 // restarts; editing/renewing the expiry date resets it.
 import { ItLicense } from '../models/ItLicense.js';
+import { Op } from 'sequelize';
 import { User } from '../models/User.js';
+import { PermissionGrant } from '../models/PermissionGrant.js';
+import { PERMISSIONS } from '../constants/permissions.js';
 import { sendPushToUser } from './pushNotifications.js';
 
 const CHECK_INTERVAL_MS = 60 * 60 * 1000;
@@ -29,6 +33,21 @@ export function reminderThreshold(daysLeft, remindDaysBefore) {
         .filter((t) => t <= remindDaysBefore)
         .sort((a, b) => a - b);
     return thresholds.find((t) => daysLeft <= t) ?? null;
+}
+
+// admin plus whichever roles are granted IT_LICENSES right now
+// (admin-editable on the Permissions page, same as getFinanceReviewerUserIds).
+async function getReminderUserIds() {
+    const grants = await PermissionGrant.findAll({
+        where: { permissionKey: PERMISSIONS.IT_LICENSES },
+        attributes: ['role'],
+    });
+    const roles = ['admin', ...grants.map((g) => g.role)];
+    const users = await User.findAll({
+        where: { role: { [Op.in]: roles }, active: true },
+        attributes: ['userId'],
+    });
+    return users.map((u) => u.userId);
 }
 
 function reminderText(license, daysLeft) {
@@ -58,9 +77,9 @@ export async function checkItLicenseReminders() {
     }
     if (due.length === 0) return 0;
 
-    const admins = await User.findAll({ where: { role: 'admin', active: true }, attributes: ['userId'] });
+    const userIds = await getReminderUserIds();
     for (const { license, daysLeft, stage } of due) {
-        await Promise.all(admins.map((admin) => sendPushToUser(admin.userId, {
+        await Promise.all(userIds.map((userId) => sendPushToUser(userId, {
             title: daysLeft < 0 ? 'License expired' : 'License renewal due',
             body: reminderText(license, daysLeft),
             data: { type: 'it_license', licenseId: license.id },
