@@ -94,6 +94,11 @@ const __dirname = path.dirname(__filename);
 // ======================
 // Security
 // ======================
+// On the PETRA-APP server Caddy sits in front on the same machine, so every
+// request arrives from 127.0.0.1. Trust X-Forwarded-For from loopback only,
+// so req.ip is the real client again for the login rate limit, the IP block
+// list and the security monitor. No effect when nothing proxies over loopback.
+app.set("trust proxy", "loopback");
 app.use(helmet({crossOriginResourcePolicy: false,}));
 
 // ======================
@@ -105,6 +110,10 @@ const staticAllowedOrigins = [
     'http://localhost:5173',
     'http://192.168.20.77:5173',
     'https://petralu.duckdns.org:5173',
+    // PETRA-APP server behind Caddy (2026-11-03)
+    'https://petralu.net',
+    'https://www.petralu.net',
+    'https://app.petralu.net',
 ];
 
 app.use(cors({
