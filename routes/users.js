@@ -56,7 +56,9 @@ const requireResetPassword = requirePermission(PERMISSIONS.USERS_RESET_PASSWORD)
 // mix_employee/mix_manager added alongside the HR tiers -- real
 // external-company logins (Mix), same sensitivity tier as admin/hr: only
 // an actual admin may grant either or touch an existing Mix account.
-const PRIVILEGED_ROLES = ['admin', 'hr', 'hr_manager', 'hr_factory', 'hr_ittihad', 'mix_employee', 'mix_manager'];
+// it_manager/it_support (2026-11-03) likewise -- IT staff see license
+// invoices and will get more IT tools, so only admin hands those out.
+const PRIVILEGED_ROLES = ['admin', 'hr', 'hr_manager', 'hr_factory', 'hr_ittihad', 'mix_employee', 'mix_manager', 'it_manager', 'it_support'];
 
 // Further restricts which roles specific manager roles may assign, on top
 // of the PRIVILEGED_ROLES block above -- e.g. installation_manager can
