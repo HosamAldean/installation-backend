@@ -41,3 +41,6 @@ Thumbs.db
 
 # Private uploads (served only through authenticated routes)
 private-uploads/
+
+# Deploy tool run logs (deploy/Deploy-Petra.ps1)
+deploy/logs/
