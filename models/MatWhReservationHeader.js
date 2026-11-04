@@ -74,6 +74,15 @@ export const MatWhReservationHeader = sequelizeUtf8.define('MatWhReservationHead
     productionRejectedBy: { type: DataTypes.INTEGER, allowNull: true },
     productionRejectedDate: { type: DataTypes.DATE, allowNull: true },
     productionRejectionReason: { type: DataTypes.STRING(500), allowNull: true },
+    // Store manager's decision on a new request (cycle v2, 2026-11-04):
+    // submit -> 'pending_store_mgr', and no store sees it until approved
+    // (-> 'submitted') or rejected (-> 'rejected' with the reason).
+    // Requests made by a store manager or admin skip this step.
+    storeManagerApprovedBy: { type: DataTypes.INTEGER, allowNull: true },
+    storeManagerApprovedDate: { type: DataTypes.DATE, allowNull: true },
+    storeManagerRejectedBy: { type: DataTypes.INTEGER, allowNull: true },
+    storeManagerRejectedDate: { type: DataTypes.DATE, allowNull: true },
+    storeManagerRejectionReason: { type: DataTypes.STRING(500), allowNull: true },
 }, {
     tableName: 'matWhReservationHeaders',
     timestamps: true,

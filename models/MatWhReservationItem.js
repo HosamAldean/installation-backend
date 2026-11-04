@@ -100,10 +100,22 @@ export const MatWhReservationItem = sequelizeUtf8.define('MatWhReservationItem',
     // .store_manager holder approves it ('approved') -- or rejects it, which
     // also sets status 'rejected' with the reason fields above.
     // 'not_required' is the default for lines confirmed before this
-    // existed, which stay issuable as they were.
+    // existed, which stay issuable as they were. Cycle v2 (2026-11-04)
+    // moved the store manager's approval to the start of the request, so a
+    // store confirm now leaves this at 'not_required'.
     managerApprovalStatus: { type: DataTypes.STRING(20), allowNull: false, defaultValue: 'not_required' },
     managerApprovedBy: { type: DataTypes.INTEGER, allowNull: true },
     managerApprovedDate: { type: DataTypes.DATE, allowNull: true },
+    // Production's issue request (cycle v2, 2026-11-04): a project
+    // reservation line is issued only once production asked for it for one
+    // of the project's orders (a project plan line). A request for less
+    // than the line holds splits the requested part off into its own line
+    // (splitFromLineId = the original).
+    issueRequestedBy: { type: DataTypes.INTEGER, allowNull: true },
+    issueRequestedDate: { type: DataTypes.DATE, allowNull: true },
+    issueRequestPlanId: { type: DataTypes.INTEGER, allowNull: true },
+    issueRequestPlanItemId: { type: DataTypes.INTEGER, allowNull: true },
+    splitFromLineId: { type: DataTypes.INTEGER, allowNull: true },
 }, {
     tableName: 'matWhReservationItems',
     timestamps: true,

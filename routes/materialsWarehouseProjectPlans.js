@@ -1,7 +1,8 @@
 // backend/routes/materialsWarehouseProjectPlans.js
-// Project material plans (2026-11-01) -- production's plan per order /
-// phase of a project, its availability check (warn-only, nothing held),
-// requesting lines as a production request, and the project status page.
+// Project material plans (2026-11-01) -- production's plan per order of a
+// project, its check against the project's reservation (warn-only, nothing
+// held), requesting ready lines from the store as an issue request (cycle
+// v2, 2026-11-04), and the project status page.
 // The logic lives in services/matWhProjectPlans.js.
 //
 // Who: production (.production_request) and store staff (.reserve) build
@@ -12,7 +13,6 @@ import { authenticateToken } from '../middleware/auth.js';
 import { getPermissionsForRole } from '../middleware/permissions.js';
 import { PERMISSIONS } from '../constants/permissions.js';
 import { getAllowedStoreIds } from '../services/matWhStoreAccess.js';
-import { needsProductionApproval } from './materialsWarehouseOperations.js';
 import {
     createPlan, updatePlan, addPlanLines, updatePlanLine, deletePlanLine,
     checkPlan, requestPlanLines, planDetail, listPlans, projectStatus,
@@ -104,10 +104,7 @@ router.post('/project-plans/:id/check', requirePlanWrite, handle(async (req) => 
 // lineIds: the chosen lines, or omitted/null for every line not yet requested.
 router.post('/project-plans/:id/request', requirePlanWrite, handle(async (req) => {
     const lineIds = Array.isArray(req.body.lineIds) && req.body.lineIds.length ? req.body.lineIds : null;
-    return requestPlanLines(
-        Number(req.params.id), lineIds, req.user,
-        await needsProductionApproval(req.user), await getAllowedStoreIds(req.user),
-    );
+    return requestPlanLines(Number(req.params.id), lineIds, req.user, await getAllowedStoreIds(req.user));
 }));
 
 export default router;

@@ -39,6 +39,11 @@ export const MatWhProjectPlanItem = sequelizeUtf8.define('MatWhProjectPlanItem',
     checkIncomingEta: { type: DataTypes.DATEONLY, allowNull: true },
     reservationHeaderId: { type: DataTypes.INTEGER, allowNull: true },
     reservationItemId: { type: DataTypes.INTEGER, allowNull: true },
+    // Cycle v2 (2026-11-04): set when production sends this order line to
+    // the store as an issue request against the project's reservation (the
+    // reservation lines point back via issueRequestPlanItemId).
+    requestedBy: { type: DataTypes.INTEGER, allowNull: true },
+    requestedDate: { type: DataTypes.DATE, allowNull: true },
 }, {
     tableName: 'matWhProjectPlanItems',
     timestamps: true,
