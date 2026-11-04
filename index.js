@@ -514,7 +514,14 @@ import tls from "tls";
         console.log("✅ Models synced");
     }
 
-    startSecurityMonitor();
-    startItLicenseMonitor();
+    // The dev PC and the PETRA-APP server share the live databases, so only
+    // the server may run the jobs that send push notifications -- a test
+    // backend on the PC sets DISABLE_BACKGROUND_JOBS=true in its .env.
+    if (process.env.DISABLE_BACKGROUND_JOBS === "true") {
+        console.log("⏸ Background jobs disabled (DISABLE_BACKGROUND_JOBS=true)");
+    } else {
+        startSecurityMonitor();
+        startItLicenseMonitor();
+    }
 })();
 
