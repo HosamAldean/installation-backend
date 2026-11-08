@@ -267,15 +267,15 @@ const ATTACHMENT_REQUIRED_MESSAGE = {
     maternity_paternity: "A birth certificate attachment is required for maternity/paternity leave",
 };
 
-// Company rule: a departure (short personal-leave) request must cover more
-// than 15 minutes -- exactly 15 (e.g. 08:00-08:15) is still rejected, 16+
-// (08:00-08:16) is accepted. Confirmed live that most submitted departure
+// Company rule: a morning departure (short personal-leave) request must cover more
+// than 30 minutes (raised from 15 on 2026-11-08) -- exactly 30 (e.g. 08:00-08:30) is still rejected, 31+
+// (08:00-08:31) is accepted. Confirmed live that most submitted departure
 // requests land on fromTime "08:00" regardless of when the employee
 // actually meant to leave (the mobile/web time picker opens to "now",
 // which for a morning departure request is right around clock-in, and
 // nobody bothers scrolling the wheel) -- so fromTime alone isn't trustworthy
 // as the real start of the departure.
-const MIN_DEPARTURE_MINUTES = 15;
+const MIN_DEPARTURE_MINUTES = 30;
 
 // Factory-HR employees (hr_factory scope) can't file a leave or departure
 // for a day before today (Amman time) -- per explicit direction
@@ -333,7 +333,7 @@ async function getShiftStartMinutes(empNo, forDate) {
 // backwards/negative interval), and the MIN_DEPARTURE_MINUTES floor.
 //
 // That floor is deliberately NOT a blanket "every departure must be over
-// 15 minutes" rule -- it only fires when fromTime is at or before the
+// 30 minutes" rule -- it only fires when fromTime is at or before the
 // employee's real shift start (getShiftStartMinutes). That's the one
 // specific pattern it exists to catch: the mobile/web time picker opens to
 // "now", which for a morning submission is right around clock-in, and
