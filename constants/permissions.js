@@ -216,6 +216,7 @@ export const ASSIGNABLE_ROLES = [
     'sales_manager',
     'accounting',
     'accounting_manager',
+    'accounting_ittihad',
     'project_manager',
     'hr_factory',
     'hr_ittihad',
@@ -359,7 +360,7 @@ export const PERMISSION_GROUPS = [
     {
         module: 'hrAccounting',
         label: 'HR / Accounting',
-        roles: ['hr_factory', 'hr_ittihad', 'hr', 'hr_manager', 'accounting', 'accounting_manager', 'gm'],
+        roles: ['hr_factory', 'hr_ittihad', 'hr', 'hr_manager', 'accounting', 'accounting_manager', 'accounting_ittihad', 'gm'],
         items: [
             { key: PERMISSIONS.HR_REQUESTS_QUEUE, labelKey: 'hrQueue' },
             { key: PERMISSIONS.ACCOUNTING_REQUESTS_QUEUE, labelKey: 'financeQueue' },

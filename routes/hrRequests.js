@@ -31,7 +31,7 @@ import {
     HrVisitReportRow,
 } from "../models/index.js";
 import { isSupervisorOf, getSupervisedEmpNos, hasRealSupervisor, getEmpNosWithoutRealSupervisor, getSupervisorUserId, getFallbackManagerUserIds, isGeneralManager } from "../utils/supervisorLookup.js";
-import { isHrScopedRole, isInHrScope, getHrQueueEmpNos, isInHrQueueScope, getHrReviewerUserIds, getFinanceReviewerUserIds, getGmReviewerUserIds, getSecondApproverEmpNo, getSecondApprovalSourceEmpNos, secondStageApproverFor, isSecondApproverEmpNo, getUserIdsForEmpNo, INSTALLATION_SECOND_APPROVER_EMP_NO, isEligibleForVisitReport } from "../utils/hrScope.js";
+import { isHrScopedRole, isInHrScope, getHrQueueEmpNos, isInHrQueueScope, getHrReviewerUserIds, getFinanceReviewerUserIds, filterByFinanceScope, isInFinanceScope, getGmReviewerUserIds, getSecondApproverEmpNo, getSecondApprovalSourceEmpNos, secondStageApproverFor, isSecondApproverEmpNo, getUserIdsForEmpNo, INSTALLATION_SECOND_APPROVER_EMP_NO, isEligibleForVisitReport } from "../utils/hrScope.js";
 import { resolveEmployeeNames, resolveVacationBalances } from "../utils/employeeLookup.js";
 import { resolveUserNames } from "../utils/userLookup.js";
 import { resolveProjectLabels, withProjectDisplay } from "../utils/projectLookup.js";
@@ -85,9 +85,9 @@ async function notifyHrReviewers(requesterEmpNo, { title, body }) {
     }
 }
 
-async function notifyFinanceReviewers({ title, body }) {
+async function notifyFinanceReviewers(requesterEmpNo, { title, body }) {
     try {
-        const reviewerIds = await getFinanceReviewerUserIds();
+        const reviewerIds = await getFinanceReviewerUserIds(requesterEmpNo);
         reviewerIds.forEach((id) => sendPushToUser(id, { title, body }));
     } catch (err) {
         console.error("❌ Failed to notify finance reviewers:", err);
@@ -873,7 +873,7 @@ router.put("/transport-requests/:id/hr-decision", authenticateToken, requirePerm
             body: decision === "approved" ? "HR audited and approved your transportation request — now awaiting finance." : "HR rejected your transportation request.",
         });
         if (decision === "approved") {
-            notifyFinanceReviewers({
+            notifyFinanceReviewers(request.requesterEmpNo, {
                 title: "Transportation request awaiting finance",
                 body: "An HR-audited transportation request needs your review.",
             });
@@ -893,6 +893,9 @@ router.put("/transport-requests/:id/finance-decision", authenticateToken, requir
     try {
         const request = await HrTransportRequest.findByPk(req.params.id);
         if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+        if (!(await isInFinanceScope(req.user.role, request.requesterEmpNo))) {
+            return res.status(403).json({ success: false, message: "Forbidden" });
+        }
         if (request.status !== "pending_finance") {
             return res.status(400).json({ success: false, message: "This request is not awaiting finance approval" });
         }
@@ -950,6 +953,9 @@ router.put("/transport-requests/:id/mark-paid", authenticateToken, requirePermis
     try {
         const request = await HrTransportRequest.findByPk(req.params.id);
         if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+        if (!(await isInFinanceScope(req.user.role, request.requesterEmpNo))) {
+            return res.status(403).json({ success: false, message: "Forbidden" });
+        }
         if (request.status !== "approved") {
             return res.status(400).json({ success: false, message: "Only approved requests can be marked as paid" });
         }
@@ -2023,11 +2029,11 @@ router.get("/hr-queue", authenticateToken, requirePermission(PERMISSIONS.HR_REQU
 // ============================================================
 router.get("/finance-queue", authenticateToken, requirePermission(PERMISSIONS.ACCOUNTING_REQUESTS_QUEUE), async (req, res) => {
     try {
-        const transport = await HrTransportRequest.findAll({
+        const transport = await filterByFinanceScope(req.user.role, await HrTransportRequest.findAll({
             where: { status: "pending_finance" },
             order: [["createdAt", "ASC"]],
             include: [{ model: HrTransportAccompanier, as: "accompaniers" }],
-        });
+        }));
         const [names, projectNames] = await Promise.all([
             resolveEmployeeNames(transport.map(r => r.requesterEmpNo)),
             resolveProjectLabels(transport.map(r => r.projectLabel)),
@@ -2054,10 +2060,10 @@ router.get("/finance-queue", authenticateToken, requirePermission(PERMISSIONS.AC
 // ============================================================
 router.get("/finance-queue/employees", authenticateToken, requirePermission(PERMISSIONS.ACCOUNTING_REQUESTS_QUEUE), async (req, res) => {
     try {
-        const rows = await HrTransportRequest.findAll({
+        const rows = await filterByFinanceScope(req.user.role, await HrTransportRequest.findAll({
             where: { status: "pending_finance" },
             attributes: ["requesterEmpNo"],
-        });
+        }));
         const empNos = rows.map((r) => r.requesterEmpNo);
         const names = await resolveEmployeeNames(empNos);
         const data = [...new Set(empNos)]

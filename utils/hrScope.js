@@ -176,22 +176,70 @@ export async function getUserIdsForEmpNo(empNo) {
     return users.map((u) => u.userId);
 }
 
+// Transport-reimbursement finance stage split by company (per explicit
+// direction 2026-11-15): Ittihad (Comp_num=10) requests belong to the
+// dedicated accounting_ittihad role instead of plain accounting --
+// finance queue, finance decision, mark-paid, notification, and the
+// Transport report/export. accounting_manager/gm/admin (and any other
+// role an admin grants these keys to) keep the full company-wide view as
+// a fallback, e.g. while the Ittihad accountant is on leave.
+export const ITTIHAD_ACCOUNTING_ROLE = "accounting_ittihad";
+
+// "ittihad" | "non_ittihad" | "all"
+export function financeScopeForRole(role) {
+    if (role === ITTIHAD_ACCOUNTING_ROLE) return "ittihad";
+    if (role === "accounting") return "non_ittihad";
+    return "all";
+}
+
+// Every Ittihad Emp_num regardless of Work_status -- a request filed by
+// someone who has since left still belongs to the Ittihad accountant.
+export async function getAllIttihadEmpNos() {
+    const result = await withSqlRetry("erp", (pool) => pool.request()
+        .query(`SELECT Emp_num FROM ${SQL_DB}.dbo.PayEmp WHERE ${ITTIHAD_WHERE}`));
+    return new Set(result.recordset.map((r) => Number(r.Emp_num)));
+}
+
+// Keeps only the rows (anything with a requesterEmpNo) the role's finance
+// scope covers.
+export async function filterByFinanceScope(role, rows) {
+    const scope = financeScopeForRole(role);
+    if (scope === "all" || rows.length === 0) return rows;
+    const ittihad = await getAllIttihadEmpNos();
+    return rows.filter((r) => ittihad.has(Number(r.requesterEmpNo)) === (scope === "ittihad"));
+}
+
+export async function isInFinanceScope(role, requesterEmpNo) {
+    return (await filterByFinanceScope(role, [{ requesterEmpNo }])).length === 1;
+}
+
 // Which InsUser accounts to notify when a transport request reaches
 // pending_finance -- whichever roles actually hold
 // PERMISSIONS.ACCOUNTING_REQUESTS_QUEUE right now (admin-editable via
 // PermissionGrants, so this stays correct if grants change rather than
-// hardcoding accounting/accounting_manager).
-export async function getFinanceReviewerUserIds() {
+// hardcoding accounting/accounting_manager), narrowed by company: an
+// Ittihad requester notifies only the Ittihad accountant (or, if no such
+// active account exists yet, the company-wide fallback roles so the
+// request never waits on nobody); everyone else notifies every granted
+// role except the Ittihad accountant.
+export async function getFinanceReviewerUserIds(requesterEmpNo) {
     const grants = await PermissionGrant.findAll({
         where: { permissionKey: PERMISSIONS.ACCOUNTING_REQUESTS_QUEUE },
         attributes: ["role"],
     });
     const roles = grants.map((g) => g.role);
     if (roles.length === 0) return [];
-    const reviewers = await User.findAll({
+    let reviewers = await User.findAll({
         where: { role: roles, active: true },
-        attributes: ["userId"],
+        attributes: ["userId", "role"],
     });
+    const isIttihad = (await getAllIttihadEmpNos()).has(Number(requesterEmpNo));
+    if (isIttihad) {
+        const own = reviewers.filter((u) => u.role === ITTIHAD_ACCOUNTING_ROLE);
+        reviewers = own.length > 0 ? own : reviewers.filter((u) => financeScopeForRole(u.role) === "all");
+    } else {
+        reviewers = reviewers.filter((u) => financeScopeForRole(u.role) !== "ittihad");
+    }
     return reviewers.map((u) => u.userId);
 }
 
