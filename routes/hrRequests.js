@@ -31,7 +31,7 @@ import {
     HrVisitReportRow,
 } from "../models/index.js";
 import { isSupervisorOf, getSupervisedEmpNos, hasRealSupervisor, getEmpNosWithoutRealSupervisor, getSupervisorUserId, getFallbackManagerUserIds, isGeneralManager } from "../utils/supervisorLookup.js";
-import { isHrScopedRole, isInHrScope, getHrQueueEmpNos, isInHrQueueScope, getHrReviewerUserIds, getFinanceReviewerUserIds, filterByFinanceScope, isInFinanceScope, getGmReviewerUserIds, getSecondApproverEmpNo, getSecondApprovalSourceEmpNos, secondStageApproverFor, isSecondApproverEmpNo, getUserIdsForEmpNo, INSTALLATION_SECOND_APPROVER_EMP_NO, isEligibleForVisitReport } from "../utils/hrScope.js";
+import { isHrScopedRole, isInHrScope, getHrQueueEmpNos, isInHrQueueScope, getHrReviewerUserIds, getFinanceReviewerUserIds, filterByFinanceScope, isInFinanceScope, getGmReviewerUserIds, getSecondApproverEmpNo, getThirdApproverEmpNo, isAwaitingThirdApproval, getSecondApprovalSourceEmpNos, secondStageApproverFor, isSecondApproverEmpNo, getUserIdsForEmpNo, INSTALLATION_SECOND_APPROVER_EMP_NO, ITTIHAD_TRANSPORT_APPROVER_EMP_NO, isEligibleForVisitReport } from "../utils/hrScope.js";
 import { resolveEmployeeNames, resolveVacationBalances } from "../utils/employeeLookup.js";
 import { resolveUserNames } from "../utils/userLookup.js";
 import { resolveProjectLabels, withProjectDisplay } from "../utils/projectLookup.js";
@@ -107,9 +107,12 @@ async function notifyGmReviewers({ title, body }) {
 // approval stage) -- tell the requester where it stands and the second
 // approver (see secondStageApproverFor) that it's their turn.
 async function notifyAwaitingFactoryManager(request, { title, noun }) {
+    const third = isAwaitingThirdApproval(request);
     sendPushToUser(request.requesterUserId, {
         title,
-        body: `Your manager approved your ${noun} — now awaiting second approval.`,
+        body: third
+            ? `The second approver approved your ${noun} — now awaiting final approval.`
+            : `Your manager approved your ${noun} — now awaiting second approval.`,
     });
     try {
         const approver = secondStageApproverFor(request, await getSecondApprovalSourceEmpNos());
@@ -175,15 +178,24 @@ function isFactoryManagerCaller(req) {
 // 554 gets the requests first-approved by Work_place 1364 staff; the
 // factory manager gets the rest (including admin-fallback approvals,
 // managerApproverEmpNo NULL), same as before this split.
-async function secondStageWhereForCaller(req) {
+// pending=true is the waiting-on-me list: there, an Ittihad transport
+// request 554 already approved (still pending_factory_mgr, see
+// isAwaitingThirdApproval) belongs to 100254, not 554. The history view
+// (pending=false, factoryMgrDecidedAt set) keeps it under 554's decisions.
+async function secondStageWhereForCaller(req, { pending = false } = {}) {
     if (req.user.role === "admin") return {};
     if (!isSecondApproverEmpNo(req.user.assignedEmpNo)) return null;
     const sources = await getSecondApprovalSourceEmpNos();
     if (parseInt(req.user.assignedEmpNo) === INSTALLATION_SECOND_APPROVER_EMP_NO) {
-        return { managerApproverEmpNo: sources.length ? sources : [-1] };
+        const where = { managerApproverEmpNo: sources.length ? sources : [-1] };
+        if (pending) where.factoryMgrDecision = null;
+        return where;
     }
-    if (!sources.length) return {};
-    return { [Op.or]: [{ managerApproverEmpNo: null }, { managerApproverEmpNo: { [Op.notIn]: sources } }] };
+    const mine = [{ managerApproverEmpNo: null }];
+    if (sources.length) mine.push({ managerApproverEmpNo: { [Op.notIn]: sources } });
+    else return {};
+    if (pending) mine.push({ factoryMgrDecision: "approved" });
+    return { [Op.or]: mine };
 }
 
 // Shared by all 4 .../manager-decision endpoints. Covers both
@@ -193,7 +205,7 @@ async function secondStageWhereForCaller(req) {
 // stages goes (pending_hr, pending_hr_audit, or pending_gm). Returns the
 // stage decided ("manager" | "factory_mgr"), or null after already
 // sending an error response.
-async function applyManagerStageDecision(req, res, request, decision, note, nextStatus) {
+async function applyManagerStageDecision(req, res, request, decision, note, nextStatus, type = null) {
     const callerEmpNo = req.user.assignedEmpNo ? parseInt(req.user.assignedEmpNo) : null;
     if (request.status === "pending_factory_mgr") {
         const approver = secondStageApproverFor(request, await getSecondApprovalSourceEmpNos());
@@ -201,12 +213,28 @@ async function applyManagerStageDecision(req, res, request, decision, note, next
             res.status(403).json({ success: false, message: "Only the second approver can act on this stage" });
             return null;
         }
+        // Third stage (Ittihad transport, 554 already approved -> 100254).
+        if (isAwaitingThirdApproval(request)) {
+            await request.update({
+                thirdApproverEmpNo: callerEmpNo,
+                thirdDecision: decision,
+                thirdDecidedAt: new Date(),
+                thirdNote: note || null,
+                status: decision === "approved" ? nextStatus : "rejected",
+            });
+            return "third";
+        }
+        let status = "rejected";
+        if (decision === "approved") {
+            const third = await getThirdApproverEmpNo(type, request.requesterEmpNo, request.managerApproverEmpNo, approver);
+            status = third ? "pending_factory_mgr" : nextStatus;
+        }
         await request.update({
             factoryMgrApproverEmpNo: callerEmpNo,
             factoryMgrDecision: decision,
             factoryMgrDecidedAt: new Date(),
             factoryMgrNote: note || null,
-            status: decision === "approved" ? nextStatus : "rejected",
+            status,
         });
         return "factory_mgr";
     }
@@ -220,7 +248,7 @@ async function applyManagerStageDecision(req, res, request, decision, note, next
     }
     let status = "rejected";
     if (decision === "approved") {
-        status = (await getSecondApproverEmpNo(request.requesterEmpNo, callerEmpNo)) ? "pending_factory_mgr" : nextStatus;
+        status = (await getSecondApproverEmpNo(request.requesterEmpNo, callerEmpNo, type)) ? "pending_factory_mgr" : nextStatus;
     }
     await request.update({
         managerApproverEmpNo: callerEmpNo,
@@ -823,13 +851,13 @@ router.put("/transport-requests/:id/manager-decision", authenticateToken, async 
     try {
         const request = await HrTransportRequest.findByPk(req.params.id);
         if (!request) return res.status(404).json({ success: false, message: "Request not found" });
-        const stage = await applyManagerStageDecision(req, res, request, decision, note, "pending_hr_audit");
+        const stage = await applyManagerStageDecision(req, res, request, decision, note, "pending_hr_audit", "transport");
         if (!stage) return;
         if (request.status === "pending_factory_mgr") {
             notifyAwaitingFactoryManager(request, { title: "Transportation request update", noun: "transportation request" });
             return res.json({ success: true });
         }
-        const by = stage === "factory_mgr" ? "The second approver" : "Your manager";
+        const by = stage === "third" ? "The final approver" : stage === "factory_mgr" ? "The second approver" : "Your manager";
         sendPushToUser(request.requesterUserId, {
             title: "Transportation request update",
             body: decision === "approved" ? `${by} approved your transportation request — now awaiting HR audit.` : `${by} rejected your transportation request.`,
@@ -1684,6 +1712,7 @@ router.get("/my-requests", authenticateToken, async (req, res) => {
                 ...attendance.map(r => r.factoryMgrApproverEmpNo),
                 ...transport.map(r => r.managerApproverEmpNo),
                 ...transport.map(r => r.factoryMgrApproverEmpNo),
+                ...transport.map(r => r.thirdApproverEmpNo),
                 ...overtime.map(r => r.managerApproverEmpNo),
                 ...overtime.map(r => r.factoryMgrApproverEmpNo),
                 ...visits.map(r => r.managerApproverEmpNo),
@@ -1704,6 +1733,7 @@ router.get("/my-requests", authenticateToken, async (req, res) => {
         const approvers = (r, hrField) => ({
             managerApprover: r.managerApproverEmpNo ? (empNames[r.managerApproverEmpNo] || null) : null,
             factoryMgrApprover: r.factoryMgrApproverEmpNo ? (empNames[r.factoryMgrApproverEmpNo] || null) : null,
+            thirdApprover: r.thirdApproverEmpNo ? (empNames[r.thirdApproverEmpNo] || null) : null,
             hrApprover: r[hrField] ? (userNames[r[hrField]] || null) : null,
         });
 
@@ -1753,7 +1783,7 @@ router.get("/manager-approvals", authenticateToken, async (req, res) => {
 
         // pending_factory_mgr isn't Supervisor_No-scoped either -- each second
         // approver sees what waits on them (see secondStageWhereForCaller).
-        const fmWhere = { ...(await secondStageWhereForCaller(req)), status: "pending_factory_mgr" };
+        const fmWhere = { ...(await secondStageWhereForCaller(req, { pending: true })), status: "pending_factory_mgr" };
         const [leaveMgr, attendanceMgr, transportMgr, overtimeMgr, leaveFm, attendanceFm, transportFm, overtimeFm, overtimeGm, visitsMgr, visitsFm] = await Promise.all([
             skipManagerStage ? [] : HrLeaveRequest.findAll({ where, order: [["createdAt", "ASC"]] }),
             skipManagerStage ? [] : HrAttendanceCorrectionRequest.findAll({ where, order: [["createdAt", "ASC"]], include: [{ model: HrAttendanceCorrectionRow, as: "rows" }] }),
@@ -1847,7 +1877,13 @@ router.get("/manager-approvals-history", authenticateToken, async (req, res) => 
         // this is one mixed list, and an app version that doesn't know the
         // type yet would show it as a broken card.
         const withVisits = String(req.query.include || "").split(",").includes("visit");
-        const [leave, attendance, transport, overtime, overtimeGm, leaveFm, attendanceFm, transportFm, overtimeFm, visits, visitsFm] = await Promise.all([
+        // Ittihad-transport third-stage decisions (100254 after 554).
+        const callerEmpNo = req.user.assignedEmpNo ? parseInt(req.user.assignedEmpNo) : null;
+        const isThirdApprover = req.user.role === "admin" || callerEmpNo === ITTIHAD_TRANSPORT_APPROVER_EMP_NO;
+        const thirdWhere = req.user.role === "admin"
+            ? { thirdDecidedAt: { [Op.ne]: null } }
+            : { thirdDecidedAt: { [Op.ne]: null }, thirdApproverEmpNo: callerEmpNo };
+        const [leave, attendance, transport, overtime, overtimeGm, leaveFm, attendanceFm, transportFm, overtimeFm, visits, visitsFm, transportThird] = await Promise.all([
             skipManagerStage ? [] : HrLeaveRequest.findAll({ where, order: [["managerDecidedAt", "DESC"]] }),
             skipManagerStage ? [] : HrAttendanceCorrectionRequest.findAll({ where, order: [["managerDecidedAt", "DESC"]], include: [{ model: HrAttendanceCorrectionRow, as: "rows" }] }),
             skipManagerStage ? [] : HrTransportRequest.findAll({ where, order: [["managerDecidedAt", "DESC"]], include: [{ model: HrTransportAccompanier, as: "accompaniers" }] }),
@@ -1864,6 +1900,7 @@ router.get("/manager-approvals-history", authenticateToken, async (req, res) => 
             isFactoryMgr ? HrOvertimeRequest.findAll({ where: fmWhere, order: fmOrder }) : [],
             withVisits && !skipManagerStage ? HrVisitReport.findAll({ where, order: [["managerDecidedAt", "DESC"]], include: [VISIT_ROWS_INCLUDE] }) : [],
             withVisits && isFactoryMgr ? HrVisitReport.findAll({ where: fmWhere, order: fmOrder, include: [VISIT_ROWS_INCLUDE] }) : [],
+            isThirdApprover ? HrTransportRequest.findAll({ where: thirdWhere, order: [["thirdDecidedAt", "DESC"]], include: [{ model: HrTransportAccompanier, as: "accompaniers" }] }) : [],
         ]);
 
         // callerStage marks which decision was actually the current
@@ -1886,6 +1923,7 @@ router.get("/manager-approvals-history", authenticateToken, async (req, res) => 
             ...overtimeFm.map(r => ({ ...r.toJSON(), type: "overtime", callerStage: "factory_mgr", sortDate: r.factoryMgrDecidedAt })),
             ...visits.map(r => ({ ...r.toJSON(), type: "visit", callerStage: "manager", sortDate: r.managerDecidedAt })),
             ...visitsFm.map(r => ({ ...r.toJSON(), type: "visit", callerStage: "factory_mgr", sortDate: r.factoryMgrDecidedAt })),
+            ...transportThird.map(r => ({ ...r.toJSON(), type: "transport", callerStage: "third", sortDate: r.thirdDecidedAt })),
         ];
         combined.sort((a, b) => new Date(b.sortDate) - new Date(a.sortDate));
 

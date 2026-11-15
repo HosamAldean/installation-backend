@@ -139,15 +139,51 @@ async function hasActiveAccount(empNo) {
 // when that person already approved it as the direct manager, for their
 // own requests, and when they have no active account (otherwise the
 // request would wait on nobody).
-export async function getSecondApproverEmpNo(requesterEmpNo, managerApproverEmpNo) {
+// Ittihad transport reimbursements (per explicit direction 2026-11-15):
+// 100254 approves after the manager -- as the second approval normally, or
+// as a THIRD approval after 554 when the manager is in Work_place 1364
+// (manager -> 554 -> 100254). Transport only; other Ittihad request types
+// are unchanged. Skipped when 100254 is the requester, already approved
+// as the manager, or has no active account.
+export const ITTIHAD_TRANSPORT_APPROVER_EMP_NO = FACTORY_MANAGER_EMP_NO;
+
+async function ittihadTransportApproverApplies(type, requester, managerApprover) {
+    if (type !== "transport") return false;
+    const approver = ITTIHAD_TRANSPORT_APPROVER_EMP_NO;
+    if (requester === approver || managerApprover === approver) return false;
+    if (!(await getAllIttihadEmpNos()).has(requester)) return false;
+    return hasActiveAccount(approver);
+}
+
+// After the second approver approved: who gives the third approval, or
+// null to move on. Only the Ittihad-transport 554 -> 100254 chain has one.
+export async function getThirdApproverEmpNo(type, requesterEmpNo, managerApproverEmpNo, secondApproverEmpNo) {
+    const requester = parseInt(requesterEmpNo);
+    const managerApprover = parseInt(managerApproverEmpNo);
+    if (parseInt(secondApproverEmpNo) === ITTIHAD_TRANSPORT_APPROVER_EMP_NO) return null;
+    return (await ittihadTransportApproverApplies(type, requester, managerApprover))
+        ? ITTIHAD_TRANSPORT_APPROVER_EMP_NO
+        : null;
+}
+
+export async function getSecondApproverEmpNo(requesterEmpNo, managerApproverEmpNo, type = null) {
     const requester = parseInt(requesterEmpNo);
     const managerApprover = parseInt(managerApproverEmpNo);
     if (!requester) return null;
 
     if (managerApprover && (await getSecondApprovalSourceEmpNos()).includes(managerApprover)) {
+        // Known gap: if 554 is skipped here for an Ittihad transport request
+        // (554 is the requester / has no account), 100254's approval is
+        // skipped too -- the awaited approver is derived from
+        // managerApproverEmpNo, which would point at 554 (see
+        // secondStageApproverFor).
         const approver = INSTALLATION_SECOND_APPROVER_EMP_NO;
         if (requester === approver || managerApprover === approver) return null;
         return (await hasActiveAccount(approver)) ? approver : null;
+    }
+
+    if (await ittihadTransportApproverApplies(type, requester, managerApprover)) {
+        return ITTIHAD_TRANSPORT_APPROVER_EMP_NO;
     }
 
     if (requester === FACTORY_MANAGER_EMP_NO) return null;
@@ -161,9 +197,16 @@ export async function getSecondApproverEmpNo(requesterEmpNo, managerApproverEmpN
 // Derived from who gave the first approval, so no extra column is needed
 // (and requests already pending for the factory manager stay his).
 export function secondStageApproverFor(request, sourceEmpNos) {
+    // Still pending although the second approver already approved = the
+    // Ittihad-transport third stage (554 approved, waiting on 100254).
+    if (isAwaitingThirdApproval(request)) return ITTIHAD_TRANSPORT_APPROVER_EMP_NO;
     return sourceEmpNos.includes(parseInt(request.managerApproverEmpNo))
         ? INSTALLATION_SECOND_APPROVER_EMP_NO
         : FACTORY_MANAGER_EMP_NO;
+}
+
+export function isAwaitingThirdApproval(request) {
+    return request.status === "pending_factory_mgr" && request.factoryMgrDecision === "approved";
 }
 
 export function isSecondApproverEmpNo(empNo) {

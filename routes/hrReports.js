@@ -447,6 +447,7 @@ router.get("/transport", authenticateToken, requirePermission(PERMISSIONS.HR_REP
                 ...transport.map((r) => r.requesterEmpNo),
                 ...transport.map((r) => r.managerApproverEmpNo),
                 ...transport.map((r) => r.factoryMgrApproverEmpNo),
+                ...transport.map((r) => r.thirdApproverEmpNo),
             ]),
             resolveUserNames([
                 ...transport.map((r) => r.hrAuditorUserId),
@@ -462,6 +463,7 @@ router.get("/transport", authenticateToken, requirePermission(PERMISSIONS.HR_REP
                 employee: empNames[r.requesterEmpNo] || null,
                 managerApprover: r.managerApproverEmpNo ? (empNames[r.managerApproverEmpNo] || null) : null,
                 factoryMgrApprover: r.factoryMgrApproverEmpNo ? (empNames[r.factoryMgrApproverEmpNo] || null) : null,
+                thirdApprover: r.thirdApproverEmpNo ? (empNames[r.thirdApproverEmpNo] || null) : null,
                 hrApprover: r.hrAuditorUserId ? (userNames[r.hrAuditorUserId] || null) : null,
                 financeApprover: r.financeApproverUserId ? (userNames[r.financeApproverUserId] || null) : null,
                 paidBy: r.paidByUserId ? (userNames[r.paidByUserId] || null) : null,
