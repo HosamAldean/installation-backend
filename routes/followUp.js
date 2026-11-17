@@ -1028,10 +1028,15 @@ const OSRM_MAX_WAYPOINTS = 100; // osrm-routed's default --max-matching-size
 const OSRM_MATCH_RADIUS_M = 50; // phone GPS accuracy in the city
 const OSRM_MAX_REAL_KMH = 180;
 const OSRM_BATCH_HOP_SHARE = 0.2;
-const OSRM_TIMEOUT_MS = 8000;
+// /match with a 50 m radius is slow (~130 ms a point on the MLD build), so a
+// long day needs well over the old 8 s.
+const OSRM_TIMEOUT_MS = 25000;
 // Past days never change, so their road result is kept in memory.
 const roadRouteCache = new Map(); // `${teamId}|${date}` -> result
 const ROAD_CACHE_MAX = 500;
+// Today's result, reused until the team sends a new ping (the live map
+// refreshes far more often than pings arrive).
+const todayRoadCache = new Map(); // teamId -> { date, sig, road }
 
 async function roadRouteThrough(pings) {
     const kept = [];
@@ -1084,7 +1089,12 @@ async function roadRouteThrough(pings) {
                 chunk.forEach((p) => path.push([Number(p.latitude), Number(p.longitude)]));
             }
         } catch {
-            return null;
+            // Timeout or OSRM down: this chunk (and the rest, so a hung OSRM
+            // isn't waited on again) counts as straight line, keeping any
+            // road distance already matched.
+            for (let k = i + 1; k < kept.length; k++) meters += haversineKm(kept[k - 1], kept[k]) * 1000;
+            kept.slice(i).forEach((p) => path.push([Number(p.latitude), Number(p.longitude)]));
+            break;
         } finally {
             clearTimeout(timer);
         }
@@ -1150,12 +1160,19 @@ router.get('/team/day/:teamId', authenticateToken, requirePermission(PERMISSIONS
 
         const cacheKey = `${teamId}|${date}`;
         const isPastDay = date < jordanDayRange().date;
-        let road = isPastDay ? roadRouteCache.get(cacheKey) : undefined;
+        const lastPing = pings[pings.length - 1];
+        const todaySig = `${pings.length}|${lastPing ? new Date(lastPing.ping_time).getTime() : 0}`;
+        const todayHit = !isPastDay ? todayRoadCache.get(teamId) : undefined;
+        let road = isPastDay
+            ? roadRouteCache.get(cacheKey)
+            : (todayHit && todayHit.date === date && todayHit.sig === todaySig ? todayHit.road : undefined);
         if (road === undefined) {
             road = await roadRouteThrough(pings);
             if (road && isPastDay) {
                 if (roadRouteCache.size >= ROAD_CACHE_MAX) roadRouteCache.delete(roadRouteCache.keys().next().value);
                 roadRouteCache.set(cacheKey, road);
+            } else if (road) {
+                todayRoadCache.set(teamId, { date, sig: todaySig, road });
             }
         }
 
