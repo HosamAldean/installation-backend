@@ -2101,6 +2101,8 @@ router.post("/delivery-status", authenticateToken, requirePermission(PERMISSIONS
 // POST /api/follow-up/location
 // Periodic location ping from the mobile app; upserts the employee's team
 // location so it shows up wherever instTeamLocations is already consumed (SSE dashboard).
+const PING_MIN_GAP_S = 120;
+
 router.post("/location", authenticateToken, async (req, res) => {
     try {
         const { lat, lng } = req.body;
@@ -2139,6 +2141,23 @@ router.post("/location", authenticateToken, async (req, res) => {
         const ageSeconds = Number.isFinite(capturedAt) && capturedAt > 0
             ? Math.min(Math.max(0, Math.round((Date.now() - capturedAt) / 1000)), 7 * 24 * 3600)
             : 0;
+
+        // Android treats the app's 30-minute interval as a hint: when another
+        // app (navigation, live-location sharing) uses GPS, our background
+        // task gets every fix -- confirmed 2026-11-17, team 63 sent a ping
+        // every 30 s all night and every ~6 s while driving (1,103 in a
+        // day). Keep at most one ping per team per PING_MIN_GAP_S, measured
+        // around the fix's own time so offline replays are thinned too.
+        // Still answers success so the app doesn't queue a retry.
+        const [nearby] = await sequelize2.query(
+            `SELECT 1 AS hit FROM IIT_Petra.instTeamLocations
+             WHERE team_id = :teamId
+               AND ping_time > DATE_SUB(UTC_TIMESTAMP(), INTERVAL :before SECOND)
+               AND ping_time < DATE_SUB(UTC_TIMESTAMP(), INTERVAL :after SECOND)
+             LIMIT 1`,
+            { replacements: { teamId, before: ageSeconds + PING_MIN_GAP_S, after: ageSeconds - PING_MIN_GAP_S }, type: QueryTypes.SELECT }
+        );
+        if (nearby) return res.json({ success: true, skipped: true });
 
         // upsertTeamLocation silently no-ops if teamId doesn't reference a
         // real instTeams row (e.g. a stale teamId on an office/admin account),
