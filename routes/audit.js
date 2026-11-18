@@ -22,6 +22,7 @@ import { sequelize, sequelize2, sequelize3, getSqlPool, getSqlServerKeys } from 
 import { sseClients } from "../sse.js";
 import { getRateLimitedIdentities, clearRateLimitKey } from "./auth.js";
 import { BlockedIp } from "../models/BlockedIp.js";
+import { ActivityAudit } from "../models/ActivityAudit.js";
 import { invalidateBlockedIpsCache } from "../middleware/ipBlock.js";
 
 const router = express.Router();
@@ -29,11 +30,234 @@ router.use(authenticateToken, authorizeRoles("admin"));
 
 const DEFAULT_PAGE_SIZE = 30;
 const MAX_PAGE_SIZE = 200;
+// The page's "Export" buttons ask for one big page (export=1) with the
+// same filters instead of paging through 200 rows at a time.
+const MAX_EXPORT_SIZE = 5000;
 function parsePagination(query) {
     const page = Math.max(1, parseInt(query.page) || 1);
-    const pageSize = Math.min(MAX_PAGE_SIZE, Math.max(1, parseInt(query.pageSize) || DEFAULT_PAGE_SIZE));
+    const max = query.export === "1" ? MAX_EXPORT_SIZE : MAX_PAGE_SIZE;
+    const pageSize = Math.min(max, Math.max(1, parseInt(query.pageSize) || DEFAULT_PAGE_SIZE));
     return { page, pageSize };
 }
+
+function dateRange(dateFrom, dateTo) {
+    if (!dateFrom && !dateTo) return null;
+    const r = {};
+    if (dateFrom) r[Op.gte] = new Date(`${dateFrom}T00:00:00`);
+    if (dateTo) r[Op.lte] = new Date(`${dateTo}T23:59:59`);
+    return r;
+}
+
+function startOfToday() {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    return d;
+}
+
+const nameLike = (q) => ({ [Op.or]: [
+    { username: { [Op.like]: `%${q}%` } },
+    { firstName: { [Op.like]: `%${q}%` } },
+    { lastName: { [Op.like]: `%${q}%` } },
+] });
+
+// ============================================================
+// GET /summary -- the Overview tab's numbers: today's logins, alerts,
+// blocked IPs, who is online, denied requests, data changes, and the
+// busiest users/modules today.
+// ============================================================
+router.get("/summary", async (req, res) => {
+    try {
+        const today = { [Op.gte]: startOfToday() };
+        const [
+            loginsOk, loginsFailed, failedIps, openAlerts, blockedIps, onlineUsers,
+            deniedToday, changesToday, changeErrorsToday, topUsers, topModules,
+        ] = await Promise.all([
+            LoginAudit.count({ where: { success: true, createdAt: today } }),
+            LoginAudit.count({ where: { success: false, createdAt: today } }),
+            LoginAudit.count({ where: { success: false, createdAt: today }, distinct: true, col: "ip" }),
+            SecurityAlert.count({ where: { acknowledged: false } }),
+            BlockedIp.count(),
+            User.count({ where: { isOnline: true } }),
+            UnauthorizedAccessAudit.count({ where: { createdAt: today } }),
+            ActivityAudit.count({ where: { createdAt: today } }),
+            ActivityAudit.count({ where: { createdAt: today, status: { [Op.gte]: 400 } } }),
+            ActivityAudit.findAll({
+                where: { createdAt: today },
+                attributes: ["userId", [fn("COUNT", col("id")), "count"]],
+                group: ["userId"], order: [[literal("count"), "DESC"]], limit: 5, raw: true,
+            }),
+            ActivityAudit.findAll({
+                where: { createdAt: today },
+                attributes: ["module", [fn("COUNT", col("id")), "count"]],
+                group: ["module"], order: [[literal("count"), "DESC"]], limit: 6, raw: true,
+            }),
+        ]);
+        const names = await resolveUserNames(topUsers.map((u) => u.userId));
+        res.json({
+            success: true,
+            summary: {
+                loginsOk, loginsFailed, failedIps, openAlerts, blockedIps, onlineUsers,
+                deniedToday, changesToday, changeErrorsToday,
+                rateLimited: getRateLimitedIdentities().length,
+                topUsers: topUsers.map((u) => ({ userId: u.userId, count: Number(u.count), user: names[u.userId] || null })),
+                topModules: topModules.map((m) => ({ module: m.module, count: Number(m.count) })),
+            },
+        });
+    } catch (err) {
+        console.error("❌ AUDIT SUMMARY ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to load audit summary" });
+    }
+});
+
+// ============================================================
+// GET /activity -- every data change made through the app (see
+// middleware/activityAudit.js). Filters: userId, username (partial, also
+// matches first/last name), module, method, outcome ('ok' | 'error'),
+// q (partial path/route), platform, dateFrom/dateTo.
+// ============================================================
+router.get("/activity", async (req, res) => {
+    try {
+        const { page, pageSize } = parsePagination(req.query);
+        const { userId, username, module, method, outcome, q, platform, dateFrom, dateTo } = req.query;
+        const where = {};
+        if (userId) where.userId = parseInt(userId, 10) || 0;
+        if (username) {
+            const users = await User.findAll({ where: nameLike(username), attributes: ["userId"], limit: 200 });
+            where.userId = users.length ? users.map((u) => u.userId) : -1;
+        }
+        if (module) where.module = module;
+        if (method) where.method = method;
+        if (platform) where.platform = platform;
+        if (outcome === "ok") where.status = { [Op.lt]: 400 };
+        if (outcome === "error") where.status = { [Op.gte]: 400 };
+        if (q) where[Op.or] = [{ path: { [Op.like]: `%${q}%` } }, { route: { [Op.like]: `%${q}%` } }];
+        const range = dateRange(dateFrom, dateTo);
+        if (range) where.createdAt = range;
+
+        const { count: total, rows } = await ActivityAudit.findAndCountAll({
+            where, order: [["createdAt", "DESC"], ["id", "DESC"]],
+            offset: (page - 1) * pageSize, limit: pageSize,
+        });
+        const names = await resolveUserNames(rows.map((r) => r.userId));
+        const items = rows.map((r) => ({ ...r.toJSON(), user: r.userId ? (names[r.userId] || null) : null }));
+        res.json({ success: true, items, total, page, pageSize });
+    } catch (err) {
+        console.error("❌ AUDIT ACTIVITY ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to fetch activity log" });
+    }
+});
+
+// GET /activity/modules -- module names seen in the last 90 days, for the
+// filter dropdown.
+router.get("/activity/modules", async (req, res) => {
+    try {
+        const rows = await ActivityAudit.findAll({
+            where: { createdAt: { [Op.gte]: new Date(Date.now() - 90 * 86400000) } },
+            attributes: ["module", [fn("COUNT", col("id")), "count"]],
+            group: ["module"], order: [["module", "ASC"]], raw: true,
+        });
+        res.json({ success: true, modules: rows.filter((r) => r.module).map((r) => ({ module: r.module, count: Number(r.count) })) });
+    } catch (err) {
+        console.error("❌ AUDIT ACTIVITY MODULES ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to fetch modules" });
+    }
+});
+
+// GET /users/search?q= -- user picker for the per-user timeline.
+router.get("/users/search", async (req, res) => {
+    try {
+        const q = String(req.query.q || "").trim();
+        if (q.length < 2) return res.json({ success: true, users: [] });
+        const where = nameLike(q);
+        where[Op.or].push({ assignedEmpNo: { [Op.like]: `%${q}%` } });
+        const users = await User.findAll({
+            where,
+            attributes: ["userId", "username", "firstName", "lastName", "role", "active"],
+            order: [["username", "ASC"]], limit: 20,
+        });
+        res.json({ success: true, users });
+    } catch (err) {
+        console.error("❌ AUDIT USER SEARCH ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to search users" });
+    }
+});
+
+// ============================================================
+// GET /user-timeline/:userId -- everything one account did or had done to
+// it, newest first, merged from every audit table: logins, data changes,
+// denied requests, account changes (on it or by it), permission and admin
+// changes it made. Optional dateFrom/dateTo; capped at limit (default 300).
+// ============================================================
+router.get("/user-timeline/:userId", async (req, res) => {
+    try {
+        const userId = parseInt(req.params.userId, 10);
+        if (!userId) return res.status(400).json({ success: false, message: "userId required" });
+        const limit = Math.min(1000, Math.max(20, parseInt(req.query.limit, 10) || 300));
+        const range = dateRange(req.query.dateFrom, req.query.dateTo);
+        const when = range ? { createdAt: range } : {};
+        const user = await User.findByPk(userId, {
+            attributes: ["userId", "username", "firstName", "lastName", "role", "active", "isOnline", "lastSeenAt", "assignedEmpNo", "lastMobileAppVersionCode"],
+        });
+        if (!user) return res.status(404).json({ success: false, message: "User not found" });
+
+        const order = [["createdAt", "DESC"]];
+        const [logins, activity, denied, accountOn, accountBy, perms, admin] = await Promise.all([
+            LoginAudit.findAll({ where: { ...when, [Op.or]: [{ userId }, { username: user.username }] }, order, limit }),
+            ActivityAudit.findAll({ where: { ...when, userId }, order, limit }),
+            UnauthorizedAccessAudit.findAll({ where: { ...when, userId }, order, limit }),
+            UserAccountAudit.findAll({ where: { ...when, targetUserId: userId }, order, limit }),
+            UserAccountAudit.findAll({ where: { ...when, performedByUserId: userId }, order, limit }),
+            PermissionGrantAudit.findAll({ where: { ...when, performedByUserId: userId }, order, limit }),
+            AdminActionAudit.findAll({ where: { ...when, performedByUserId: userId }, order, limit }),
+        ]);
+
+        const ids = [...accountOn, ...accountBy, ...perms, ...admin].map((r) => r.performedByUserId);
+        const names = await resolveUserNames(ids);
+        const events = [];
+        logins.forEach((r) => events.push({
+            kind: "login", at: r.createdAt, ok: r.success, ip: r.ip,
+            title: r.success ? "Signed in" : "Failed sign-in",
+            detail: [r.platform, r.failureReason, r.appVersionCode ? `app ${r.appVersionCode}` : null].filter(Boolean).join(" · "),
+        }));
+        activity.forEach((r) => events.push({
+            kind: "change", at: r.createdAt, ok: r.status < 400, ip: r.ip,
+            title: `${r.method} ${r.route || r.path}`, module: r.module, status: r.status,
+            detail: r.path, body: r.body, platform: r.platform,
+        }));
+        denied.forEach((r) => events.push({
+            kind: "denied", at: r.createdAt, ok: false, ip: r.ip,
+            title: `Denied: ${r.method} ${r.path}`, detail: r.requiredAccess || "",
+        }));
+        accountOn.forEach((r) => events.push({
+            kind: "account", at: r.createdAt, ok: true,
+            title: `Account ${String(r.action).replace(/_/g, " ")}`,
+            detail: [
+                r.oldValue && r.newValue ? `${r.oldValue} → ${r.newValue}` : r.newValue,
+                r.performedByUserId ? `by ${names[r.performedByUserId]?.name || r.performedByUserId}` : null,
+            ].filter(Boolean).join(" · "),
+        }));
+        accountBy.filter((r) => r.targetUserId !== userId).forEach((r) => events.push({
+            kind: "account", at: r.createdAt, ok: true,
+            title: `Changed account ${r.targetUsername}: ${String(r.action).replace(/_/g, " ")}`,
+            detail: r.oldValue && r.newValue ? `${r.oldValue} → ${r.newValue}` : (r.newValue || ""),
+        }));
+        perms.forEach((r) => events.push({
+            kind: "permission", at: r.createdAt, ok: true,
+            title: `Permission ${r.action}: ${r.permissionKey}`, detail: `role ${r.role}`,
+        }));
+        admin.forEach((r) => events.push({
+            kind: "admin", at: r.createdAt, ok: true,
+            title: `${r.module} ${r.action}: ${r.entityLabel || r.entityId}`,
+            detail: r.changes ? String(r.changes).slice(0, 300) : "",
+        }));
+        events.sort((a, b) => new Date(b.at) - new Date(a.at));
+
+        res.json({ success: true, user, events: events.slice(0, limit), truncated: events.length > limit });
+    } catch (err) {
+        console.error("❌ AUDIT USER TIMELINE ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to load user timeline" });
+    }
+});
 
 // ============================================================
 // GET /login-history -- paginated, filterable login attempts (success and

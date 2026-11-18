@@ -18,6 +18,7 @@ import { LoginAudit } from '../models/LoginAudit.js';
 import { SecurityAlert } from '../models/SecurityAlert.js';
 import { User } from '../models/User.js';
 import { sendPushToUser } from './pushNotifications.js';
+import { sendMail, emailList } from './mailer.js';
 
 const WINDOW_MINUTES = 15;
 const DISTINCT_USERNAME_THRESHOLD = 4;
@@ -88,6 +89,22 @@ export async function checkForCredentialSprayAttacks() {
         } catch (err) {
             console.error('❌ Failed to notify admins of security alert:', err);
         }
+
+        // Email as well: push only reaches admins who have the mobile app.
+        await sendMail({
+            to: emailList(process.env.SECURITY_ALERT_EMAILS),
+            subject: `Petra App security alert: suspicious logins from ${ip}`,
+            text: [
+                `Possible password-guessing attack on the Petra app.`,
+                ``,
+                `IP address: ${ip}`,
+                `Failed logins: ${offender.failCount} for ${offender.distinctUsernames} different accounts in the last ${WINDOW_MINUTES} minutes.`,
+                `Usernames tried: ${usernames.join(', ')}`,
+                `Time: ${new Date().toLocaleString('en-GB', { timeZone: 'Asia/Amman' })}`,
+                ``,
+                `Review it and block the IP if needed: Admin > Audit Log > Security.`,
+            ].join('\n'),
+        });
     }
 }
 
