@@ -105,11 +105,55 @@ async function resolveUnit(instOrderItemId) {
 const PROJECT_STOCK_CACHE_TTL_MS = 10_000;
 const projectStockCache = new Map(); // wantProject -> { rows, expiresAt }
 
+// minstock lives on 192.168.10.3ACCESPROJ at Thuhaiba. When that server
+// is unreachable (power cut there, 2026-11-18) every connect waits 15s and
+// is retried once, and the error used to fail the whole Orders Components
+// page. Now: on a CONNECTION failure the overview is served without stock
+// data (stockUnavailable flag for the page to say so), and for the next
+// MINSTOCK_RETRY_MS nobody waits on it again -- one background probe at a
+// time checks whether it is back, so no page load blocks on a dead server.
+// Query errors (bad SQL, timeouts of a slow query) still throw as before.
+const MINSTOCK_RETRY_MS = 2 * 60 * 1000;
+let minstockDown = false;
+let minstockNextProbeAt = 0;
+let minstockProbing = false;
+
+function isSqlConnectionError(err) {
+    return err?.name === 'ConnectionError'
+        || ['ESOCKET', 'ECONNCLOSED', 'ENOTOPEN', 'EINSTLOOKUP'].includes(err?.code);
+}
+
+function markMinstockDown(err) {
+    if (!minstockDown) console.warn(`⚠️ minstock unreachable (${err.message}); orders are served without stock data until it answers again`);
+    minstockDown = true;
+    minstockNextProbeAt = Date.now() + MINSTOCK_RETRY_MS;
+}
+
+function probeMinstock() {
+    if (minstockProbing) return;
+    minstockProbing = true;
+    withSqlRetry('minstock', (pool) => pool.request().query('SELECT 1 AS ok'), { retries: 0 })
+        .then(() => { minstockDown = false; console.log('✅ minstock reachable again'); })
+        .catch((err) => markMinstockDown(err))
+        .finally(() => { minstockProbing = false; });
+}
+
+export function isMinstockUnavailable() {
+    return minstockDown;
+}
+
 async function fetchProjectStockRows(wantProject) {
     const cached = projectStockCache.get(wantProject);
     if (cached && cached.expiresAt > Date.now()) return cached.rows;
 
-    const result = await withSqlRetry('minstock', (pool) => pool.request()
+    if (minstockDown) {
+        if (Date.now() >= minstockNextProbeAt) probeMinstock();
+        return [];
+    }
+
+    let result;
+    try {
+        result = await withSqlRetry('minstock', (pool) => pool.request()
         .input('projPrefix', `${wantProject}%`)
         .query(`
             SELECT s.orderNo, s.serialNo, s.Prodc, s.UNO, s.barcode, s.barcode1, o.projNo, o.ProdctionNO
@@ -117,6 +161,11 @@ async function fetchProjectStockRows(wantProject) {
             JOIN STOCKO o ON o.orderNo = s.orderNo
             WHERE o.projNo LIKE @projPrefix
         `));
+    } catch (err) {
+        if (!isSqlConnectionError(err)) throw err;
+        markMinstockDown(err);
+        return [];
+    }
     projectStockCache.set(wantProject, { rows: result.recordset, expiresAt: Date.now() + PROJECT_STOCK_CACHE_TTL_MS });
     return result.recordset;
 }
@@ -622,6 +671,12 @@ function buildUnitStats(unit, materials, components, confirmerNames) {
 // flow would also write to.
 export async function markUnitComplete(instOrderItemId) {
     const stats = await getUnitCompletionStats(instOrderItemId);
+    // Without the stock server the allocated-materials list is empty, so
+    // every recorded component would look "orphaned + installed" and the
+    // unit could pass the checks below with materials still missing.
+    if (isMinstockUnavailable()) {
+        return { success: false, httpStatus: 503, status: 'STOCK_UNAVAILABLE', message: 'The stock server (Thuhaiba) is not reachable right now, so completion cannot be checked. Try again later.' };
+    }
     if (stats.total === 0) {
         return { success: true, httpStatus: 200, status: 'NO_MATERIALS', message: 'No materials allocated to this unit yet' };
     }

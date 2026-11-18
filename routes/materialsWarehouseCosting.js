@@ -12,6 +12,7 @@ import { requirePermission } from '../middleware/permissions.js';
 import { PERMISSIONS } from '../constants/permissions.js';
 import { MatWhItemCost } from '../models/MatWhItemCost.js';
 import { MatWhItem } from '../models/MatWhItem.js';
+import { getAllowedStoreIds, storeWhere, canActOnStore } from '../services/matWhStoreAccess.js';
 
 const router = express.Router();
 const requireItemCost = requirePermission(PERMISSIONS.MATERIALS_WAREHOUSE_ITEM_COST);
@@ -27,9 +28,10 @@ router.use(authenticateToken, requireItemCost);
 // Optional search (item code/name) and page/pageSize; without page every
 // matching row comes back, as before.
 router.get('/item-cost', async (req, res) => {
-    const where = {};
+    const allowed = await getAllowedStoreIds(req.user);
+    const where = { ...storeWhere(allowed) };
     if (req.query.itemId) where.itemId = req.query.itemId;
-    if (req.query.storeId) where.storeId = req.query.storeId;
+    if (req.query.storeId) where.storeId = canActOnStore(allowed, req.query.storeId) ? req.query.storeId : -1;
     const search = String(req.query.search || '').trim();
     if (search) {
         const matches = await MatWhItem.findAll({
@@ -70,7 +72,7 @@ router.get('/item-cost', async (req, res) => {
 
 router.get('/item-cost/:itemId/:storeId', async (req, res) => {
     const row = await MatWhItemCost.findOne({ where: { itemId: req.params.itemId, storeId: req.params.storeId } });
-    if (!row) return res.status(404).json({ message: 'No cost record for this item/store yet' });
+    if (!row || !canActOnStore(await getAllowedStoreIds(req.user), row.storeId)) return res.status(404).json({ message: 'No cost record for this item/store yet' });
     res.json(row);
 });
 
@@ -83,7 +85,7 @@ router.patch('/item-cost/:id', async (req, res) => {
         return res.status(400).json({ message: "costMethod must be 'lastCost' or 'weightedAvg'" });
     }
     const row = await MatWhItemCost.findByPk(req.params.id);
-    if (!row) return res.status(404).json({ message: 'Not found' });
+    if (!row || !canActOnStore(await getAllowedStoreIds(req.user), row.storeId)) return res.status(404).json({ message: 'Not found' });
 
     const currentCost = costMethod === 'weightedAvg' ? row.weightedAvgCost : row.lastCost;
     await row.update({ costMethod, currentCost });

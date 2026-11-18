@@ -139,15 +139,51 @@ async function hasActiveAccount(empNo) {
 // when that person already approved it as the direct manager, for their
 // own requests, and when they have no active account (otherwise the
 // request would wait on nobody).
-export async function getSecondApproverEmpNo(requesterEmpNo, managerApproverEmpNo) {
+// Ittihad transport reimbursements (per explicit direction 2026-11-15):
+// 100254 approves after the manager -- as the second approval normally, or
+// as a THIRD approval after 554 when the manager is in Work_place 1364
+// (manager -> 554 -> 100254). Transport only; other Ittihad request types
+// are unchanged. Skipped when 100254 is the requester, already approved
+// as the manager, or has no active account.
+export const ITTIHAD_TRANSPORT_APPROVER_EMP_NO = FACTORY_MANAGER_EMP_NO;
+
+async function ittihadTransportApproverApplies(type, requester, managerApprover) {
+    if (type !== "transport") return false;
+    const approver = ITTIHAD_TRANSPORT_APPROVER_EMP_NO;
+    if (requester === approver || managerApprover === approver) return false;
+    if (!(await getAllIttihadEmpNos()).has(requester)) return false;
+    return hasActiveAccount(approver);
+}
+
+// After the second approver approved: who gives the third approval, or
+// null to move on. Only the Ittihad-transport 554 -> 100254 chain has one.
+export async function getThirdApproverEmpNo(type, requesterEmpNo, managerApproverEmpNo, secondApproverEmpNo) {
+    const requester = parseInt(requesterEmpNo);
+    const managerApprover = parseInt(managerApproverEmpNo);
+    if (parseInt(secondApproverEmpNo) === ITTIHAD_TRANSPORT_APPROVER_EMP_NO) return null;
+    return (await ittihadTransportApproverApplies(type, requester, managerApprover))
+        ? ITTIHAD_TRANSPORT_APPROVER_EMP_NO
+        : null;
+}
+
+export async function getSecondApproverEmpNo(requesterEmpNo, managerApproverEmpNo, type = null) {
     const requester = parseInt(requesterEmpNo);
     const managerApprover = parseInt(managerApproverEmpNo);
     if (!requester) return null;
 
     if (managerApprover && (await getSecondApprovalSourceEmpNos()).includes(managerApprover)) {
+        // Known gap: if 554 is skipped here for an Ittihad transport request
+        // (554 is the requester / has no account), 100254's approval is
+        // skipped too -- the awaited approver is derived from
+        // managerApproverEmpNo, which would point at 554 (see
+        // secondStageApproverFor).
         const approver = INSTALLATION_SECOND_APPROVER_EMP_NO;
         if (requester === approver || managerApprover === approver) return null;
         return (await hasActiveAccount(approver)) ? approver : null;
+    }
+
+    if (await ittihadTransportApproverApplies(type, requester, managerApprover)) {
+        return ITTIHAD_TRANSPORT_APPROVER_EMP_NO;
     }
 
     if (requester === FACTORY_MANAGER_EMP_NO) return null;
@@ -161,9 +197,16 @@ export async function getSecondApproverEmpNo(requesterEmpNo, managerApproverEmpN
 // Derived from who gave the first approval, so no extra column is needed
 // (and requests already pending for the factory manager stay his).
 export function secondStageApproverFor(request, sourceEmpNos) {
+    // Still pending although the second approver already approved = the
+    // Ittihad-transport third stage (554 approved, waiting on 100254).
+    if (isAwaitingThirdApproval(request)) return ITTIHAD_TRANSPORT_APPROVER_EMP_NO;
     return sourceEmpNos.includes(parseInt(request.managerApproverEmpNo))
         ? INSTALLATION_SECOND_APPROVER_EMP_NO
         : FACTORY_MANAGER_EMP_NO;
+}
+
+export function isAwaitingThirdApproval(request) {
+    return request.status === "pending_factory_mgr" && request.factoryMgrDecision === "approved";
 }
 
 export function isSecondApproverEmpNo(empNo) {
@@ -176,22 +219,70 @@ export async function getUserIdsForEmpNo(empNo) {
     return users.map((u) => u.userId);
 }
 
+// Transport-reimbursement finance stage split by company (per explicit
+// direction 2026-11-15): Ittihad (Comp_num=10) requests belong to the
+// dedicated accounting_ittihad role instead of plain accounting --
+// finance queue, finance decision, mark-paid, notification, and the
+// Transport report/export. accounting_manager/gm/admin (and any other
+// role an admin grants these keys to) keep the full company-wide view as
+// a fallback, e.g. while the Ittihad accountant is on leave.
+export const ITTIHAD_ACCOUNTING_ROLE = "accounting_ittihad";
+
+// "ittihad" | "non_ittihad" | "all"
+export function financeScopeForRole(role) {
+    if (role === ITTIHAD_ACCOUNTING_ROLE) return "ittihad";
+    if (role === "accounting") return "non_ittihad";
+    return "all";
+}
+
+// Every Ittihad Emp_num regardless of Work_status -- a request filed by
+// someone who has since left still belongs to the Ittihad accountant.
+export async function getAllIttihadEmpNos() {
+    const result = await withSqlRetry("erp", (pool) => pool.request()
+        .query(`SELECT Emp_num FROM ${SQL_DB}.dbo.PayEmp WHERE ${ITTIHAD_WHERE}`));
+    return new Set(result.recordset.map((r) => Number(r.Emp_num)));
+}
+
+// Keeps only the rows (anything with a requesterEmpNo) the role's finance
+// scope covers.
+export async function filterByFinanceScope(role, rows) {
+    const scope = financeScopeForRole(role);
+    if (scope === "all" || rows.length === 0) return rows;
+    const ittihad = await getAllIttihadEmpNos();
+    return rows.filter((r) => ittihad.has(Number(r.requesterEmpNo)) === (scope === "ittihad"));
+}
+
+export async function isInFinanceScope(role, requesterEmpNo) {
+    return (await filterByFinanceScope(role, [{ requesterEmpNo }])).length === 1;
+}
+
 // Which InsUser accounts to notify when a transport request reaches
 // pending_finance -- whichever roles actually hold
 // PERMISSIONS.ACCOUNTING_REQUESTS_QUEUE right now (admin-editable via
 // PermissionGrants, so this stays correct if grants change rather than
-// hardcoding accounting/accounting_manager).
-export async function getFinanceReviewerUserIds() {
+// hardcoding accounting/accounting_manager), narrowed by company: an
+// Ittihad requester notifies only the Ittihad accountant (or, if no such
+// active account exists yet, the company-wide fallback roles so the
+// request never waits on nobody); everyone else notifies every granted
+// role except the Ittihad accountant.
+export async function getFinanceReviewerUserIds(requesterEmpNo) {
     const grants = await PermissionGrant.findAll({
         where: { permissionKey: PERMISSIONS.ACCOUNTING_REQUESTS_QUEUE },
         attributes: ["role"],
     });
     const roles = grants.map((g) => g.role);
     if (roles.length === 0) return [];
-    const reviewers = await User.findAll({
+    let reviewers = await User.findAll({
         where: { role: roles, active: true },
-        attributes: ["userId"],
+        attributes: ["userId", "role"],
     });
+    const isIttihad = (await getAllIttihadEmpNos()).has(Number(requesterEmpNo));
+    if (isIttihad) {
+        const own = reviewers.filter((u) => u.role === ITTIHAD_ACCOUNTING_ROLE);
+        reviewers = own.length > 0 ? own : reviewers.filter((u) => financeScopeForRole(u.role) === "all");
+    } else {
+        reviewers = reviewers.filter((u) => financeScopeForRole(u.role) !== "ittihad");
+    }
     return reviewers.map((u) => u.userId);
 }
 

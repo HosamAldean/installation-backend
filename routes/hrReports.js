@@ -28,7 +28,7 @@ import {
 } from "../models/index.js";
 import { resolveEmployeeNames } from "../utils/employeeLookup.js";
 import { resolveUserNames } from "../utils/userLookup.js";
-import { isHrScopedRole, getHrScopedEmpNos, getEmpNosByPrefixGroup } from "../utils/hrScope.js";
+import { isHrScopedRole, getHrScopedEmpNos, getEmpNosByPrefixGroup, financeScopeForRole, getAllIttihadEmpNos, ITTIHAD_ACCOUNTING_ROLE } from "../utils/hrScope.js";
 import { resolveProjectLabels, withProjectDisplay } from "../utils/projectLookup.js";
 
 const router = express.Router();
@@ -38,8 +38,26 @@ const router = express.Router();
 // admin aren't HR-tier roles in that map, so this returns null (no
 // filtering) for them, same as before this redesign.
 async function hrReportScopeFilter(role) {
+    // The Ittihad accountant's report tabs are Ittihad-only too, not just
+    // Transport (see applyFinanceScope below).
+    if (role === ITTIHAD_ACCOUNTING_ROLE) return getAllIttihadEmpNos();
     if (!isHrScopedRole(role)) return null;
     return new Set((await getHrScopedEmpNos(role)).map(Number));
+}
+
+// Transport tab/export only: accounting_ittihad sees just Ittihad
+// requests and plain accounting everything except them (see
+// financeScopeForRole in utils/hrScope.js); every other role keeps the
+// company-wide view. Narrows `where.requesterEmpNo` in place.
+async function applyFinanceScope(role, where) {
+    const scope = financeScopeForRole(role);
+    if (scope === "all") return;
+    const ittihad = [...(await getAllIttihadEmpNos())];
+    if (scope === "non_ittihad" && ittihad.length === 0) return;
+    const cond = scope === "ittihad"
+        ? { [Op.in]: ittihad.length ? ittihad : [-1] }
+        : { [Op.notIn]: ittihad };
+    where.requesterEmpNo = where.requesterEmpNo ? { [Op.and]: [where.requesterEmpNo, cond] } : cond;
 }
 
 
@@ -416,6 +434,7 @@ router.get("/transport", authenticateToken, requirePermission(PERMISSIONS.HR_REP
         }
         if (exported === "no") where.exportedAt = null;
         else if (exported === "yes") where.exportedAt = { [Op.ne]: null };
+        await applyFinanceScope(req.user.role, where);
 
         const transport = await HrTransportRequest.findAll({
             where,
@@ -428,6 +447,7 @@ router.get("/transport", authenticateToken, requirePermission(PERMISSIONS.HR_REP
                 ...transport.map((r) => r.requesterEmpNo),
                 ...transport.map((r) => r.managerApproverEmpNo),
                 ...transport.map((r) => r.factoryMgrApproverEmpNo),
+                ...transport.map((r) => r.thirdApproverEmpNo),
             ]),
             resolveUserNames([
                 ...transport.map((r) => r.hrAuditorUserId),
@@ -443,6 +463,7 @@ router.get("/transport", authenticateToken, requirePermission(PERMISSIONS.HR_REP
                 employee: empNames[r.requesterEmpNo] || null,
                 managerApprover: r.managerApproverEmpNo ? (empNames[r.managerApproverEmpNo] || null) : null,
                 factoryMgrApprover: r.factoryMgrApproverEmpNo ? (empNames[r.factoryMgrApproverEmpNo] || null) : null,
+                thirdApprover: r.thirdApproverEmpNo ? (empNames[r.thirdApproverEmpNo] || null) : null,
                 hrApprover: r.hrAuditorUserId ? (userNames[r.hrAuditorUserId] || null) : null,
                 financeApprover: r.financeApproverUserId ? (userNames[r.financeApproverUserId] || null) : null,
                 paidBy: r.paidByUserId ? (userNames[r.paidByUserId] || null) : null,
@@ -636,6 +657,7 @@ router.put("/transport/mark-exported", authenticateToken, requirePermission(PERM
         }
         if (paidStatus === "paid") where.paidAt = { [Op.ne]: null };
         else if (paidStatus === "unpaid") where.paidAt = null;
+        await applyFinanceScope(req.user.role, where);
 
         const [count] = await HrTransportRequest.update({ exportedAt: new Date() }, { where });
         res.json({ success: true, count });

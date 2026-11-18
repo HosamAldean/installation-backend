@@ -16,6 +16,7 @@ import { MatWhStockLedger } from '../models/MatWhStockLedger.js';
 import { MatWhItemCost } from '../models/MatWhItemCost.js';
 import { MatWhPurchaseOrder } from '../models/MatWhPurchaseOrder.js';
 import { getAvailableToReserve } from '../services/matWhLedger.js';
+import { denyStore, getAllowedStoreIds, storeWhere, storeSql, canActOnStore } from '../services/matWhStoreAccess.js';
 
 const router = express.Router();
 // Shares the /api/materials-warehouse mount with the other warehouse
@@ -31,6 +32,7 @@ router.get('/reports/card', async (req, res) => {
     const itemId = parseInt(req.query.itemId);
     const storeId = parseInt(req.query.storeId);
     if (!itemId || !storeId) return res.status(400).json({ message: 'itemId and storeId are required' });
+    if (await denyStore(req, res, storeId)) return;
 
     const item = await MatWhItem.findByPk(itemId);
     if (!item) return res.status(404).json({ message: 'Item not found' });
@@ -68,7 +70,8 @@ router.get('/reports/remaining-stock', async (req, res) => {
     const page = req.query.page ? Math.max(1, parseInt(req.query.page) || 1) : null;
     const pageSize = Math.min(500, Math.max(1, parseInt(req.query.pageSize) || 50));
 
-    const where = [];
+    const allowed = await getAllowedStoreIds(req.user);
+    const where = ['1 = 1' + storeSql(allowed, 'l.storeId')];
     const replacements = {};
     if (storeId) { where.push('l.storeId = :storeId'); replacements.storeId = storeId; }
     if (search) {
@@ -133,7 +136,9 @@ router.get('/reports/remaining-stock', async (req, res) => {
 // highest value first, paged (?page=&pageSize=&search=).
 // ------------------------------------------------------------
 router.get('/reports/stock-value', async (req, res) => {
+    const allowed = await getAllowedStoreIds(req.user);
     const storeId = req.query.storeId ? parseInt(req.query.storeId) : null;
+    if (storeId && !canActOnStore(allowed, storeId)) return res.status(404).json({ message: 'Store not found' });
     const balances = (where = '') => `
         SELECT l.itemId, l.storeId,
                SUM(CASE WHEN l.direction = 'in' THEN l.qty ELSE -l.qty END) AS balance
@@ -152,7 +157,7 @@ router.get('/reports/stock-value', async (req, res) => {
         FROM matWhStores s
         LEFT JOIN (${balances()}) b ON b.storeId = s.id
         LEFT JOIN matWhItemCost c ON c.itemId = b.itemId AND c.storeId = b.storeId
-        WHERE s.isActive = 1
+        WHERE s.isActive = 1${storeSql(allowed, 's.id')}
         GROUP BY s.id, s.storeCode, s.storeName, s.storeType
         ORDER BY s.storeCode
     `);
@@ -208,8 +213,9 @@ router.get('/reports/stock-value', async (req, res) => {
 // In/Out -- ledger activity over a date range.
 // ------------------------------------------------------------
 router.get('/reports/in-out', async (req, res) => {
-    const where = {};
-    if (req.query.storeId) where.storeId = req.query.storeId;
+    const allowed = await getAllowedStoreIds(req.user);
+    const where = { ...storeWhere(allowed) };
+    if (req.query.storeId) where.storeId = canActOnStore(allowed, req.query.storeId) ? req.query.storeId : -1;
     if (req.query.itemId) where.itemId = req.query.itemId;
     if (req.query.docType) where.docType = req.query.docType;
     // Only ever populated on a reservation-line issue movement --
@@ -241,10 +247,11 @@ router.get('/reports/in-out', async (req, res) => {
 // ------------------------------------------------------------
 router.get('/reports/purchase-pipeline', async (req, res) => {
     const projectId = req.query.projectId ? Number(req.query.projectId) : null;
+    const allowed = await getAllowedStoreIds(req.user);
     const [rows] = await sequelizeUtf8.query(`
         SELECT status, COUNT(*) AS count, SUM(netAmt) AS totalAmt
         FROM matWhPurchaseOrders
-        ${projectId ? 'WHERE projectId = :projectId' : ''}
+        WHERE 1 = 1 ${projectId ? 'AND projectId = :projectId' : ''}${storeSql(allowed, 'destinationStoreId')}
         GROUP BY status
     `, { replacements: projectId ? { projectId } : {} });
     res.json({ statuses: rows });

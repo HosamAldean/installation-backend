@@ -13,6 +13,8 @@ import cookieParser from 'cookie-parser';
 import compression from 'compression';
 import { monitorLog } from './middleware/monitorLog.js';
 import { blockIpMiddleware } from './middleware/ipBlock.js';
+import { activityAudit, ensureActivityAuditTable } from './middleware/activityAudit.js';
+import { startAuditRetention } from './services/auditRetention.js';
 import { startSecurityMonitor } from './services/securityMonitor.js';
 import { startItLicenseMonitor } from './services/itLicenseMonitor.js';
 import { LATEST_VERSION_CODE, LATEST_VERSION_NAME, MIN_SUPPORTED_VERSION_CODE, DOWNLOAD_URL, UPDATE_PAGE_URL, WHATS_NEW_EN, WHATS_NEW_AR } from './constants/mobileAppVersion.js';
@@ -54,6 +56,7 @@ import materialsWarehouseStockCountRouter from "./routes/materialsWarehouseStock
 import materialsWarehouseTransferRouter from "./routes/materialsWarehouseTransfer.js";
 import materialsWarehouseProfileStoreRouter from "./routes/materialsWarehouseProfileStore.js";
 import materialsWarehouseCoatingVendorRouter from "./routes/materialsWarehouseCoatingVendor.js";
+import materialsWarehouseProjectPlansRouter from "./routes/materialsWarehouseProjectPlans.js";
 import petraErpOrdersRouter from "./routes/petraErpOrders.js";
 import cashFlowRouter from "./routes/cashFlow.js";
 import offersRouter from "./routes/offers.js";
@@ -157,6 +160,13 @@ app.use(monitorLog);
 // static file and API route, so a blocked IP can't reach anything.
 // ======================
 app.use(blockIpMiddleware);
+
+// ======================
+// Activity audit -- records every POST/PUT/PATCH/DELETE by a signed-in
+// user (see middleware/activityAudit.js). Before the routers so its
+// 'finish' listener is registered for every API request.
+// ======================
+app.use(activityAudit);
 
 // ======================
 // UTF-8 JSON responses
@@ -289,6 +299,7 @@ app.use("/api/materials-warehouse", materialsWarehouseCutoverRouter);
 app.use("/api/materials-warehouse", materialsWarehouseWriteoffRouter);
 app.use("/api/materials-warehouse", materialsWarehouseStockCountRouter);
 app.use("/api/materials-warehouse", materialsWarehouseTransferRouter);
+app.use("/api/materials-warehouse", materialsWarehouseProjectPlansRouter);
 app.use("/api/materials-warehouse/profile-store", materialsWarehouseProfileStoreRouter);
 // Deliberately its own top-level path, NOT nested under
 // /api/materials-warehouse -- every router already mounted there (see
@@ -514,6 +525,8 @@ import tls from "tls";
         console.log("✅ Models synced");
     }
 
+    await ensureActivityAuditTable();
+
     // The dev PC and the PETRA-APP server share the live databases, so only
     // the server may run the jobs that send push notifications -- a test
     // backend on the PC sets DISABLE_BACKGROUND_JOBS=true in its .env.
@@ -522,6 +535,7 @@ import tls from "tls";
     } else {
         startSecurityMonitor();
         startItLicenseMonitor();
+        startAuditRetention();
     }
 })();
 

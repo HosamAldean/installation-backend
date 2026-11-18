@@ -2,24 +2,47 @@
 // Per-user store scoping for Materials Warehouse ACTIONS, backed by
 // matWhUserStoreAssignments (see MatWhUserStoreAssignment.js).
 //
-// Rules (agreed 2026-10-15):
+// Rules (agreed 2026-10-15, tightened 2026-10-29 at the user's request):
 //   - admin: every store.
-//   - a user with NO assignment rows: every store -- nothing changes for
-//     anyone until an admin actually assigns stores, so rollout can't lock
-//     a whole role out on day one.
 //   - a user with one or more rows: only those stores.
-// Only actions are scoped (confirm/issue/receive/count/transfer/write-off
-// etc.) -- viewing stays open across stores, same "access check, not a
-// per-row filter" principle Stock House settled on, so a storekeeper can
-// still see where else an item is held before requesting a transfer.
+//   - a store role (STORE_ROLES) with NO rows: no store at all -- a new
+//     storekeeper sees and does nothing until an admin assigns stores.
+//   - any other role with no rows (production, mix, ...): every store,
+//     unchanged -- their work isn't tied to one store.
+// Both actions AND viewing are scoped: lists, stock and reports only show
+// the allowed stores (storeWhere / storeSql / filterStores below). A
+// transfer's destination picker is the one place other stores still
+// appear, by name only.
 import { MatWhUserStoreAssignment } from '../models/MatWhUserStoreAssignment.js';
 import { MatWhStore } from '../models/MatWhStore.js';
 
-// null = every store; otherwise a Set of storeIds.
+export const STORE_ROLES = new Set(['material_user', 'store_manager']);
+
+// null = every store; otherwise a Set of storeIds (possibly empty).
 export async function getAllowedStoreIds(user) {
     if (!user || user.role === 'admin') return null;
     const rows = await MatWhUserStoreAssignment.findAll({ where: { userId: user.userId }, attributes: ['storeId'] });
-    return rows.length === 0 ? null : new Set(rows.map((r) => r.storeId));
+    if (rows.length) return new Set(rows.map((r) => r.storeId));
+    return STORE_ROLES.has(user.role) ? new Set() : null;
+}
+
+// Sequelize where fragment limiting a store column to the allowed stores
+// ({} when every store is allowed; an empty set matches nothing).
+export function storeWhere(allowed, field = 'storeId') {
+    return allowed === null ? {} : { [field]: [...allowed, -1] };
+}
+
+// Raw-SQL equivalent: "" or " AND <column> IN (...)". The ids come from
+// the DB, never from the request.
+export function storeSql(allowed, column) {
+    return allowed === null ? '' : ` AND ${column} IN (${[...allowed, -1].map(Number).join(',')})`;
+}
+
+// Keeps the allowed entries of a list of store ids, or of rows carrying a
+// store id in `field`.
+export function filterStores(allowed, list, field = null) {
+    if (allowed === null) return list;
+    return list.filter((x) => allowed.has(Number(field ? x[field] : x)));
 }
 
 export function canActOnStore(allowed, storeId) {

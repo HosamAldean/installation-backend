@@ -41,6 +41,13 @@ export const HrTransportRequest = sequelizeUtf8.define('HrTransportRequest', {
     factoryMgrDecision: { type: DataTypes.ENUM('approved', 'rejected'), allowNull: true },
     factoryMgrDecidedAt: { type: DataTypes.DATE, allowNull: true },
     factoryMgrNote: { type: DataTypes.TEXT, allowNull: true },
+    // Third approval (2026-11-15): Ittihad transport requests first-approved
+    // by Work_place 1364 go manager -> 554 (factoryMgr* above) -> 100254
+    // (these). Status stays pending_factory_mgr until 100254 decides.
+    thirdApproverEmpNo: { type: DataTypes.INTEGER, allowNull: true },
+    thirdDecision: { type: DataTypes.ENUM('approved', 'rejected'), allowNull: true },
+    thirdDecidedAt: { type: DataTypes.DATE, allowNull: true },
+    thirdNote: { type: DataTypes.TEXT, allowNull: true },
     hrAuditorUserId: { type: DataTypes.INTEGER, allowNull: true },
     hrDecision: { type: DataTypes.ENUM('approved', 'rejected'), allowNull: true },
     hrDecidedAt: { type: DataTypes.DATE, allowNull: true },

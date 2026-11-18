@@ -31,8 +31,18 @@ import {
     getPhysicalBalance, getAvailableToReserve, resolveProfileStock, findProfileStockByBarcode,
 } from '../services/matWhProfileStock.js';
 import { Op } from 'sequelize';
+import { getAllowedStoreIds, storeWhere, canActOnStore } from '../services/matWhStoreAccess.js';
 
 const router = express.Router();
+
+// The caller's stores (services/matWhStoreAccess.js), narrowed to
+// ?storeId= when one is asked for -- another store's id matches nothing.
+async function scopedStoreWhere(req) {
+    const allowed = await getAllowedStoreIds(req.user);
+    if (!req.query.storeId) return storeWhere(allowed);
+    const storeId = parseInt(req.query.storeId, 10);
+    return { storeId: canActOnStore(allowed, storeId) ? storeId : -1 };
+}
 router.use(authenticateToken);
 
 const requireReceive = requirePermission(PERMISSIONS.MATERIALS_WAREHOUSE_RECEIVE);
@@ -315,7 +325,7 @@ router.get('/stock/barcode/:barcode', requireAnyStockAccess, async (req, res) =>
 router.get('/stock', requireAnyStockAccess, async (req, res) => {
     const { page, pageSize, offset } = paging(req);
     const where = {};
-    if (req.query.storeId) where.storeId = parseInt(req.query.storeId, 10);
+    Object.assign(where, await scopedStoreWhere(req));
     if (req.query.profileCatalogId) where.profileCatalogId = parseInt(req.query.profileCatalogId, 10);
     if (req.query.search) {
         where.barcode = { [Op.like]: `%${String(req.query.search).trim()}%` };
@@ -429,7 +439,7 @@ router.put('/receipts/:id', requireReceive, async (req, res) => {
 router.get('/receipts', requireAnyStockAccess, async (req, res) => {
     const { page, pageSize, offset } = paging(req);
     const where = {};
-    if (req.query.storeId) where.storeId = parseInt(req.query.storeId, 10);
+    Object.assign(where, await scopedStoreWhere(req));
     if (req.query.profileStockId) where.profileStockId = parseInt(req.query.profileStockId, 10);
     const { count, rows } = await MatWhProfileReceipt.findAndCountAll({ where, order: [['id', 'DESC']], limit: pageSize, offset });
     res.json({ success: true, receipts: await attachBarcodes(rows), total: count, page, pageSize });
@@ -484,7 +494,7 @@ router.put('/reservations/:id/release', requireReserve, async (req, res) => {
 router.get('/reservations', requireAnyStockAccess, async (req, res) => {
     const { page, pageSize, offset } = paging(req);
     const where = {};
-    if (req.query.storeId) where.storeId = parseInt(req.query.storeId, 10);
+    Object.assign(where, await scopedStoreWhere(req));
     if (req.query.projectNo) where.projectNo = req.query.projectNo;
     if (req.query.status) where.status = req.query.status;
     const { count, rows } = await MatWhProfileReservation.findAndCountAll({ where, order: [['id', 'DESC']], limit: pageSize, offset });
@@ -533,7 +543,7 @@ router.put('/shipments/:id', requireIssue, async (req, res) => {
 router.get('/shipments', requireAnyStockAccess, async (req, res) => {
     const { page, pageSize, offset } = paging(req);
     const where = {};
-    if (req.query.storeId) where.storeId = parseInt(req.query.storeId, 10);
+    Object.assign(where, await scopedStoreWhere(req));
     if (req.query.projectNo) where.projectNo = req.query.projectNo;
     const { count, rows } = await MatWhProfileShipment.findAndCountAll({ where, order: [['id', 'DESC']], limit: pageSize, offset });
     res.json({ success: true, shipments: await attachBarcodes(rows), total: count, page, pageSize });
@@ -577,7 +587,7 @@ router.put('/returns/:id', requireIssue, async (req, res) => {
 router.get('/returns', requireAnyStockAccess, async (req, res) => {
     const { page, pageSize, offset } = paging(req);
     const where = {};
-    if (req.query.storeId) where.storeId = parseInt(req.query.storeId, 10);
+    Object.assign(where, await scopedStoreWhere(req));
     const { count, rows } = await MatWhProfileReturn.findAndCountAll({ where, order: [['id', 'DESC']], limit: pageSize, offset });
     res.json({ success: true, returns: await attachBarcodes(rows), total: count, page, pageSize });
 });
@@ -683,7 +693,7 @@ router.post('/coating-batches/:id/receive', requireCoating, async (req, res) => 
 router.get('/coating-batches', requireAnyStockAccess, async (req, res) => {
     const { page, pageSize, offset } = paging(req);
     const where = {};
-    if (req.query.storeId) where.storeId = parseInt(req.query.storeId, 10);
+    Object.assign(where, await scopedStoreWhere(req));
     if (req.query.status) where.status = req.query.status;
     if (req.query.outstanding === 'true') where.status = { [Op.ne]: 'received' };
     const { count, rows } = await MatWhProfileCoatingBatch.findAndCountAll({ where, order: [['id', 'DESC']], limit: pageSize, offset });
@@ -725,7 +735,7 @@ router.post('/transfers', requireTransfer, async (req, res) => {
 router.get('/transfers', requireAnyStockAccess, async (req, res) => {
     const { page, pageSize, offset } = paging(req);
     const where = {};
-    if (req.query.storeId) where.storeId = parseInt(req.query.storeId, 10);
+    Object.assign(where, await scopedStoreWhere(req));
     if (req.query.projectNo) where.projectNo = req.query.projectNo;
     const { count, rows } = await MatWhProfileTransfer.findAndCountAll({ where, order: [['id', 'DESC']], limit: pageSize, offset });
     res.json({ success: true, transfers: await attachBarcodes(rows), total: count, page, pageSize });
@@ -763,7 +773,7 @@ router.post('/feasibility-checks', requireReserve, async (req, res) => {
 router.get('/feasibility-checks', requireAnyStockAccess, async (req, res) => {
     const { page, pageSize, offset } = paging(req);
     const where = {};
-    if (req.query.storeId) where.storeId = parseInt(req.query.storeId, 10);
+    Object.assign(where, await scopedStoreWhere(req));
     if (req.query.projectNo) where.projectNo = req.query.projectNo;
     const { count, rows } = await MatWhProfileFeasibilityCheck.findAndCountAll({ where, order: [['id', 'DESC']], limit: pageSize, offset });
     res.json({ success: true, checks: rows, total: count, page, pageSize });
@@ -776,7 +786,7 @@ router.get('/feasibility-checks', requireAnyStockAccess, async (req, res) => {
 router.get('/stock-levels', requireReports, async (req, res) => {
     const { page, pageSize, offset } = paging(req);
     const where = {};
-    if (req.query.storeId) where.storeId = parseInt(req.query.storeId, 10);
+    Object.assign(where, await scopedStoreWhere(req));
     if (req.query.profileCatalogId) where.profileCatalogId = parseInt(req.query.profileCatalogId, 10);
     const { count, rows } = await MatWhProfileStock.findAndCountAll({ where, order: [['id', 'ASC']], limit: pageSize, offset });
     const levels = await Promise.all(rows.map(async (s) => ({
@@ -822,7 +832,7 @@ router.get('/card/:barcode', requireAnyStockAccess, async (req, res) => {
 router.get('/remaining', requireReports, async (req, res) => {
     const where = { status: 'active' };
     if (req.query.projectNo) where.projectNo = req.query.projectNo;
-    if (req.query.storeId) where.storeId = parseInt(req.query.storeId, 10);
+    Object.assign(where, await scopedStoreWhere(req));
     const reservations = await MatWhProfileReservation.findAll({ where });
 
     const byKey = new Map();

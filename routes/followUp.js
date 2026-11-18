@@ -1028,10 +1028,15 @@ const OSRM_MAX_WAYPOINTS = 100; // osrm-routed's default --max-matching-size
 const OSRM_MATCH_RADIUS_M = 50; // phone GPS accuracy in the city
 const OSRM_MAX_REAL_KMH = 180;
 const OSRM_BATCH_HOP_SHARE = 0.2;
-const OSRM_TIMEOUT_MS = 8000;
+// /match with a 50 m radius is slow (~130 ms a point on the MLD build), so a
+// long day needs well over the old 8 s.
+const OSRM_TIMEOUT_MS = 25000;
 // Past days never change, so their road result is kept in memory.
 const roadRouteCache = new Map(); // `${teamId}|${date}` -> result
 const ROAD_CACHE_MAX = 500;
+// Today's result, reused until the team sends a new ping (the live map
+// refreshes far more often than pings arrive).
+const todayRoadCache = new Map(); // teamId -> { date, sig, road }
 
 async function roadRouteThrough(pings) {
     const kept = [];
@@ -1084,7 +1089,12 @@ async function roadRouteThrough(pings) {
                 chunk.forEach((p) => path.push([Number(p.latitude), Number(p.longitude)]));
             }
         } catch {
-            return null;
+            // Timeout or OSRM down: this chunk (and the rest, so a hung OSRM
+            // isn't waited on again) counts as straight line, keeping any
+            // road distance already matched.
+            for (let k = i + 1; k < kept.length; k++) meters += haversineKm(kept[k - 1], kept[k]) * 1000;
+            kept.slice(i).forEach((p) => path.push([Number(p.latitude), Number(p.longitude)]));
+            break;
         } finally {
             clearTimeout(timer);
         }
@@ -1150,12 +1160,19 @@ router.get('/team/day/:teamId', authenticateToken, requirePermission(PERMISSIONS
 
         const cacheKey = `${teamId}|${date}`;
         const isPastDay = date < jordanDayRange().date;
-        let road = isPastDay ? roadRouteCache.get(cacheKey) : undefined;
+        const lastPing = pings[pings.length - 1];
+        const todaySig = `${pings.length}|${lastPing ? new Date(lastPing.ping_time).getTime() : 0}`;
+        const todayHit = !isPastDay ? todayRoadCache.get(teamId) : undefined;
+        let road = isPastDay
+            ? roadRouteCache.get(cacheKey)
+            : (todayHit && todayHit.date === date && todayHit.sig === todaySig ? todayHit.road : undefined);
         if (road === undefined) {
             road = await roadRouteThrough(pings);
             if (road && isPastDay) {
                 if (roadRouteCache.size >= ROAD_CACHE_MAX) roadRouteCache.delete(roadRouteCache.keys().next().value);
                 roadRouteCache.set(cacheKey, road);
+            } else if (road) {
+                todayRoadCache.set(teamId, { date, sig: todaySig, road });
             }
         }
 
@@ -2084,6 +2101,8 @@ router.post("/delivery-status", authenticateToken, requirePermission(PERMISSIONS
 // POST /api/follow-up/location
 // Periodic location ping from the mobile app; upserts the employee's team
 // location so it shows up wherever instTeamLocations is already consumed (SSE dashboard).
+const PING_MIN_GAP_S = 120;
+
 router.post("/location", authenticateToken, async (req, res) => {
     try {
         const { lat, lng } = req.body;
@@ -2122,6 +2141,23 @@ router.post("/location", authenticateToken, async (req, res) => {
         const ageSeconds = Number.isFinite(capturedAt) && capturedAt > 0
             ? Math.min(Math.max(0, Math.round((Date.now() - capturedAt) / 1000)), 7 * 24 * 3600)
             : 0;
+
+        // Android treats the app's 30-minute interval as a hint: when another
+        // app (navigation, live-location sharing) uses GPS, our background
+        // task gets every fix -- confirmed 2026-11-17, team 63 sent a ping
+        // every 30 s all night and every ~6 s while driving (1,103 in a
+        // day). Keep at most one ping per team per PING_MIN_GAP_S, measured
+        // around the fix's own time so offline replays are thinned too.
+        // Still answers success so the app doesn't queue a retry.
+        const [nearby] = await sequelize2.query(
+            `SELECT 1 AS hit FROM IIT_Petra.instTeamLocations
+             WHERE team_id = :teamId
+               AND ping_time > DATE_SUB(UTC_TIMESTAMP(), INTERVAL :before SECOND)
+               AND ping_time < DATE_SUB(UTC_TIMESTAMP(), INTERVAL :after SECOND)
+             LIMIT 1`,
+            { replacements: { teamId, before: ageSeconds + PING_MIN_GAP_S, after: ageSeconds - PING_MIN_GAP_S }, type: QueryTypes.SELECT }
+        );
+        if (nearby) return res.json({ success: true, skipped: true });
 
         // upsertTeamLocation silently no-ops if teamId doesn't reference a
         // real instTeams row (e.g. a stale teamId on an office/admin account),

@@ -13,7 +13,7 @@ import { MatWhStore } from '../models/MatWhStore.js';
 import { MatWhItem } from '../models/MatWhItem.js';
 import { MatWhItemVariant } from '../models/MatWhItemVariant.js';
 import { getAvailableToReserve } from '../services/matWhLedger.js';
-import { denyStore } from '../services/matWhStoreAccess.js';
+import { denyStore, getAllowedStoreIds, canActOnStore } from '../services/matWhStoreAccess.js';
 import { normalizeRequestKey } from '../services/matWhRequestKeys.js';
 import {
     createTransfer, addLine, updateLine, removeLine, cancelTransfer, sendTransfer,
@@ -82,10 +82,23 @@ async function shapeLines(lines) {
 }
 
 // Stores for the "New transfer" dialog. Declared before /:id.
+// stores: every store, as a destination (the one place a store-scoped
+// user still sees other stores, by name only); fromStores: the ones the
+// caller may send from.
 router.get('/store-transfers/options', requireTransfer, async (req, res) => {
-    const stores = await MatWhStore.findAll({ where: { isActive: true }, order: [['storeCode', 'ASC']] });
-    res.json({ stores: stores.map((s) => ({ id: s.id, storeCode: s.storeCode, storeName: s.storeName, storeNameAr: s.storeNameAr })) });
+    const allowed = await getAllowedStoreIds(req.user);
+    const stores = (await MatWhStore.findAll({ where: { isActive: true }, order: [['storeCode', 'ASC']] }))
+        .map((s) => ({ id: s.id, storeCode: s.storeCode, storeName: s.storeName, storeNameAr: s.storeNameAr }));
+    res.json({ stores, fromStores: stores.filter((s) => canActOnStore(allowed, s.id)) });
 });
+
+// A store-scoped caller sees the transfers leaving or entering their stores.
+async function transferStoreWhere(req) {
+    const allowed = await getAllowedStoreIds(req.user);
+    if (allowed === null) return null;
+    const ids = [...allowed, -1];
+    return { [Op.or]: [{ fromStoreId: ids }, { toStoreId: ids }] };
+}
 
 // Items for the draft's "add item" search, with each variant's available
 // qty in the source store so the user sees what can actually be sent.
@@ -93,6 +106,7 @@ router.get('/store-transfers/item-search', requireTransfer, async (req, res) => 
     const q = String(req.query.q || '').trim();
     const storeId = Number(req.query.storeId);
     if (q.length < 2 || !storeId) return res.json({ items: [] });
+    if (await denyStore(req, res, storeId)) return;
     const items = await MatWhItem.findAll({
         where: {
             isActive: true,
@@ -140,6 +154,8 @@ function requireTransferOrReports(req, res, next) {
 
 router.get('/store-transfers/in-transit', requireTransferOrReports, async (req, res) => {
     const where = { status: OPEN_STATUSES };
+    const scope = await transferStoreWhere(req);
+    if (scope) where[Op.and] = [scope];
     if (req.query.storeId) {
         const sid = Number(req.query.storeId);
         where[Op.or] = [{ fromStoreId: sid }, { toStoreId: sid }];
@@ -168,6 +184,8 @@ router.get('/store-transfers/in-transit', requireTransferOrReports, async (req, 
 
 router.get('/store-transfers', requireTransfer, async (req, res) => {
     const where = {};
+    const scope = await transferStoreWhere(req);
+    if (scope) where[Op.and] = [scope];
     if (req.query.status) where.status = String(req.query.status).split(',');
     if (req.query.storeId) {
         const sid = Number(req.query.storeId);
@@ -202,6 +220,10 @@ router.get('/store-transfers', requireTransfer, async (req, res) => {
 router.get('/store-transfers/:id', requireTransfer, async (req, res) => {
     try {
         const transfer = await loadTransfer(Number(req.params.id));
+        const allowed = await getAllowedStoreIds(req.user);
+        if (!canActOnStore(allowed, transfer.fromStoreId) && !canActOnStore(allowed, transfer.toStoreId)) {
+            return res.status(404).json({ message: 'Transfer not found' });
+        }
         const lines = await MatWhStoreTransferLine.findAll({ where: { storeTransferId: transfer.id }, order: [['id', 'ASC']] });
         const [shaped, stores] = await Promise.all([shapeLines(lines), storeMap([transfer.fromStoreId, transfer.toStoreId])]);
         // While still a draft, show how much of each line the source store
