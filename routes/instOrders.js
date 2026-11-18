@@ -10,7 +10,7 @@ import { InstTeamVacation } from '../models/InstTeamVacation.js';
 import { InstOrderScheduleDay } from '../models/InstOrderScheduleDay.js';
 import { ProjectMapCache } from '../models/ProjectMapCache.js';
 import { User } from '../models/User.js';
-import { recordComponentAction, getUnitCompletionStatsBulk, summarizeUnitStats, markUnitComplete } from '../services/instOrderComponents.js';
+import { recordComponentAction, getUnitCompletionStatsBulk, summarizeUnitStats, markUnitComplete, isMinstockUnavailable } from '../services/instOrderComponents.js';
 import { isShortMapLink, extractCoords, extractPlaceName, resolveShortMapLink } from '../services/resolveMapLink.js';
 import { reverseGeocodeArea } from '../services/reverseGeocode.js';
 import { toDateOnlyString } from '../utils/dateOnly.js';
@@ -1641,7 +1641,9 @@ router.get('/assigned-components', async (req, res) => {
             recentCheckins.map((r) => [String(r.projectNo), r.lastCheckin])
         );
 
-        res.json({ success: true, data: { orders, teams, checkpoints, recentComponentUpdates, projectLastCheckin } });
+        // stockUnavailable: the Thuhaiba stock server (minstock) did not
+        // answer, so material counts are missing -- the page says so.
+        res.json({ success: true, data: { orders, teams, checkpoints, recentComponentUpdates, projectLastCheckin, stockUnavailable: isMinstockUnavailable() } });
     } catch (err) {
         console.error('❌ FETCH ASSIGNED COMPONENTS ERROR:', err);
         res.status(500).json({ success: false, message: 'Error fetching assigned orders' });
