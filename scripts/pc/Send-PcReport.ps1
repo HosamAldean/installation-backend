@@ -30,6 +30,17 @@ $ErrorActionPreference = 'Stop'
 
 function Iso($d) { if ($d) { ([datetime]$d).ToUniversalTime().ToString('o') } else { $null } }
 
+# One-line result for troubleshooting: C:\ProgramData\PetraPcReport\last-run.log
+# (ProgramData is readable by every local user; no secrets are written).
+function Write-RunLog($text) {
+    try {
+        $dir = Join-Path $env:ProgramData 'PetraPcReport'
+        New-Item -ItemType Directory -Force $dir | Out-Null
+        "$(Get-Date -Format s) [$([Security.Principal.WindowsIdentity]::GetCurrent().Name)] $text" |
+            Set-Content -Path (Join-Path $dir 'last-run.log') -Encoding UTF8
+    } catch { }
+}
+
 $WindowsAppId = '55c92734-d682-4d71-983e-d6ec3f16059f'
 $OfficeAppId = '0ff1ce15-a989-479d-af46-f275c6370663'
 
@@ -130,8 +141,10 @@ try {
 
     Invoke-RestMethod -Method Post -Uri $ApiUrl -Headers @{ 'X-Report-Token' = $Token } `
         -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($json)) -TimeoutSec 60 | Out-Null
+    Write-RunLog "OK sent $($json.Length) bytes"
 }
 catch {
     # Never bother the user; the page shows when a PC last reported.
+    Write-RunLog "FAILED at line $($_.InvocationInfo.ScriptLineNumber): $($_.Exception.Message)"
     exit 1
 }
