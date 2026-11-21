@@ -192,6 +192,13 @@ export const PERMISSIONS = Object.freeze({
     // expiry push reminders all follow this one key; it was hardcoded
     // admin-only before.
     IT_LICENSES: 'it.licenses',
+    // Network page (routes/network.js, 2026-11-21): Meraki clients/devices,
+    // WAN/VPN, DHCP + AD inventory, ping monitor and its down/up pushes.
+    IT_NETWORK: 'it.network',
+    // Remote control from the network page (today: the .rdp download, later
+    // MeshCentral). Separate on purpose -- seeing the device list must not
+    // imply being able to connect to the devices.
+    IT_REMOTE: 'it.remote',
 });
 
 // Every role that can be granted a permission. `admin` is deliberately
@@ -408,7 +415,11 @@ export const PERMISSION_GROUPS = [
         module: 'it',
         label: 'IT',
         roles: ['it_manager', 'it_support'],
-        items: [{ key: PERMISSIONS.IT_LICENSES, labelKey: 'itLicenses' }],
+        items: [
+            { key: PERMISSIONS.IT_LICENSES, labelKey: 'itLicenses' },
+            { key: PERMISSIONS.IT_NETWORK, labelKey: 'itNetwork' },
+            { key: PERMISSIONS.IT_REMOTE, labelKey: 'itRemote' },
+        ],
     },
 ];
 
