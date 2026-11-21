@@ -17,6 +17,7 @@ import { activityAudit, ensureActivityAuditTable } from './middleware/activityAu
 import { startAuditRetention } from './services/auditRetention.js';
 import { startSecurityMonitor } from './services/securityMonitor.js';
 import { startItLicenseMonitor } from './services/itLicenseMonitor.js';
+import { startNetworkMonitor } from './services/networkMonitor.js';
 import { LATEST_VERSION_CODE, LATEST_VERSION_NAME, MIN_SUPPORTED_VERSION_CODE, DOWNLOAD_URL, UPDATE_PAGE_URL, WHATS_NEW_EN, WHATS_NEW_AR } from './constants/mobileAppVersion.js';
 
 // import routes
@@ -70,6 +71,7 @@ import permissionsRouter from "./routes/permissions.js";
 import auditRouter from "./routes/audit.js";
 import announcementsRouter from "./routes/announcements.js";
 import itLicensesRouter from "./routes/itLicenses.js";
+import networkRouter from "./routes/network.js";
 import hrRequestsRouter from "./routes/hrRequests.js";
 import payslipRouter from "./routes/payslip.js";
 import hrReportsRouter from "./routes/hrReports.js";
@@ -321,6 +323,7 @@ app.use("/api/admin/permissions", permissionsRouter);
 app.use("/api/admin/audit", auditRouter);
 app.use("/api/announcements", announcementsRouter);
 app.use("/api/it-licenses", itLicensesRouter);
+app.use("/api/network", networkRouter);
 app.use("/api/cr09/tags", cr09TagsRouter);
 app.use("/api/hr-requests", hrRequestsRouter);
 app.use("/api/payslip", payslipRouter);
@@ -535,6 +538,7 @@ import tls from "tls";
     } else {
         startSecurityMonitor();
         startItLicenseMonitor();
+        startNetworkMonitor();
         startAuditRetention();
     }
 })();
