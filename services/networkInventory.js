@@ -47,7 +47,7 @@ export async function loadSnapshots() {
 function emptyRow(key) {
     return {
         key,
-        mac: key.startsWith('ad:') ? null : key,
+        mac: key.includes(':') && !key.startsWith('ad:') && !key.startsWith('ip:') ? key : null,
         name: null,
         ip: null,
         online: false,
@@ -70,6 +70,7 @@ function emptyRow(key) {
         reservation: null,
         ad: null,
         monitor: null,
+        scan: null, // { alive, rttMs, pingBlocked, name } from the LAN scan
         lastLogon: null, // { user, domain, time, dc } from DC Kerberos events
         label: null,
         owner: null,
@@ -114,6 +115,25 @@ export async function buildDeviceList(snapshots) {
         row.user = c.user;
         row.usage = c.usage;
         row.name = row.name || c.description || null;
+    }
+
+    // --- LAN scan from the server (services/lanScan.js): online now + IP/MAC.
+    // Hosts on other subnets have no MAC (ARP doesn't cross routers) and get
+    // an "ip:<addr>" row.
+    const scan = snaps.lan_scan?.data;
+    for (const h of scan?.hosts ?? []) {
+        const mac = normalizeMac(h.mac);
+        const row = get(mac || `ip:${h.ip}`);
+        if (!row.sources.includes('scan')) row.sources.push('scan');
+        row.scan = { alive: h.alive, rttMs: h.rttMs ?? null, pingBlocked: !!h.pingBlocked, name: h.name ?? null };
+        if (h.alive) {
+            row.online = true;
+            row.ip = h.ip;
+        } else {
+            row.ip = row.ip || h.ip;
+        }
+        if (h.lastSeen && (!row.lastSeen || h.lastSeen > row.lastSeen)) row.lastSeen = h.lastSeen;
+        if (!row.name && h.name) row.name = h.name.split('.')[0].toUpperCase();
     }
 
     // --- DHCP leases + reservations
@@ -198,7 +218,7 @@ export async function buildDeviceList(snapshots) {
     for (const row of rows.values()) {
         // Only rows whose IP is current (Meraki or a DHCP lease) -- an AD-only
         // row's IP comes from DNS and may belong to another PC by now.
-        if (!row.ip || (!row.meraki && !row.dhcp && !row.reservation)) continue;
+        if (!row.ip || (!row.meraki && !row.dhcp && !row.reservation && !row.scan?.alive)) continue;
         const l = lastLogonByIp.get(row.ip);
         if (l) row.lastLogon = l;
     }

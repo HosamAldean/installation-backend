@@ -18,6 +18,7 @@ import { startAuditRetention } from './services/auditRetention.js';
 import { startSecurityMonitor } from './services/securityMonitor.js';
 import { startItLicenseMonitor } from './services/itLicenseMonitor.js';
 import { startNetworkMonitor } from './services/networkMonitor.js';
+import { startLanScan } from './services/lanScan.js';
 import { LATEST_VERSION_CODE, LATEST_VERSION_NAME, MIN_SUPPORTED_VERSION_CODE, DOWNLOAD_URL, UPDATE_PAGE_URL, WHATS_NEW_EN, WHATS_NEW_AR } from './constants/mobileAppVersion.js';
 
 // import routes
@@ -539,6 +540,7 @@ import tls from "tls";
         startSecurityMonitor();
         startItLicenseMonitor();
         startNetworkMonitor();
+        startLanScan();
         startAuditRetention();
     }
 })();

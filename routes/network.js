@@ -201,7 +201,7 @@ router.get("/overview", async (req, res) => {
             merakiConfigured: merakiConfigured(),
             ingestConfigured: Boolean(process.env.NETWORK_INGEST_TOKEN),
             sources: Object.fromEntries(
-                ["meraki_devices", "meraki_clients", "meraki_uplinks", "meraki_vpn", "dhcp", "ad",
+                ["lan_scan", "meraki_devices", "meraki_clients", "meraki_uplinks", "meraki_vpn", "dhcp", "ad",
                     ...Object.keys(snaps).filter((k) => k.startsWith("logons_")).sort()]
                     .map((k) => [k, sourceInfo(snaps[k])]),
             ),
@@ -243,7 +243,7 @@ router.get("/devices", async (req, res) => {
     }
 });
 
-const DEVICE_KEY_RE = /^(?:[0-9a-f]{2}(?::[0-9a-f]{2}){5}|ad:[A-Z0-9_.\-$]{1,64})$/;
+const DEVICE_KEY_RE = /^(?:[0-9a-f]{2}(?::[0-9a-f]{2}){5}|ad:[A-Z0-9_.\-$]{1,64}|ip:\d{1,3}(?:\.\d{1,3}){3})$/;
 
 router.patch("/devices/:key/note", async (req, res) => {
     const key = String(req.params.key);
