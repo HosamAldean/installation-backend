@@ -59,7 +59,7 @@ router.post("/ingest", async (req, res) => {
         return res.status(401).json({ success: false, message: "Bad token" });
     }
     try {
-        const { dhcp, ad } = req.body ?? {};
+        const { dhcp, ad, logons } = req.body ?? {};
         const saved = [];
         if (dhcp && typeof dhcp === "object") {
             await saveSnapshot("dhcp", {
@@ -107,6 +107,22 @@ router.post("/ingest", async (req, res) => {
                 })),
             });
             saved.push("ad");
+        }
+        // Last domain user per IP, one snapshot per DC (each DC only sees
+        // the logons it served) -- merged by services/networkInventory.js.
+        if (logons && typeof logons === "object") {
+            const dc = String(logons.dc ?? "").toUpperCase().replace(/[^A-Z0-9-]/g, "").slice(0, 30);
+            if (!dc) return res.status(400).json({ success: false, message: "logons.dc is required" });
+            await saveSnapshot(`logons_${dc}`, {
+                dc,
+                items: list(logons.items).filter((x) => x?.ip && x?.user).map((x) => ({
+                    ip: s(x.ip, 45),
+                    user: s(x.user, 100),
+                    domain: s(x.domain, 50),
+                    time: s(x.time, 40),
+                })),
+            });
+            saved.push(`logons_${dc}`);
         }
         res.json({ success: true, saved });
     } catch (err) {
@@ -185,7 +201,8 @@ router.get("/overview", async (req, res) => {
             merakiConfigured: merakiConfigured(),
             ingestConfigured: Boolean(process.env.NETWORK_INGEST_TOKEN),
             sources: Object.fromEntries(
-                ["meraki_devices", "meraki_clients", "meraki_uplinks", "meraki_vpn", "dhcp", "ad"]
+                ["meraki_devices", "meraki_clients", "meraki_uplinks", "meraki_vpn", "dhcp", "ad",
+                    ...Object.keys(snaps).filter((k) => k.startsWith("logons_")).sort()]
                     .map((k) => [k, sourceInfo(snaps[k])]),
             ),
             merakiDevices,

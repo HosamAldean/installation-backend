@@ -70,6 +70,7 @@ function emptyRow(key) {
         reservation: null,
         ad: null,
         monitor: null,
+        lastLogon: null, // { user, domain, time, dc } from DC Kerberos events
         label: null,
         owner: null,
         notes: null,
@@ -178,6 +179,28 @@ export async function buildDeviceList(snapshots) {
         row.os = c.os || row.os;
         row.ip = row.ip || c.ipv4 || null;
         row.windows = true;
+    }
+
+    // --- last domain user per IP: newest across every DC's logons snapshot.
+    // Kerberos TGT events say who last authenticated FROM that IP -- usually
+    // the person at the PC, but a run-as / share login also counts, so the
+    // page labels it "last logon", not "logged in now".
+    const lastLogonByIp = new Map();
+    for (const [source, snap] of Object.entries(snaps)) {
+        if (!source.startsWith('logons_')) continue;
+        for (const l of snap.data?.items ?? []) {
+            const prev = lastLogonByIp.get(l.ip);
+            if (!prev || String(l.time) > String(prev.time)) {
+                lastLogonByIp.set(l.ip, { user: l.user, domain: l.domain, time: toIso(l.time), dc: snap.data.dc });
+            }
+        }
+    }
+    for (const row of rows.values()) {
+        // Only rows whose IP is current (Meraki or a DHCP lease) -- an AD-only
+        // row's IP comes from DNS and may belong to another PC by now.
+        if (!row.ip || (!row.meraki && !row.dhcp && !row.reservation)) continue;
+        const l = lastLogonByIp.get(row.ip);
+        if (l) row.lastLogon = l;
     }
 
     // --- monitor targets, matched by IP or host name
