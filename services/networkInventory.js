@@ -156,7 +156,12 @@ export async function buildDeviceList(snapshots) {
     for (const c of computers) {
         const s = shortName(c.name);
         if (!s) continue;
-        const row = byName.get(s) || (c.ipv4 && byIp.get(c.ipv4)) || get(`ad:${s.toUpperCase()}`);
+        // A row takes at most one AD computer. The IP match is the weaker
+        // one (AD's IPv4 comes from DNS and can be stale), so a second AD
+        // record pointing at an already-matched device gets its own row
+        // instead of overwriting the first.
+        const free = (r) => (r && !r.ad ? r : null);
+        const row = free(byName.get(s)) || free(c.ipv4 && byIp.get(c.ipv4)) || get(`ad:${s.toUpperCase()}`);
         if (!row.sources.includes('ad')) row.sources.push('ad');
         row.ad = {
             name: c.name,
