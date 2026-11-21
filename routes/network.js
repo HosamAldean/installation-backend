@@ -143,6 +143,7 @@ const PC_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$/;
 
 // PowerShell 5.1's ConvertTo-Json turns a one-item array into a bare object.
 const asArray = (v) => (Array.isArray(v) ? v : v && typeof v === "object" ? [v] : []);
+const num = (v) => (v === null || v === undefined || v === "" || !Number.isFinite(Number(v)) ? null : Number(v));
 
 function licenseList(v) {
     return asArray(v).slice(0, 60).map((l) => ({
@@ -185,6 +186,28 @@ router.post("/report", async (req, res) => {
                 model: s(b.hardware?.model, 100),
                 serial: s(b.hardware?.serial, 100),
                 ramGb: Number(b.hardware?.ramGb) || null,
+                ramFreeGb: num(b.hardware?.ramFreeGb),
+                cpu: b.hardware?.cpu ? {
+                    name: s(b.hardware.cpu.name, 150),
+                    sockets: num(b.hardware.cpu.sockets),
+                    cores: num(b.hardware.cpu.cores),
+                    threads: num(b.hardware.cpu.threads),
+                    loadPct: num(b.hardware.cpu.loadPct),
+                } : null,
+                volumes: asArray(b.hardware?.volumes).slice(0, 26).map((v) => ({
+                    drive: s(v?.drive, 4),
+                    label: s(v?.label, 60),
+                    fs: s(v?.fs, 10),
+                    sizeGb: num(v?.sizeGb),
+                    freeGb: num(v?.freeGb),
+                })).filter((v) => v.drive),
+                disks: asArray(b.hardware?.disks).slice(0, 16).map((d) => ({
+                    model: s(d?.model, 100),
+                    mediaType: s(d?.mediaType, 20),
+                    busType: s(d?.busType, 20),
+                    sizeGb: num(d?.sizeGb),
+                    health: s(d?.health, 20),
+                })),
             },
             windowsLicenses: licenseList(b.windowsLicenses),
             officeLicenses: licenseList(b.officeLicenses),

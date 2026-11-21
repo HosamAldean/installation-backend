@@ -8,7 +8,8 @@
   Sends: computer name, logged-on user, Windows edition/build, Windows and
   Office license/activation status (SoftwareLicensingProduct), installed
   Office products (Uninstall registry + Click-to-Run config), NICs (MAC/IP),
-  make/model/serial/RAM.
+  make/model/serial, CPU (model/cores/load), RAM (total/free), drives
+  (size/free) and physical disks (SSD/HDD, health).
 
   READ-ONLY on the PC: CIM queries and registry reads. It changes nothing --
   it does not activate, install or remove anything.
@@ -103,6 +104,38 @@ try {
         }
     }
 
+    # CPU / RAM / disks (read-only CIM queries)
+    $cpus = @(Get-CimInstance Win32_Processor)
+    $cpu = [ordered]@{
+        name    = (($cpus | Select-Object -First 1).Name -replace '\s+', ' ').Trim()
+        sockets = $cpus.Count
+        cores   = [int](($cpus | Measure-Object NumberOfCores -Sum).Sum)
+        threads = [int](($cpus | Measure-Object NumberOfLogicalProcessors -Sum).Sum)
+        loadPct = [int](($cpus | Measure-Object LoadPercentage -Average).Average)
+    }
+    $volumes = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType = 3' |
+        ForEach-Object {
+            [ordered]@{
+                drive  = $_.DeviceID
+                label  = $_.VolumeName
+                fs     = $_.FileSystem
+                sizeGb = [math]::Round($_.Size / 1GB, 1)
+                freeGb = [math]::Round($_.FreeSpace / 1GB, 1)
+            }
+        })
+    $physical = @()
+    try {
+        $physical = @(Get-PhysicalDisk -ErrorAction Stop | ForEach-Object {
+            [ordered]@{
+                model     = ($_.FriendlyName -replace '\s+', ' ').Trim()
+                mediaType = "$($_.MediaType)"
+                busType   = "$($_.BusType)"
+                sizeGb    = [math]::Round($_.Size / 1GB, 0)
+                health    = "$($_.HealthStatus)"
+            }
+        })
+    } catch { }
+
     $nics = @(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled = TRUE' |
         Where-Object { $_.MACAddress } |
         ForEach-Object {
@@ -128,6 +161,10 @@ try {
             model        = $cs.Model
             serial       = $bios.SerialNumber
             ramGb        = [math]::Round($cs.TotalPhysicalMemory / 1GB, 1)
+            ramFreeGb    = [math]::Round($os.FreePhysicalMemory / 1MB, 1)
+            cpu          = $cpu
+            volumes      = @($volumes)
+            disks        = @($physical)
         }
         windowsLicenses = @($winLic)
         officeLicenses  = @($offLic)
