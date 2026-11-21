@@ -71,6 +71,8 @@ function emptyRow(key) {
         ad: null,
         monitor: null,
         scan: null, // { alive, rttMs, pingBlocked, name } from the LAN scan
+        pc: null, // the PC's own report (activation, Office, user, hardware)
+        activation: null, // summarizeActivation(pc)
         lastLogon: null, // { user, domain, time, dc } from DC Kerberos events
         label: null,
         owner: null,
@@ -201,6 +203,32 @@ export async function buildDeviceList(snapshots) {
         row.windows = true;
     }
 
+    // --- each PC's own report (routes/network.js POST /report): activation,
+    // installed Office, logged-on user. Matched by computer name, then by
+    // any of its MACs; a PC never seen otherwise gets its "ad:<NAME>" row.
+    const rowsByName = new Map();
+    for (const row of rows.values()) {
+        for (const n of [row.ad?.name, row.dhcp?.hostName, row.reservation?.name, row.scan?.name, row.name]) {
+            const s = shortName(n);
+            if (s && !rowsByName.has(s)) rowsByName.set(s, row);
+        }
+    }
+    for (const [source, snap] of Object.entries(snaps)) {
+        if (!source.startsWith('pc:') || !snap.data) continue;
+        const p = snap.data;
+        const s = shortName(p.computerName);
+        let row = rowsByName.get(s);
+        if (!row) {
+            const mac = (p.nics ?? []).map((n) => n.mac).find((m) => m && rows.has(m));
+            row = mac ? rows.get(mac) : get(`ad:${String(p.computerName).toUpperCase()}`);
+        }
+        if (!row.sources.includes('pc')) row.sources.push('pc');
+        row.pc = { ...p, reportedAt: snap.fetchedAt ? new Date(snap.fetchedAt).toISOString() : null };
+        row.activation = summarizeActivation(p);
+        row.name = row.name || p.computerName;
+        row.windows = true;
+    }
+
     // --- last domain user per IP: newest across every DC's logons snapshot.
     // Kerberos TGT events say who last authenticated FROM that IP -- usually
     // the person at the PC, but a run-as / share login also counts, so the
@@ -248,6 +276,62 @@ export async function buildDeviceList(snapshots) {
         Number(b.online) - Number(a.online)
         || ipSortKey(a.ip) - ipSortKey(b.ip)
         || String(a.name ?? '').localeCompare(String(b.name ?? '')));
+}
+
+// SoftwareLicensingProduct.LicenseStatus: 0 unlicensed, 1 licensed,
+// 2-6 grace / notification states.
+function licenseState(status) {
+    if (status === 1) return 'activated';
+    if (status === 0) return 'not_activated';
+    if (status === 5) return 'notification';
+    if ([2, 3, 4, 6].includes(status)) return 'grace';
+    return 'unknown';
+}
+
+// "Windows(R) Operating System, RETAIL channel" -> "RETAIL"
+function licenseChannel(description) {
+    const m = String(description ?? '').match(/,\s*([A-Z_]+)\s+channel/i);
+    return m ? m[1].toUpperCase() : null;
+}
+
+function kmsOf(l) {
+    return l.kmsHost || l.kmsDiscovered || null;
+}
+
+export function summarizeActivation(p) {
+    const win = (p.windowsLicenses ?? []).find((l) => l.partialKey) ?? (p.windowsLicenses ?? [])[0] ?? null;
+    const officeLic = (p.officeLicenses ?? []).filter((l) => l.partialKey);
+    const officeStates = officeLic.map((l) => licenseState(l.status));
+    let officeStatus = 'none';
+    if (officeLic.length) {
+        if (officeStates.every((x) => x === 'activated')) officeStatus = 'activated';
+        else if (officeStates.some((x) => x === 'activated')) officeStatus = 'partial';
+        else if (officeStates.some((x) => x === 'grace')) officeStatus = 'grace';
+        else officeStatus = 'not_activated';
+    } else if ((p.officeProducts ?? []).length) {
+        officeStatus = 'unknown';
+    }
+    return {
+        windows: win ? {
+            status: licenseState(win.status),
+            channel: licenseChannel(win.description),
+            name: win.name,
+            kmsHost: kmsOf(win),
+            graceMinutes: win.graceMinutes,
+        } : null,
+        office: {
+            status: officeStatus,
+            products: (p.officeProducts ?? []).map((x) => x.name),
+            licenses: officeLic.map((l) => ({
+                name: l.name,
+                status: licenseState(l.status),
+                channel: licenseChannel(l.description),
+                kmsHost: kmsOf(l),
+                graceMinutes: l.graceMinutes,
+            })),
+            kmsHosts: [...new Set(officeLic.map(kmsOf).filter(Boolean))],
+        },
+    };
 }
 
 function ipSortKey(ip) {

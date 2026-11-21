@@ -39,8 +39,7 @@ function logAction({ entityId, entityLabel, action, changes, req }) {
 // POST /ingest -- DHCP + AD inventory from DC3 (token auth, no session)
 // ---------------------------------------------------------------------------
 
-function tokenMatches(given) {
-    const expected = process.env.NETWORK_INGEST_TOKEN;
+function tokenMatches(given, expected = process.env.NETWORK_INGEST_TOKEN) {
     if (!expected || typeof given !== "string") return false;
     const a = Buffer.from(given);
     const b = Buffer.from(expected);
@@ -128,6 +127,86 @@ router.post("/ingest", async (req, res) => {
     } catch (err) {
         console.error("❌ Network ingest failed:", err);
         res.status(500).json({ success: false, message: "Ingest failed" });
+    }
+});
+
+// ---------------------------------------------------------------------------
+// POST /report -- one PC reporting about itself (scripts/pc/Send-PcReport.ps1,
+// run on every domain PC by GPO as SYSTEM): Windows + Office activation,
+// installed Office, logged-on user, NICs. Its own NETWORK_REPORT_TOKEN,
+// separate from the DC ingest token on purpose: this one sits in SYSVOL
+// where any domain user can read it, so all it can ever do is overwrite one
+// PC's report row ("pc:<NAME>") -- never DHCP/AD/logon data.
+// ---------------------------------------------------------------------------
+
+const PC_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$/;
+
+// PowerShell 5.1's ConvertTo-Json turns a one-item array into a bare object.
+const asArray = (v) => (Array.isArray(v) ? v : v && typeof v === "object" ? [v] : []);
+
+function licenseList(v) {
+    return asArray(v).slice(0, 60).map((l) => ({
+        name: s(l?.name, 150),
+        description: s(l?.description, 150),
+        status: Number.isInteger(l?.status) ? l.status : null,
+        partialKey: s(l?.partialKey, 10),
+        kmsHost: s(l?.kmsHost, 150),
+        kmsDiscovered: s(l?.kmsDiscovered, 150),
+        graceMinutes: Number.isFinite(l?.graceMinutes) ? l.graceMinutes : null,
+    }));
+}
+
+router.post("/report", async (req, res) => {
+    if (!process.env.NETWORK_REPORT_TOKEN) {
+        return res.status(503).json({ success: false, message: "PC reports are not configured" });
+    }
+    if (!tokenMatches(req.get("x-report-token"), process.env.NETWORK_REPORT_TOKEN)) {
+        return res.status(401).json({ success: false, message: "Bad token" });
+    }
+    const b = req.body ?? {};
+    const name = String(b.computerName ?? "").trim();
+    if (!PC_NAME_RE.test(name)) return res.status(400).json({ success: false, message: "Bad computerName" });
+    try {
+        const key = `pc:${name.toUpperCase()}`.slice(0, 40);
+        await saveSnapshot(key, {
+            computerName: name.toUpperCase(),
+            fromIp: (req.ip || "").replace(/^::ffff:/, ""),
+            user: s(b.user, 150),
+            os: {
+                caption: s(b.os?.caption, 150),
+                version: s(b.os?.version, 40),
+                build: s(b.os?.build, 40),
+                displayVersion: s(b.os?.displayVersion, 20),
+                installDate: s(b.os?.installDate, 40),
+                lastBoot: s(b.os?.lastBoot, 40),
+            },
+            hardware: {
+                manufacturer: s(b.hardware?.manufacturer, 100),
+                model: s(b.hardware?.model, 100),
+                serial: s(b.hardware?.serial, 100),
+                ramGb: Number(b.hardware?.ramGb) || null,
+            },
+            windowsLicenses: licenseList(b.windowsLicenses),
+            officeLicenses: licenseList(b.officeLicenses),
+            officeProducts: asArray(b.officeProducts).slice(0, 40).map((p) => ({
+                name: s(p?.name, 200),
+                version: s(p?.version, 40),
+                source: s(p?.source, 20),
+            })),
+            clickToRun: b.clickToRun ? {
+                productIds: s(b.clickToRun.productIds, 300),
+                version: s(b.clickToRun.version, 40),
+                platform: s(b.clickToRun.platform, 10),
+                channel: s(b.clickToRun.channel, 200),
+            } : null,
+            nics: asArray(b.nics).slice(0, 10)
+                .map((n) => ({ mac: normalizeMac(n?.mac), ip: s(n?.ip, 45) }))
+                .filter((n) => n.mac),
+        });
+        res.json({ success: true });
+    } catch (err) {
+        console.error("❌ PC report failed:", err);
+        res.status(500).json({ success: false, message: "Report failed" });
     }
 });
 
@@ -225,6 +304,12 @@ router.get("/overview", async (req, res) => {
                 // On the wire but neither an AD computer nor a DHCP
                 // reservation, nor labelled by IT -- worth a look.
                 unknown: devices.filter((d) => d.online && !d.ad && !d.reservation && !d.label).length,
+                // From the PCs' own reports (POST /report).
+                pcReports: devices.filter((d) => d.pc).length,
+                windowsNotActivated: devices.filter((d) => d.activation?.windows
+                    && d.activation.windows.status !== "activated").length,
+                officeNotActivated: devices.filter((d) => d.activation
+                    && ["not_activated", "grace", "partial"].includes(d.activation.office.status)).length,
             },
         });
     } catch (err) {
