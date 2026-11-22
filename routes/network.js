@@ -461,7 +461,16 @@ async function findMeshNode(names) {
         if (n.rname && wanted.has(String(n.rname).toLowerCase())) return n;
         if (!byName && n.name && wanted.has(String(n.name).toLowerCase())) byName = n;
     }
-    return byName;
+    if (byName) return byName;
+    // Windows/AD computer names are cut to 15 characters (NetBIOS), while the
+    // Mesh agent reports the full host name: AD "ABDULLAHABUSHAW" is Mesh
+    // "AbdullahAbushawish". Fall back to the first 15 characters -- only when
+    // that picks exactly one device.
+    const nb = (s) => String(s).toLowerCase().slice(0, 15);
+    const wanted15 = new Set([...wanted].map(nb));
+    const hits = [...nodes.values()].filter((n) => (n.rname && wanted15.has(nb(n.rname)))
+        || (n.name && wanted15.has(nb(n.name))));
+    return hits.length === 1 ? hits[0] : null;
 }
 
 router.get("/devices/:key/mesh", requirePermission(PERMISSIONS.IT_REMOTE), async (req, res) => {
@@ -493,7 +502,8 @@ router.get("/devices/:key/mesh", requirePermission(PERMISSIONS.IT_REMOTE), async
         // a permission -- the viewer can still tick Input in the session.
         const b64 = node._id.split("/").pop().replaceAll("@", "+").replaceAll("$", "/");
         const id = Buffer.from(b64, "base64").toString("hex");
-        const mode = ["view", "control"].includes(req.query.mode) ? req.query.mode : "page";
+        // consent = ask the logged-on user (Allow/Deny prompt + session bar)
+        const mode = ["view", "control", "consent"].includes(req.query.mode) ? req.query.mode : "page";
         logAction({
             entityId: key,
             entityLabel: node.rname || node.name,

@@ -7,13 +7,101 @@
 // The IT Network page links here with
 //   ?viewmode=11&gotonode=<hex id>&petra=view     -> view only, auto-connect
 //   ?viewmode=11&gotonode=<hex id>&petra=control  -> full control, auto-connect
+//   ?viewmode=11&gotonode=<hex id>&petra=consent  -> ask the user first
 // "view" turns MeshCentral's Desktop "Input" checkbox off (mouse/keyboard not
 // sent), "control" turns it on, then the desktop connects once the device page
-// is showing. Without ?petra= this script does nothing.
-(function () {
-  var m = /[?&]petra=(view|control)(?:&|$)/.exec(window.location.search)
+// is showing. "consent" connects like MeshCentral's own "Ask Consent + Bar":
+// the logged-on user gets an Allow/Deny prompt (0x0008) and, once allowed, a
+// bar on their screen showing the session with a Disconnect button (0x0040).
+//
+// On every page it also adds two buttons next to the Desktop tab's Connect
+// button: "View only" (connects with the Input checkbox off) and "Ask user"
+// (the consent connect above; MeshCentral only offers it in Connect's
+// right-click menu). They mirror Connect: disabled while the device is
+// offline, hidden while a session is open. Plain Connect keeps whatever the
+// Input checkbox says.
+
+// --- "View only" + "Ask user" buttons beside Connect (Desktop tab)
+;(function () {
+  var CONSENT = 0x0008 + 0x0040 // Allow/Deny prompt + session bar
+
+  function setInput(on) {
+    var box = document.getElementById('DeskControl')
+    if (box && box.checked !== on) {
+      box.checked = on
+      if (typeof toggleKvmControl === 'function') toggleKvmControl()
+    }
+  }
+
+  var BUTTONS = [
+    {
+      id: 'petraViewOnlyButton',
+      label: 'View only',
+      title: 'Watch the screen: mouse and keyboard are not sent (tick Input to take over)',
+      run: function () {
+        setInput(false)
+        connectDesktop(null, 3)
+      },
+    },
+    {
+      id: 'petraAskUserButton',
+      label: 'Ask user',
+      title:
+        'Connect only after the logged-on user clicks Allow; they see a bar with a Disconnect button',
+      run: function () {
+        setInput(true)
+        connectDesktop(null, 3, null, CONSENT)
+      },
+    },
+  ]
+
+  function ensureButtons() {
+    var connect = document.getElementById('connectbutton1')
+    var connectSpan = document.getElementById('connectbutton1span')
+    if (!connect || !connectSpan) return
+    var span = document.getElementById('petraDeskButtons')
+    if (!span) {
+      span = document.createElement('span')
+      span.id = 'petraDeskButtons'
+      BUTTONS.forEach(function (def) {
+        var btn = document.createElement('input')
+        btn.type = 'button'
+        btn.id = def.id
+        btn.value = def.label
+        btn.title = def.title
+        btn.style.marginLeft = '4px'
+        btn.onkeypress = btn.onkeydown = function () {
+          return false
+        }
+        btn.onclick = function () {
+          try {
+            def.run()
+          } catch (e) {}
+        }
+        span.appendChild(btn)
+      })
+      connectSpan.parentNode.insertBefore(span, connectSpan.nextSibling)
+    }
+    BUTTONS.forEach(function (def) {
+      var b = document.getElementById(def.id)
+      if (b) b.disabled = connect.disabled
+    })
+    span.style.display = connectSpan.style.display
+  }
+
+  setInterval(function () {
+    try {
+      ensureButtons()
+    } catch (e) {}
+  }, 500)
+})()
+
+// --- links from the IT Network page (?petra=view|control|consent)
+;(function () {
+  var m = /[?&]petra=(view|control|consent)(?:&|$)/.exec(window.location.search)
   if (!m) return
   var viewOnly = m[1] === 'view'
+  var askUser = m[1] === 'consent'
 
   // MeshCentral reads this localStorage key when the page starts and again
   // when the desktop connects; we run in <head>, before either.
@@ -37,7 +125,11 @@
         box.checked = !viewOnly
         if (typeof toggleKvmControl === 'function') toggleKvmControl()
       }
-      connectDesktop(null, 1)
+      // contype 3 = pick the logged-on user's session (prompt shows there);
+      // with no user session MeshCentral connects to the console with the
+      // same consent flags, and the agent may refuse (nobody to ask).
+      if (askUser) connectDesktop(null, 3, null, 0x0008 + 0x0040)
+      else connectDesktop(null, 1)
     } catch (e) {
       clearInterval(timer)
     }
