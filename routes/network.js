@@ -472,13 +472,18 @@ router.get("/devices/:key/mesh", requirePermission(PERMISSIONS.IT_REMOTE), async
                 message: "This PC is not in Petra Remote yet (agent not installed)",
             });
         }
-        // node ids look like "node//<base64>"; ?gotonode= takes the part after the domain.
-        const id = node._id.split("/").pop();
+        // node ids look like "node//<base64>" (MeshCentral base64: + -> @, / -> $).
+        // ?gotonode= takes the part after the domain, but MeshCentral's URL
+        // parser drops any value containing "%", so an encoded @/$ is ignored
+        // and the page falls back to My Devices. It also accepts the id as 96
+        // hex chars, which needs no encoding -- send that.
+        const b64 = node._id.split("/").pop().replaceAll("@", "+").replaceAll("$", "/");
+        const id = Buffer.from(b64, "base64").toString("hex");
         logAction({ entityId: key, entityLabel: node.rname || node.name, action: "remote_control_open", req });
         res.json({
             success: true,
             name: node.name,
-            url: `${MESH_PUBLIC_URL}?gotonode=${encodeURIComponent(id)}`,
+            url: `${MESH_PUBLIC_URL}?gotonode=${id}`,
         });
     } catch (err) {
         console.error("❌ Mesh lookup failed:", err);
