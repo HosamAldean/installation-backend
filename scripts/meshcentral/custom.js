@@ -13,8 +13,59 @@
 // is showing. "consent" connects like MeshCentral's own "Ask Consent + Bar":
 // the logged-on user gets an Allow/Deny prompt (0x0008) and, once allowed, a
 // bar on their screen showing the session with a Disconnect button (0x0040).
-// Without ?petra= this script does nothing.
-(function () {
+//
+// On every page it also adds an "Ask user" button next to the Desktop tab's
+// Connect button, doing the same consent connect (MeshCentral only offers it
+// in Connect's right-click menu). It mirrors Connect: disabled while the
+// device is offline, hidden while a session is open.
+
+// --- "Ask user" button beside Connect (Desktop tab)
+;(function () {
+  var CONSENT = 0x0008 + 0x0040 // Allow/Deny prompt + session bar
+  function ensureButton() {
+    var connect = document.getElementById('connectbutton1')
+    var connectSpan = document.getElementById('connectbutton1span')
+    if (!connect || !connectSpan) return
+    var span = document.getElementById('petraAskUserSpan')
+    if (!span) {
+      span = document.createElement('span')
+      span.id = 'petraAskUserSpan'
+      var btn = document.createElement('input')
+      btn.type = 'button'
+      btn.id = 'petraAskUserButton'
+      btn.value = 'Ask user'
+      btn.title =
+        'Connect only after the logged-on user clicks Allow; they see a bar with a Disconnect button'
+      btn.style.marginLeft = '4px'
+      btn.onkeypress = btn.onkeydown = function () {
+        return false
+      }
+      btn.onclick = function () {
+        try {
+          var box = document.getElementById('DeskControl')
+          if (box && !box.checked) {
+            box.checked = true
+            if (typeof toggleKvmControl === 'function') toggleKvmControl()
+          }
+          connectDesktop(null, 3, null, CONSENT)
+        } catch (e) {}
+      }
+      span.appendChild(btn)
+      connectSpan.parentNode.insertBefore(span, connectSpan.nextSibling)
+    }
+    var b = document.getElementById('petraAskUserButton')
+    b.disabled = connect.disabled
+    span.style.display = connectSpan.style.display
+  }
+  setInterval(function () {
+    try {
+      ensureButton()
+    } catch (e) {}
+  }, 500)
+})()
+
+// --- links from the IT Network page (?petra=view|control|consent)
+;(function () {
   var m = /[?&]petra=(view|control|consent)(?:&|$)/.exec(window.location.search)
   if (!m) return
   var viewOnly = m[1] === 'view'
