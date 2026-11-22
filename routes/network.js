@@ -8,6 +8,7 @@
 // ingest route has no user session -- it's authenticated by the shared
 // NETWORK_INGEST_TOKEN header instead, and is the only route here that is.
 import crypto from "crypto";
+import fs from "fs/promises";
 import express from "express";
 import { authenticateToken } from "../middleware/auth.js";
 import { requirePermission } from "../middleware/permissions.js";
@@ -422,6 +423,88 @@ router.get("/devices/:key/rdp", requirePermission(PERMISSIONS.IT_REMOTE), async 
     } catch (err) {
         console.error("❌ RDP file failed:", err);
         res.status(500).json({ success: false, message: "Failed to build the RDP file" });
+    }
+});
+
+// GET /devices/:key/mesh -- link that opens this device in MeshCentral
+// ("Petra Remote", LAN/VPN only). MeshCentral's own ?gotodevicename= match is
+// exact and case-sensitive, so the device id is looked up here instead: read
+// MeshCentral's NeDB file on this server and match the Windows name (rname) or
+// display name, ignoring case. Read-only. Audited.
+const MESH_DB_PATH = process.env.MESH_DB_PATH || "C:\\Petra\\meshcentral\\meshcentral-data\\meshcentral.db";
+const MESH_PUBLIC_URL = process.env.MESH_PUBLIC_URL || "https://app.petralu.net:4430/";
+
+async function findMeshNode(names) {
+    const wanted = new Set(names.filter(Boolean).map((n) => String(n).toLowerCase()));
+    if (!wanted.size) return null;
+    const text = await fs.readFile(MESH_DB_PATH, "utf8");
+    const nodes = new Map();
+    for (const line of text.split("\n")) {
+        if (!line.includes('"node/')) continue;
+        let o;
+        try {
+            o = JSON.parse(line);
+        } catch {
+            continue;
+        }
+        if (o.$$deleted) nodes.delete(o._id);
+        else if (o.type === "node" && typeof o._id === "string") nodes.set(o._id, o);
+    }
+    let byName = null;
+    for (const n of nodes.values()) {
+        if (n.rname && wanted.has(String(n.rname).toLowerCase())) return n;
+        if (!byName && n.name && wanted.has(String(n.name).toLowerCase())) byName = n;
+    }
+    return byName;
+}
+
+router.get("/devices/:key/mesh", requirePermission(PERMISSIONS.IT_REMOTE), async (req, res) => {
+    const key = String(req.params.key);
+    if (!DEVICE_KEY_RE.test(key)) return res.status(400).json({ success: false, message: "Bad device key" });
+    try {
+        const devices = await buildDeviceList();
+        const device = devices.find((d) => d.key === key);
+        if (!device) return res.status(404).json({ success: false, message: "Device not found" });
+        const node = await findMeshNode([device.pc?.computerName, device.ad?.name, device.name]);
+        if (!node) {
+            return res.status(404).json({
+                success: false,
+                message: "This PC is not in Petra Remote yet (agent not installed)",
+            });
+        }
+        // node ids look like "node//<base64>" (MeshCentral base64: + -> @, / -> $).
+        // ?gotonode= takes the part after the domain, but MeshCentral's URL
+        // parser drops any value containing "%", so an encoded @/$ is ignored
+        // and the page falls back to My Devices. It also accepts the id as 96
+        // hex chars, which needs no encoding -- send that. viewmode=10 is the
+        // device page; without it the server defaults to 1 (My Devices) and
+        // the page opens the device in that view, i.e. the device list.
+        //
+        // ?mode=view|control opens the Desktop tab (viewmode=11) and adds
+        // petra=<mode>; meshcentral-web/public/scripts/custom.js on the app
+        // server reads it, sets MeshCentral's "Input" checkbox (off = view only,
+        // on = full control) and connects. View only is a viewer setting, not
+        // a permission -- the viewer can still tick Input in the session.
+        const b64 = node._id.split("/").pop().replaceAll("@", "+").replaceAll("$", "/");
+        const id = Buffer.from(b64, "base64").toString("hex");
+        const mode = ["view", "control"].includes(req.query.mode) ? req.query.mode : "page";
+        logAction({
+            entityId: key,
+            entityLabel: node.rname || node.name,
+            action: mode === "page" ? "remote_control_open" : `remote_control_${mode}`,
+            req,
+        });
+        res.json({
+            success: true,
+            name: node.name,
+            url:
+                mode === "page"
+                    ? `${MESH_PUBLIC_URL}?viewmode=10&gotonode=${id}`
+                    : `${MESH_PUBLIC_URL}?viewmode=11&gotonode=${id}&petra=${mode}`,
+        });
+    } catch (err) {
+        console.error("❌ Mesh lookup failed:", err);
+        res.status(500).json({ success: false, message: "Could not reach Petra Remote" });
     }
 });
 
