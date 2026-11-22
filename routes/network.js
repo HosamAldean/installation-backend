@@ -334,6 +334,12 @@ router.get("/overview", async (req, res) => {
                     && d.activation.windows.status !== "activated").length,
                 officeNotActivated: devices.filter((d) => d.activation
                     && ["not_activated", "grace", "partial"].includes(d.activation.office.status)).length,
+                // Phones/tablets holding a DHCP lease now (networkInventory
+                // classifyDevice); "named" = recognised by host name, the rest
+                // are private-MAC devices with no name.
+                phones: devices.filter((d) => (d.category === "phone" || d.category === "tablet") && d.dhcp).length,
+                phonesNamed: devices.filter((d) => (d.category === "phone" || d.category === "tablet")
+                    && d.dhcp && !d.mobile?.guess).length,
             },
         });
     } catch (err) {

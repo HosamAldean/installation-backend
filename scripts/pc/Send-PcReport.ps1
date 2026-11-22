@@ -63,7 +63,7 @@ try {
     $os = Get-CimInstance Win32_OperatingSystem
     $cs = Get-CimInstance Win32_ComputerSystem
     $bios = Get-CimInstance Win32_BIOS
-    $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
+    $cv = try { Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop } catch { $null }
 
     # Licenses with a key installed (filtering on PartialProductKey keeps the
     # query fast). Office 2010 licenses live in OfficeSoftwareProtectionProduct.
@@ -76,9 +76,17 @@ try {
 
     # Installed Office (MSI + Click-to-Run entries), without updates,
     # language packs, proofing tools and helper components.
-    $paths = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
-             'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
-    $office = @(Get-ItemProperty $paths -ErrorAction SilentlyContinue |
+    # Read each uninstall key on its own: one malformed value (e.g. a DWORD
+    # with the wrong size) makes Get-ItemProperty throw "Specified cast is not
+    # valid" as a terminating error, which used to abort the whole report.
+    $roots = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+             'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+    $entries = foreach ($root in $roots) {
+        foreach ($key in @(Get-ChildItem $root -ErrorAction SilentlyContinue)) {
+            try { Get-ItemProperty $key.PSPath -ErrorAction Stop } catch { }
+        }
+    }
+    $office = @($entries |
         Where-Object {
             $_.DisplayName -match '^(Microsoft (Office|365|Visio|Project|Word|Excel|Outlook|PowerPoint|Access|Publisher)\b)' -and
             $_.DisplayName -notmatch '(Update|Language|Proof|MUI|Shared|Click-to-Run|Extensibility|Licensing|Localization|Interop|Primary Interop|Runtime|Tools|Add-in|Components|Viewer|Validation|Web Components|Get Started|Live Meeting|Visual Studio)' -and
@@ -94,7 +102,7 @@ try {
         })
 
     $c2r = $null
-    $cfg = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration' -ErrorAction SilentlyContinue
+    $cfg = try { Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration' -ErrorAction Stop } catch { $null }
     if ($cfg) {
         $c2r = [ordered]@{
             productIds = $cfg.ProductReleaseIds
