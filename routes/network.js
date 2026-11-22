@@ -502,7 +502,8 @@ router.get("/devices/:key/mesh", requirePermission(PERMISSIONS.IT_REMOTE), async
         // a permission -- the viewer can still tick Input in the session.
         const b64 = node._id.split("/").pop().replaceAll("@", "+").replaceAll("$", "/");
         const id = Buffer.from(b64, "base64").toString("hex");
-        const mode = ["view", "control"].includes(req.query.mode) ? req.query.mode : "page";
+        // consent = ask the logged-on user (Allow/Deny prompt + session bar)
+        const mode = ["view", "control", "consent"].includes(req.query.mode) ? req.query.mode : "page";
         logAction({
             entityId: key,
             entityLabel: node.rname || node.name,

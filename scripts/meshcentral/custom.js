@@ -7,13 +7,18 @@
 // The IT Network page links here with
 //   ?viewmode=11&gotonode=<hex id>&petra=view     -> view only, auto-connect
 //   ?viewmode=11&gotonode=<hex id>&petra=control  -> full control, auto-connect
+//   ?viewmode=11&gotonode=<hex id>&petra=consent  -> ask the user first
 // "view" turns MeshCentral's Desktop "Input" checkbox off (mouse/keyboard not
 // sent), "control" turns it on, then the desktop connects once the device page
-// is showing. Without ?petra= this script does nothing.
+// is showing. "consent" connects like MeshCentral's own "Ask Consent + Bar":
+// the logged-on user gets an Allow/Deny prompt (0x0008) and, once allowed, a
+// bar on their screen showing the session with a Disconnect button (0x0040).
+// Without ?petra= this script does nothing.
 (function () {
-  var m = /[?&]petra=(view|control)(?:&|$)/.exec(window.location.search)
+  var m = /[?&]petra=(view|control|consent)(?:&|$)/.exec(window.location.search)
   if (!m) return
   var viewOnly = m[1] === 'view'
+  var askUser = m[1] === 'consent'
 
   // MeshCentral reads this localStorage key when the page starts and again
   // when the desktop connects; we run in <head>, before either.
@@ -37,7 +42,11 @@
         box.checked = !viewOnly
         if (typeof toggleKvmControl === 'function') toggleKvmControl()
       }
-      connectDesktop(null, 1)
+      // contype 3 = pick the logged-on user's session (prompt shows there);
+      // with no user session MeshCentral connects to the console with the
+      // same consent flags, and the agent may refuse (nobody to ask).
+      if (askUser) connectDesktop(null, 3, null, 0x0008 + 0x0040)
+      else connectDesktop(null, 1)
     } catch (e) {
       clearInterval(timer)
     }
