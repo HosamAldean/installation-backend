@@ -14,52 +14,84 @@
 // the logged-on user gets an Allow/Deny prompt (0x0008) and, once allowed, a
 // bar on their screen showing the session with a Disconnect button (0x0040).
 //
-// On every page it also adds an "Ask user" button next to the Desktop tab's
-// Connect button, doing the same consent connect (MeshCentral only offers it
-// in Connect's right-click menu). It mirrors Connect: disabled while the
-// device is offline, hidden while a session is open.
+// On every page it also adds two buttons next to the Desktop tab's Connect
+// button: "View only" (connects with the Input checkbox off) and "Ask user"
+// (the consent connect above; MeshCentral only offers it in Connect's
+// right-click menu). They mirror Connect: disabled while the device is
+// offline, hidden while a session is open. Plain Connect keeps whatever the
+// Input checkbox says.
 
-// --- "Ask user" button beside Connect (Desktop tab)
+// --- "View only" + "Ask user" buttons beside Connect (Desktop tab)
 ;(function () {
   var CONSENT = 0x0008 + 0x0040 // Allow/Deny prompt + session bar
-  function ensureButton() {
+
+  function setInput(on) {
+    var box = document.getElementById('DeskControl')
+    if (box && box.checked !== on) {
+      box.checked = on
+      if (typeof toggleKvmControl === 'function') toggleKvmControl()
+    }
+  }
+
+  var BUTTONS = [
+    {
+      id: 'petraViewOnlyButton',
+      label: 'View only',
+      title: 'Watch the screen: mouse and keyboard are not sent (tick Input to take over)',
+      run: function () {
+        setInput(false)
+        connectDesktop(null, 3)
+      },
+    },
+    {
+      id: 'petraAskUserButton',
+      label: 'Ask user',
+      title:
+        'Connect only after the logged-on user clicks Allow; they see a bar with a Disconnect button',
+      run: function () {
+        setInput(true)
+        connectDesktop(null, 3, null, CONSENT)
+      },
+    },
+  ]
+
+  function ensureButtons() {
     var connect = document.getElementById('connectbutton1')
     var connectSpan = document.getElementById('connectbutton1span')
     if (!connect || !connectSpan) return
-    var span = document.getElementById('petraAskUserSpan')
+    var span = document.getElementById('petraDeskButtons')
     if (!span) {
       span = document.createElement('span')
-      span.id = 'petraAskUserSpan'
-      var btn = document.createElement('input')
-      btn.type = 'button'
-      btn.id = 'petraAskUserButton'
-      btn.value = 'Ask user'
-      btn.title =
-        'Connect only after the logged-on user clicks Allow; they see a bar with a Disconnect button'
-      btn.style.marginLeft = '4px'
-      btn.onkeypress = btn.onkeydown = function () {
-        return false
-      }
-      btn.onclick = function () {
-        try {
-          var box = document.getElementById('DeskControl')
-          if (box && !box.checked) {
-            box.checked = true
-            if (typeof toggleKvmControl === 'function') toggleKvmControl()
-          }
-          connectDesktop(null, 3, null, CONSENT)
-        } catch (e) {}
-      }
-      span.appendChild(btn)
+      span.id = 'petraDeskButtons'
+      BUTTONS.forEach(function (def) {
+        var btn = document.createElement('input')
+        btn.type = 'button'
+        btn.id = def.id
+        btn.value = def.label
+        btn.title = def.title
+        btn.style.marginLeft = '4px'
+        btn.onkeypress = btn.onkeydown = function () {
+          return false
+        }
+        btn.onclick = function () {
+          try {
+            def.run()
+          } catch (e) {}
+        }
+        span.appendChild(btn)
+      })
       connectSpan.parentNode.insertBefore(span, connectSpan.nextSibling)
     }
-    var b = document.getElementById('petraAskUserButton')
-    b.disabled = connect.disabled
+    BUTTONS.forEach(function (def) {
+      var b = document.getElementById(def.id)
+      if (b) b.disabled = connect.disabled
+    })
     span.style.display = connectSpan.style.display
   }
+
   setInterval(function () {
     try {
-      ensureButton()
+      ensureButtons()
     } catch (e) {}
   }, 500)
 })()
