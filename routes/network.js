@@ -476,14 +476,16 @@ router.get("/devices/:key/mesh", requirePermission(PERMISSIONS.IT_REMOTE), async
         // ?gotonode= takes the part after the domain, but MeshCentral's URL
         // parser drops any value containing "%", so an encoded @/$ is ignored
         // and the page falls back to My Devices. It also accepts the id as 96
-        // hex chars, which needs no encoding -- send that.
+        // hex chars, which needs no encoding -- send that. viewmode=10 is the
+        // device page; without it the server defaults to 1 (My Devices) and
+        // the page opens the device in that view, i.e. the device list.
         const b64 = node._id.split("/").pop().replaceAll("@", "+").replaceAll("$", "/");
         const id = Buffer.from(b64, "base64").toString("hex");
         logAction({ entityId: key, entityLabel: node.rname || node.name, action: "remote_control_open", req });
         res.json({
             success: true,
             name: node.name,
-            url: `${MESH_PUBLIC_URL}?gotonode=${id}`,
+            url: `${MESH_PUBLIC_URL}?viewmode=10&gotonode=${id}`,
         });
     } catch (err) {
         console.error("❌ Mesh lookup failed:", err);
