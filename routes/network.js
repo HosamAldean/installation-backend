@@ -479,13 +479,28 @@ router.get("/devices/:key/mesh", requirePermission(PERMISSIONS.IT_REMOTE), async
         // hex chars, which needs no encoding -- send that. viewmode=10 is the
         // device page; without it the server defaults to 1 (My Devices) and
         // the page opens the device in that view, i.e. the device list.
+        //
+        // ?mode=view|control opens the Desktop tab (viewmode=11) and adds
+        // petra=<mode>; meshcentral-web/public/scripts/custom.js on the app
+        // server reads it, sets MeshCentral's "Input" checkbox (off = view only,
+        // on = full control) and connects. View only is a viewer setting, not
+        // a permission -- the viewer can still tick Input in the session.
         const b64 = node._id.split("/").pop().replaceAll("@", "+").replaceAll("$", "/");
         const id = Buffer.from(b64, "base64").toString("hex");
-        logAction({ entityId: key, entityLabel: node.rname || node.name, action: "remote_control_open", req });
+        const mode = ["view", "control"].includes(req.query.mode) ? req.query.mode : "page";
+        logAction({
+            entityId: key,
+            entityLabel: node.rname || node.name,
+            action: mode === "page" ? "remote_control_open" : `remote_control_${mode}`,
+            req,
+        });
         res.json({
             success: true,
             name: node.name,
-            url: `${MESH_PUBLIC_URL}?viewmode=10&gotonode=${id}`,
+            url:
+                mode === "page"
+                    ? `${MESH_PUBLIC_URL}?viewmode=10&gotonode=${id}`
+                    : `${MESH_PUBLIC_URL}?viewmode=11&gotonode=${id}&petra=${mode}`,
         });
     } catch (err) {
         console.error("❌ Mesh lookup failed:", err);
