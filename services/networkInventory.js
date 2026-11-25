@@ -194,7 +194,12 @@ export async function buildDeviceList(snapshots) {
         const free = (r) => (r && !r.ad ? r : null);
         // IP match only for rows that don't name themselves: a phone with its
         // own DHCP host name that now holds a PC's old (DNS) IP is not that PC.
-        const ipRow = c.ipv4 ? byIp.get(c.ipv4) : null;
+        // ...and only for accounts that signed in recently: a computer gone
+        // for years keeps its old DNS record, and that IP now belongs to
+        // another machine (PETRA-PRINTERS, last logon 2021, pointed at
+        // PETRA-EXCHANGE's IP).
+        const fresh = Boolean(c.lastLogon) && Date.now() - Date.parse(c.lastLogon) < STALE_AD_DAYS * 86400000;
+        const ipRow = c.ipv4 && fresh ? byIp.get(c.ipv4) : null;
         const ipMatch = ipRow && !ipRow.dhcp?.hostName && !ipRow.reservation?.name ? ipRow : null;
         const ownKey = c.domain === 'PETRALU' ? `ad:${s.toUpperCase()}` : `ad:${c.domain}\\${s.toUpperCase()}`;
         const row = free(byName.get(s)) || free(ipMatch) || get(ownKey);
@@ -213,7 +218,7 @@ export async function buildDeviceList(snapshots) {
         };
         row.name = c.name;
         row.os = c.os || row.os;
-        row.ip = row.ip || c.ipv4 || null;
+        row.ip = row.ip || (fresh ? c.ipv4 : null) || null;
         row.windows = true;
     }
 
@@ -727,4 +732,18 @@ export function win11Readiness(p) {
     else if (w.secureBoot === false) fix.push('secure_boot_off');
     const status = hard.length ? 'no' : cpu.ok === null ? 'unknown' : fix.length ? 'fixable' : 'ready';
     return { status, hard, fix, cpuGen: cpu.gen };
+}
+
+// AD computer accounts that have not signed in for this long are treated as
+// gone: their DNS IP is not trusted for matching (see the AD merge above).
+export const STALE_AD_DAYS = 90;
+
+// In use lately: reported by itself or signed in to AD in the last 60 days,
+// or seen on the network while not tied to an old AD account. A device that
+// only "answers" because an old AD account's name still resolves is not.
+export function isActiveDevice(d, days = 60) {
+    const since = Date.now() - days * 86400000;
+    if (d.pc?.reportedAt && Date.parse(d.pc.reportedAt) > since) return true;
+    if (d.ad?.lastLogon && Date.parse(d.ad.lastLogon) > since) return true;
+    return Boolean(d.online && !d.ad);
 }

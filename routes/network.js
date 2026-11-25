@@ -19,7 +19,7 @@ import { merakiConfigured } from "../services/merakiClient.js";
 import {
     HOST_RE, checkHost, refreshMerakiNow, saveSnapshot, pushAlert,
 } from "../services/networkMonitor.js";
-import { buildDeviceList, loadSnapshots, normalizeMac, summarizeHealth } from "../services/networkInventory.js";
+import { buildDeviceList, loadSnapshots, normalizeMac, summarizeHealth, isActiveDevice } from "../services/networkInventory.js";
 
 const router = express.Router();
 
@@ -464,8 +464,9 @@ router.get("/overview", async (req, res) => {
                 win11Fixable: devices.filter((d) => d.win11?.status === "fixable").length,
                 win11No: devices.filter((d) => d.win11?.status === "no").length,
                 win11Unknown: devices.filter((d) => d.win11?.status === "unknown").length,
-                osUnsupported: devices.filter((d) => d.osSupported === false && (d.online
-                    || (d.ad?.lastLogon && Date.parse(d.ad.lastLogon) > Date.now() - 60 * 86400000))).length,
+                // (isActiveDevice: not an old AD account whose name still
+                // resolves to another machine's IP)
+                osUnsupported: devices.filter((d) => d.osSupported === false && isActiveDevice(d)).length,
                 // Phones/tablets holding a DHCP lease now (networkInventory
                 // classifyDevice); "named" = recognised by host name, the rest
                 // are private-MAC devices with no name.
