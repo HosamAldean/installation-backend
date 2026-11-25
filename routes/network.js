@@ -439,6 +439,10 @@ router.get("/overview", async (req, res) => {
                 avProblems: devices.filter((d) => d.health?.av && d.health.av.status !== "ok").length,
                 healthProblems: devices.filter((d) => d.health?.issues.length).length,
                 healthCritical: devices.filter((d) => d.health?.critical).length,
+                // Windows without security updates (Win 10, 7, 8.1, old Win 11 / Server),
+                // online now or logged on to AD in the last 60 days
+                osUnsupported: devices.filter((d) => d.osSupported === false && (d.online
+                    || (d.ad?.lastLogon && Date.parse(d.ad.lastLogon) > Date.now() - 60 * 86400000))).length,
                 // Phones/tablets holding a DHCP lease now (networkInventory
                 // classifyDevice); "named" = recognised by host name, the rest
                 // are private-MAC devices with no name.

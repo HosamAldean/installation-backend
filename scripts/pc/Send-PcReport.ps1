@@ -256,7 +256,7 @@ try {
             # Windows itself (monthly cumulative / preview / rollup), not drivers or .NET
             $cu = @($ok | Where-Object {
                 ($_.Title -match '^\d{4}-\d{2} .*(Cumulative|Preview|Security) .*Update|Monthly Quality Rollup|Feature update') -and
-                $_.Title -notmatch '\.NET'
+                $_.Title -notmatch '\.NET|Preparation Package|Servicing Stack'
             }) | Select-Object -First 1
             $since = (Get-Date).ToUniversalTime().AddDays(-30)
             $updates = [ordered]@{

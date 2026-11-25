@@ -291,6 +291,10 @@ export async function buildDeviceList(snapshots) {
         }
         if (!row.windows && row.os && /windows/i.test(row.os)) row.windows = true;
         row.site = row.site || siteOf(row);
+        // Windows still getting security updates? (PC report first, else AD)
+        row.osSupported = row.pc?.os?.caption
+            ? osSupported(row.pc.os.caption, row.pc.os.build || row.pc.os.version)
+            : row.ad ? osSupported(row.ad.os, row.ad.osVersion) : null;
         classifyDevice(row, pcNames);
     }
 
@@ -531,6 +535,27 @@ export const HEALTH_LIMITS = {
 // Issues worth a push alert / red on the page; the rest are orange.
 export const CRITICAL_ISSUES = ['av_off', 'av_none', 'av_outdated', 'pool_high', 'low_disk'];
 
+// Does Microsoft still ship security updates for this Windows (no paid
+// ESU)? Kept simple on purpose -- revisit when a version's end date passes.
+//   Windows 11 Home/Pro: 25H2 (build 26200) and newer; 24H2 ended Oct 2026
+//   Windows 11 Enterprise/Education: 24H2 (26100) and newer
+//   Windows 10: ended 14 Oct 2025, except LTSC/LTSB editions
+//   Windows 7 / 8 / 8.1 / XP / Vista, Server 2003 / 2008 / 2012: ended
+export function osSupported(caption, versionOrBuild) {
+    const cap = String(caption ?? '');
+    if (!/windows/i.test(cap)) return null;
+    const m = String(versionOrBuild ?? '').match(/(?:10\.0[.\s(]+)?(\d{4,5})/);
+    const build = m ? Number(m[1]) : null;
+    if (/Server/i.test(cap)) return !/Server (2003|2008|2012)/i.test(cap);
+    if (/Windows (XP|Vista|7|8)\b/i.test(cap)) return false;
+    if (/Windows 10/i.test(cap)) return /LTS[BC]/i.test(cap);
+    if (/Windows 11/i.test(cap)) {
+        if (!build) return null;
+        return build >= (/Enterprise|Education/i.test(cap) ? 26100 : 26200);
+    }
+    return null;
+}
+
 const daysBetween = (from, to) => {
     const a = Date.parse(from);
     const b = Date.parse(to);
@@ -611,8 +636,12 @@ export function summarizeHealth(p, reportedAt) {
         if (commitPct !== null && commitPct >= L.commitPct) issues.push('memory_high');
         if (runningDays !== null && runningDays > L.runningDays) issues.push('uptime_long');
         if (h.rebootPending) issues.push('reboot_pending');
+        // ESU *licensing preparation* packages are not security updates
+        // (older reports counted them).
+        if (/Preparation Package/i.test(h.updates?.lastCumulativeName ?? '')) windowsUpdateDays = null;
         if (h.updates && (windowsUpdateDays === null || windowsUpdateDays > L.windowsUpdateDays)) issues.push('updates_old');
     }
+    if (osSupported(p.os?.caption, p.os?.build || p.os?.version) === false) issues.push('os_unsupported');
 
     const hw = p.hardware ?? {};
     if ((hw.volumes ?? []).some((v) => v.sizeGb && v.freeGb !== null && v.freeGb !== undefined
