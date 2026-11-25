@@ -175,7 +175,14 @@ export async function buildDeviceList(snapshots) {
         }
         if (row.ip && !byIp.has(row.ip)) byIp.set(row.ip, row);
     }
-    const computers = snaps.ad?.data?.computers ?? [];
+    // One AD snapshot per domain: 'ad' = petralu.local (DC3), 'ad_<NETBIOS>'
+    // = other domains, e.g. 'ad_PETRATH' from PETRATH-DC01 (2026-11-25).
+    const computers = [];
+    for (const [source, snap] of Object.entries(snaps)) {
+        if (source !== 'ad' && !source.startsWith('ad_')) continue;
+        const domain = String(snap.data?.domain || (source === 'ad' ? 'PETRALU' : source.slice(3))).toUpperCase();
+        for (const c of snap.data?.computers ?? []) computers.push({ ...c, domain });
+    }
     for (const c of computers) {
         const s = shortName(c.name);
         if (!s) continue;
@@ -188,10 +195,12 @@ export async function buildDeviceList(snapshots) {
         // own DHCP host name that now holds a PC's old (DNS) IP is not that PC.
         const ipRow = c.ipv4 ? byIp.get(c.ipv4) : null;
         const ipMatch = ipRow && !ipRow.dhcp?.hostName && !ipRow.reservation?.name ? ipRow : null;
-        const row = free(byName.get(s)) || free(ipMatch) || get(`ad:${s.toUpperCase()}`);
+        const ownKey = c.domain === 'PETRALU' ? `ad:${s.toUpperCase()}` : `ad:${c.domain}\\${s.toUpperCase()}`;
+        const row = free(byName.get(s)) || free(ipMatch) || get(ownKey);
         if (!row.sources.includes('ad')) row.sources.push('ad');
         row.ad = {
             name: c.name,
+            domain: c.domain,
             dnsHostName: c.dnsHostName ?? null,
             os: c.os ?? null,
             osVersion: c.osVersion ?? null,
@@ -279,6 +288,7 @@ export async function buildDeviceList(snapshots) {
             row.notes = n.notes;
         }
         if (!row.windows && row.os && /windows/i.test(row.os)) row.windows = true;
+        row.site = row.site || siteOf(row);
         classifyDevice(row, pcNames);
     }
 
@@ -322,6 +332,41 @@ const PHONE_BRANDS = [
 export function isPrivateMac(mac) {
     const hex = String(mac ?? '').replace(/[^0-9a-f]/gi, '');
     return hex.length === 12 && /^.[26ae]/i.test(hex);
+}
+
+// Site = which network the device is on, from its IP; a device with no IP
+// (AD-only, never seen) falls back to its AD domain. NETWORK_SITES overrides
+// the map: "192.168.20.0/24=PETRALU,192.168.10.0/24=PetraTH".
+const DOMAIN_SITES = { PETRALU: 'PETRALU', PETRATH: 'PetraTH' };
+let siteRanges = null;
+function parseSites() {
+    const spec = process.env.NETWORK_SITES || '192.168.20.0/24=PETRALU,192.168.10.0/24=PetraTH';
+    return spec.split(',').map((part) => {
+        const [cidr, name] = part.split('=').map((x) => x?.trim());
+        const [base, bits] = (cidr || '').split('/');
+        const n = ipToInt(base);
+        const b = Number(bits);
+        if (n === null || !(b >= 0 && b <= 32) || !name) return null;
+        const mask = b === 0 ? 0 : (~0 << (32 - b)) >>> 0;
+        return { net: (n & mask) >>> 0, mask, name };
+    }).filter(Boolean);
+}
+function ipToInt(ip) {
+    const m = String(ip ?? '').match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+    if (!m) return null;
+    const p = m.slice(1).map(Number);
+    if (p.some((x) => x > 255)) return null;
+    return ((p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]) >>> 0;
+}
+export function siteOf(row) {
+    siteRanges ??= parseSites();
+    const n = ipToInt(row.ip);
+    if (n !== null) {
+        const hit = siteRanges.find((r) => ((n & r.mask) >>> 0) === r.net);
+        if (hit) return hit.name;
+    }
+    const d = row.ad?.domain;
+    return d ? DOMAIN_SITES[d] || d : null;
 }
 
 function hostOf(row) {
