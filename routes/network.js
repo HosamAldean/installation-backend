@@ -60,7 +60,7 @@ router.post("/ingest", async (req, res) => {
         return res.status(401).json({ success: false, message: "Bad token" });
     }
     try {
-        const { dhcp, ad, logons, backup, hygiene } = req.body ?? {};
+        const { dhcp, ad, logons, backup, hygiene, softwareShare } = req.body ?? {};
         const saved = [];
         if (dhcp && typeof dhcp === "object") {
             await saveSnapshot("dhcp", {
@@ -156,6 +156,26 @@ router.post("/ingest", async (req, res) => {
                 })),
             });
             saved.push("backup");
+        }
+        // Installers in the IT software share (PETRA-FILES Software$, F:\Software),
+        // from scripts/software/Send-SoftwareShare.ps1, for the Software Library page.
+        if (softwareShare && typeof softwareShare === "object") {
+            await saveSnapshot("software_share", {
+                server: s(softwareShare.server, 64),
+                root: s(softwareShare.root, 255),
+                files: list(softwareShare.files).filter((f) => f?.path).slice(0, 2000).map((f) => ({
+                    path: s(f.path, 500),
+                    name: s(f.name, 255),
+                    folder: s(f.folder, 400),
+                    sizeMb: Number(f.sizeMb) || 0,
+                    modified: s(f.modified, 40),
+                    sha256: /^[0-9a-f]{64}$/i.test(String(f.sha256 ?? "")) ? String(f.sha256).toLowerCase() : null,
+                    version: s(f.version, 60),
+                    product: s(f.product, 200),
+                    company: s(f.company, 150),
+                })),
+            });
+            saved.push("software_share");
         }
         // AD + DNS hygiene from each DC (Send-NetworkInventory.ps1 -Parts hygiene).
         if (hygiene && typeof hygiene === "object") {

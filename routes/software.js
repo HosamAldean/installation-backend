@@ -10,6 +10,32 @@ import { PERMISSIONS } from "../constants/permissions.js";
 import { SoftwareLibraryItem, SOFTWARE_CATEGORIES } from "../models/SoftwareLibrary.js";
 import { ItLicense } from "../models/ItLicense.js";
 import { groupInstalled, loadInstalled, matchLibraryItem } from "../services/softwareInventory.js";
+import { NetworkSnapshot } from "../models/Network.js";
+
+// Installers found in the IT software share by its hourly scanner.
+async function loadShare() {
+    const row = await NetworkSnapshot.findByPk("software_share");
+    let data = null;
+    try { data = row?.data ? JSON.parse(row.data) : null; } catch { data = null; }
+    return { root: data?.root ?? null, files: data?.files ?? [], scannedAt: row?.fetchedAt ?? null };
+}
+
+// Library item vs the share: is the installer still there, unchanged?
+function installerState(item, share) {
+    if (!item.installerPath) return null;
+    const f = share.files.find((x) => x.path.toLowerCase() === item.installerPath.toLowerCase());
+    if (!f) {
+        const onShare = share.root && item.installerPath.toLowerCase().startsWith(share.root.toLowerCase());
+        return { found: false, onShare: Boolean(onShare) };
+    }
+    return {
+        found: true,
+        onShare: true,
+        sizeMb: f.sizeMb,
+        fileVersion: f.version,
+        hashMatches: item.sha256 ? item.sha256 === f.sha256 : null,
+    };
+}
 
 const router = express.Router();
 router.use(authenticateToken, requirePermission(PERMISSIONS.IT_SOFTWARE));
@@ -52,10 +78,11 @@ function parseBody(body, partial) {
 // to pick from (so this page doesn't need it.licenses).
 router.get("/library", async (req, res) => {
     try {
-        const [items, licenses, inv] = await Promise.all([
+        const [items, licenses, inv, share] = await Promise.all([
             SoftwareLibraryItem.findAll({ order: [["name", "ASC"]], raw: true }),
             ItLicense.findAll({ attributes: ["id", "productName", "seats", "expiryDate", "status"], order: [["productName", "ASC"]], raw: true }),
             loadInstalled(),
+            loadShare(),
         ]);
         const byId = new Map(licenses.map((l) => [l.id, l]));
         res.json({
@@ -64,8 +91,10 @@ router.get("/library", async (req, res) => {
             licenses,
             machinesWithSoftware: inv.machines.length,
             machinesReporting: inv.reporting,
+            share,
             items: items.map((it) => ({
                 ...it,
+                installer: installerState(it, share),
                 license: it.licenseId ? byId.get(it.licenseId) ?? null : null,
                 ...matchLibraryItem(it, inv.machines, byId.get(it.licenseId)),
             })),
