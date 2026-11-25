@@ -76,7 +76,7 @@ async function getAlertUserIds() {
     return users.map((u) => u.userId);
 }
 
-async function pushAlert(title, body) {
+export async function pushAlert(title, body) {
     try {
         const userIds = await getAlertUserIds();
         await Promise.all(userIds.map((userId) =>

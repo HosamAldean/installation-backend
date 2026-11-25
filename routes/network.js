@@ -13,13 +13,13 @@ import express from "express";
 import { authenticateToken } from "../middleware/auth.js";
 import { requirePermission } from "../middleware/permissions.js";
 import { PERMISSIONS } from "../constants/permissions.js";
-import { NetworkMonitorTarget, NetworkDeviceNote, NETWORK_TARGET_KINDS } from "../models/Network.js";
+import { NetworkMonitorTarget, NetworkDeviceNote, NetworkSnapshot, NETWORK_TARGET_KINDS } from "../models/Network.js";
 import { AdminActionAudit } from "../models/AdminActionAudit.js";
 import { merakiConfigured } from "../services/merakiClient.js";
 import {
-    HOST_RE, checkHost, refreshMerakiNow, saveSnapshot,
+    HOST_RE, checkHost, refreshMerakiNow, saveSnapshot, pushAlert,
 } from "../services/networkMonitor.js";
-import { buildDeviceList, loadSnapshots, normalizeMac } from "../services/networkInventory.js";
+import { buildDeviceList, loadSnapshots, normalizeMac, summarizeHealth } from "../services/networkInventory.js";
 
 const router = express.Router();
 
@@ -164,6 +164,92 @@ function licenseList(v) {
     }));
 }
 
+const bool = (v) => (typeof v === "boolean" ? v : null);
+
+function securityReport(v) {
+    if (!v || typeof v !== "object") return null;
+    const t = v.trend;
+    const d = v.defender;
+    return {
+        products: asArray(v.products).slice(0, 10).map((p) => ({
+            name: s(p?.name, 100),
+            state: num(p?.state),
+            enabled: bool(p?.enabled),
+            upToDate: bool(p?.upToDate),
+        })),
+        defender: d && typeof d === "object" ? {
+            mode: s(d.mode, 40),
+            serviceEnabled: bool(d.serviceEnabled),
+            antivirusEnabled: bool(d.antivirusEnabled),
+            realTime: bool(d.realTime),
+            signatureUpdated: s(d.signatureUpdated, 40),
+            quickScan: s(d.quickScan, 40),
+        } : null,
+        trend: t && typeof t === "object" ? {
+            product: s(t.product, 100),
+            version: s(t.version, 40),
+            lastUpdate: s(t.lastUpdate, 40),
+            patternTooOld: bool(t.patternTooOld),
+            lastScheduledScan: s(t.lastScheduledScan, 40),
+            lastInfection: s(t.lastInfection, 40),
+            services: asArray(t.services).slice(0, 10).map((x) => ({
+                name: s(x?.name, 40),
+                state: s(x?.state, 20),
+                startMode: s(x?.startMode, 20),
+            })),
+        } : null,
+    };
+}
+
+function healthReport(v) {
+    if (!v || typeof v !== "object") return null;
+    const u = v.updates;
+    return {
+        lastStart: s(v.lastStart, 40),
+        fastStartup: bool(v.fastStartup),
+        poolNonPagedMb: num(v.poolNonPagedMb),
+        poolPagedMb: num(v.poolPagedMb),
+        commitGb: num(v.commitGb),
+        commitLimitGb: num(v.commitLimitGb),
+        topProcesses: asArray(v.topProcesses).slice(0, 5).map((p) => ({ name: s(p?.name, 80), mb: num(p?.mb) })),
+        rebootPending: bool(v.rebootPending),
+        updates: u && typeof u === "object" ? {
+            lastInstalled: s(u.lastInstalled, 40),
+            lastTitle: s(u.lastTitle, 200),
+            lastCumulative: s(u.lastCumulative, 40),
+            lastCumulativeName: s(u.lastCumulativeName, 200),
+            failed30d: num(u.failed30d),
+        } : null,
+    };
+}
+
+// Push alert (same recipients as the network alerts) when a PC's report
+// turns an antivirus or kernel-memory problem on or off. Only between two
+// reports that both carry the new fields, so rolling the script out does
+// not send one alert per PC.
+const ALERT_ISSUES = {
+    av_off: "antivirus is OFF",
+    av_none: "no antivirus",
+    av_outdated: "antivirus not updated",
+    pool_high: "kernel memory leak (non-paged pool high)",
+};
+
+function alertHealthChange(name, prevData, prevAt, nextData) {
+    if (!prevData?.security || !nextData.security) return;
+    const before = new Set(summarizeHealth(prevData, prevAt)?.issues ?? []);
+    const after = summarizeHealth(nextData, new Date().toISOString());
+    const now = new Set(after?.issues ?? []);
+    const raised = Object.keys(ALERT_ISSUES).filter((k) => now.has(k) && !before.has(k));
+    const cleared = Object.keys(ALERT_ISSUES).filter((k) => before.has(k) && !now.has(k));
+    if (raised.length) {
+        const extra = raised.includes("pool_high") ? ` (${nextData.health?.poolNonPagedMb} MB)` : "";
+        pushAlert("🔴 PC problem", `${name}: ${raised.map((k) => ALERT_ISSUES[k]).join(", ")}${extra}.`);
+    }
+    if (cleared.length) {
+        pushAlert("🟢 PC OK again", `${name}: ${cleared.map((k) => ALERT_ISSUES[k]).join(", ")} -- fixed.`);
+    }
+}
+
 router.post("/report", async (req, res) => {
     if (!process.env.NETWORK_REPORT_TOKEN) {
         return res.status(503).json({ success: false, message: "PC reports are not configured" });
@@ -176,7 +262,10 @@ router.post("/report", async (req, res) => {
     if (!PC_NAME_RE.test(name)) return res.status(400).json({ success: false, message: "Bad computerName" });
     try {
         const key = `pc:${name.toUpperCase()}`.slice(0, 40);
-        await saveSnapshot(key, {
+        const prev = await NetworkSnapshot.findByPk(key);
+        let prevData = null;
+        try { prevData = prev?.data ? JSON.parse(prev.data) : null; } catch { prevData = null; }
+        const data = {
             computerName: name.toUpperCase(),
             fromIp: (req.ip || "").replace(/^::ffff:/, ""),
             user: s(b.user, 150),
@@ -232,7 +321,12 @@ router.post("/report", async (req, res) => {
             nics: asArray(b.nics).slice(0, 10)
                 .map((n) => ({ mac: normalizeMac(n?.mac), ip: s(n?.ip, 45) }))
                 .filter((n) => n.mac),
-        });
+            security: securityReport(b.security),
+            health: healthReport(b.health),
+        };
+        await saveSnapshot(key, data);
+        alertHealthChange(name.toUpperCase(), prevData,
+            prev?.fetchedAt ? new Date(prev.fetchedAt).toISOString() : null, data);
         res.json({ success: true });
     } catch (err) {
         console.error("❌ PC report failed:", err);
@@ -340,6 +434,11 @@ router.get("/overview", async (req, res) => {
                     && d.activation.windows.status !== "activated").length,
                 officeNotActivated: devices.filter((d) => d.activation
                     && ["not_activated", "grace", "partial"].includes(d.activation.office.status)).length,
+                // From the 2026-11-25 report fields (antivirus + health)
+                avReported: devices.filter((d) => d.health?.av).length,
+                avProblems: devices.filter((d) => d.health?.av && d.health.av.status !== "ok").length,
+                healthProblems: devices.filter((d) => d.health?.issues.length).length,
+                healthCritical: devices.filter((d) => d.health?.critical).length,
                 // Phones/tablets holding a DHCP lease now (networkInventory
                 // classifyDevice); "named" = recognised by host name, the rest
                 // are private-MAC devices with no name.

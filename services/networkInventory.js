@@ -73,6 +73,7 @@ function emptyRow(key) {
         scan: null, // { alive, rttMs, pingBlocked, name } from the LAN scan
         pc: null, // the PC's own report (activation, Office, user, hardware)
         activation: null, // summarizeActivation(pc)
+        health: null, // summarizeHealth(pc): antivirus + PC health issues
         lastLogon: null, // { user, domain, time, dc } from DC Kerberos events
         label: null,
         owner: null,
@@ -238,6 +239,7 @@ export async function buildDeviceList(snapshots) {
         if (!row.sources.includes('pc')) row.sources.push('pc');
         row.pc = { ...p, reportedAt: snap.fetchedAt ? new Date(snap.fetchedAt).toISOString() : null };
         row.activation = summarizeActivation(p);
+        row.health = summarizeHealth(p, row.pc.reportedAt);
         row.name = row.name || p.computerName;
         row.windows = true;
     }
@@ -510,4 +512,120 @@ export function summarizeActivation(p) {
 function ipSortKey(ip) {
     if (!ip || !/^\d+\.\d+\.\d+\.\d+$/.test(ip)) return Number.MAX_SAFE_INTEGER;
     return ip.split('.').reduce((acc, part) => acc * 256 + Number(part), 0);
+}
+
+// ---------------------------------------------------------------------------
+// PC health + antivirus (from the PC's own report, Send-PcReport.ps1)
+// ---------------------------------------------------------------------------
+
+export const HEALTH_LIMITS = {
+    avUpdateDays: 3, // Trend's own "pattern too old" warning is 7 days
+    lowDiskPct: 10,
+    lowMemoryPct: 10,
+    poolNonPagedMb: 800, // normal is 100-400 MB; SALES-25's leak reached 1,647 MB
+    commitPct: 90,
+    runningDays: 14,
+    windowsUpdateDays: 45,
+};
+
+// Issues worth a push alert / red on the page; the rest are orange.
+export const CRITICAL_ISSUES = ['av_off', 'av_none', 'av_outdated', 'pool_high', 'low_disk'];
+
+const daysBetween = (from, to) => {
+    const a = Date.parse(from);
+    const b = Date.parse(to);
+    return Number.isFinite(a) && Number.isFinite(b) ? (b - a) / 86400000 : null;
+};
+const round1 = (v) => (v === null || v === undefined ? null : Math.round(v * 10) / 10);
+
+function summarizeAntivirus(sec, ref) {
+    const L = HEALTH_LIMITS;
+    const products = sec.products ?? [];
+    const trend = sec.trend;
+    const def = sec.defender;
+    let status = 'none';
+    let product = null;
+    let lastUpdate = null;
+    let stoppedServices = [];
+    if (trend) {
+        product = trend.product || 'Trend Micro';
+        lastUpdate = trend.lastUpdate;
+        const realTime = (trend.services ?? []).find((x) => String(x.name).toLowerCase() === 'ntrtscan');
+        const center = products.find((x) => /trend/i.test(x.name ?? ''));
+        const age = lastUpdate ? daysBetween(lastUpdate, ref) : null;
+        if (!realTime || realTime.state !== 'Running' || (center && !center.enabled)) status = 'off';
+        else if (trend.patternTooOld || (age !== null && age > L.avUpdateDays) || (age === null && center && !center.upToDate)) status = 'outdated';
+        else status = 'ok';
+        stoppedServices = (trend.services ?? [])
+            .filter((x) => x.startMode === 'Auto' && x.state !== 'Running')
+            .map((x) => x.name);
+    } else if (def && (def.serviceEnabled || def.antivirusEnabled)) {
+        product = 'Microsoft Defender';
+        lastUpdate = def.signatureUpdated;
+        const age = lastUpdate ? daysBetween(lastUpdate, ref) : null;
+        if (!def.antivirusEnabled || !def.realTime) status = 'off';
+        else if (age !== null && age > L.avUpdateDays) status = 'outdated';
+        else status = 'ok';
+    } else if (products.length) {
+        const on = products.find((x) => x.enabled);
+        product = (on ?? products[0]).name;
+        status = !on ? 'off' : on.upToDate ? 'ok' : 'outdated';
+    }
+    return {
+        status, // ok | off | outdated | none
+        product,
+        version: trend?.version ?? null,
+        lastUpdate,
+        lastScan: trend?.lastScheduledScan ?? def?.quickScan ?? null,
+        lastInfection: trend?.lastInfection ?? null,
+        stoppedServices,
+        others: products
+            .filter((x) => x.name && x.name !== product && !(trend && /trend/i.test(x.name)))
+            .map((x) => ({ name: x.name, enabled: x.enabled })),
+    };
+}
+
+// -> { av, runningDays, commitPct, windowsUpdateDays, issues[], critical }
+// Ages are measured at report time, so a PC that was switched off for a
+// week does not show as "not updated" until it reports again.
+export function summarizeHealth(p, reportedAt) {
+    if (!p) return null;
+    const L = HEALTH_LIMITS;
+    const ref = reportedAt || new Date().toISOString();
+    const issues = [];
+    const av = p.security ? summarizeAntivirus(p.security, ref) : null;
+    if (av) {
+        if (av.status !== 'ok') issues.push(`av_${av.status}`);
+        if (av.stoppedServices.length) issues.push('av_service_stopped');
+    }
+
+    const h = p.health;
+    let runningDays = null;
+    let commitPct = null;
+    let windowsUpdateDays = null;
+    if (h) {
+        runningDays = round1(daysBetween(h.lastStart || p.os?.lastBoot, ref));
+        commitPct = h.commitGb && h.commitLimitGb ? Math.round((h.commitGb / h.commitLimitGb) * 100) : null;
+        windowsUpdateDays = h.updates?.lastCumulative ? Math.floor(daysBetween(h.updates.lastCumulative, ref)) : null;
+        if (h.poolNonPagedMb >= L.poolNonPagedMb) issues.push('pool_high');
+        if (commitPct !== null && commitPct >= L.commitPct) issues.push('memory_high');
+        if (runningDays !== null && runningDays > L.runningDays) issues.push('uptime_long');
+        if (h.rebootPending) issues.push('reboot_pending');
+        if (h.updates && (windowsUpdateDays === null || windowsUpdateDays > L.windowsUpdateDays)) issues.push('updates_old');
+    }
+
+    const hw = p.hardware ?? {};
+    if ((hw.volumes ?? []).some((v) => v.sizeGb && v.freeGb !== null && v.freeGb !== undefined
+        && (v.freeGb / v.sizeGb) * 100 < L.lowDiskPct)) issues.push('low_disk');
+    if (hw.ramGb && hw.ramFreeGb !== null && hw.ramFreeGb !== undefined
+        && (hw.ramFreeGb / hw.ramGb) * 100 < L.lowMemoryPct && !issues.includes('memory_high')) issues.push('memory_high');
+
+    return {
+        av,
+        runningDays,
+        commitPct,
+        windowsUpdateDays,
+        issues,
+        critical: issues.some((i) => CRITICAL_ISSUES.includes(i)),
+    };
 }

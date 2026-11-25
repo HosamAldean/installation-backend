@@ -10,6 +10,10 @@
   Office products (Uninstall registry + Click-to-Run config), NICs (MAC/IP),
   make/model/serial, CPU (model/cores/load), RAM (total/free), drives
   (size/free) and physical disks (SSD/HDD, health).
+  Since 2026-11-25 also: antivirus (Security Center, Defender, Trend Micro
+  agent services + update status) and health (real running time with Fast
+  Startup, kernel memory pool, commit, top processes, pending restart,
+  Windows Update history).
 
   READ-ONLY on the PC: CIM queries and registry reads. It changes nothing --
   it does not activate, install or remove anything.
@@ -153,6 +157,118 @@ try {
             }
         })
 
+    # --- Antivirus (read-only). Security Center lists what Windows thinks
+    # protects the PC (workstations only -- Windows Server has no
+    # SecurityCenter2). productState: bits 12-15 = 1 on, bits 4-7 = 0 up to date.
+    $avProducts = @()
+    try {
+        $avProducts = @(Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction Stop |
+            ForEach-Object {
+                $st = [int]$_.productState
+                [ordered]@{
+                    name     = $_.displayName
+                    state    = $st
+                    enabled  = ((($st -shr 12) -band 0xF) -eq 1)
+                    upToDate = ((($st -shr 4) -band 0xF) -eq 0)
+                }
+            })
+    } catch { }
+
+    # Defender: throws when its service is stopped (Trend installed) -- fine.
+    $defender = $null
+    try {
+        $mp = Get-MpComputerStatus -ErrorAction Stop
+        $defender = [ordered]@{
+            mode             = "$($mp.AMRunningMode)"
+            serviceEnabled   = [bool]$mp.AMServiceEnabled
+            antivirusEnabled = [bool]$mp.AntivirusEnabled
+            realTime         = [bool]$mp.RealTimeProtectionEnabled
+            signatureUpdated = Iso $mp.AntivirusSignatureLastUpdated
+            quickScan        = Iso $mp.QuickScanEndTime
+        }
+    } catch { }
+
+    # Trend Micro Worry-Free / Apex One agent: services + its own registry
+    # status. Values are read one by one (see the uninstall-key note above).
+    function FromUnix($v) {
+        if ($v -and [double]$v -gt 0) { (Get-Date '1970-01-01T00:00:00Z').ToUniversalTime().AddSeconds([double]$v).ToString('o') } else { $null }
+    }
+    function ParseLocal($v, $formats) {
+        if (-not $v) { return $null }
+        foreach ($f in $formats) {
+            try { return Iso ([datetime]::ParseExact("$v", $f, [Globalization.CultureInfo]::InvariantCulture)) } catch { }
+        }
+        return $null
+    }
+    $trend = $null
+    $trendSvc = @(Get-CimInstance Win32_Service -Filter "Name='ntrtscan' OR Name='tmlisten' OR Name='TMBMServer' OR Name='TmCCSF' OR Name='PccNTUpd' OR Name='TmPfw'" |
+        ForEach-Object { [ordered]@{ name = $_.Name; state = "$($_.State)"; startMode = "$($_.StartMode)" } })
+    $tk = $null
+    foreach ($p in 'HKLM:\SOFTWARE\WOW6432Node\TrendMicro\PC-cillinNTCorp\CurrentVersion\Misc.',
+                   'HKLM:\SOFTWARE\TrendMicro\PC-cillinNTCorp\CurrentVersion\Misc.') {
+        if (-not $tk) { $tk = try { Get-Item -LiteralPath $p -ErrorAction Stop } catch { $null } }
+    }
+    if ($tk -or $trendSvc.Count) {
+        $tv = { param($n) try { $tk.GetValue($n) } catch { $null } }
+        $trend = [ordered]@{
+            product           = if ($tk) { & $tv 'ProductName' } else { $null }
+            version           = if ($tk) { "$(& $tv 'TmListen_Ver')" } else { $null }
+            lastUpdate        = if ($tk) { FromUnix (& $tv 'LastUpdateTime') } else { $null }
+            patternTooOld     = if ($tk) { [int](& $tv 'PatternTooOld') -eq 1 } else { $null }
+            lastScheduledScan = if ($tk) { ParseLocal (& $tv 'VirusScheduleScanDateTime') @('yyyy/MM/dd HH:mm:ss') } else { $null }
+            lastInfection     = if ($tk) { ParseLocal (& $tv 'LastInfectedSpywareDateTime') @('M/d/yyyy H:mm:ss', 'yyyy/MM/dd HH:mm:ss') } else { $null }
+            services          = @($trendSvc)
+        }
+    }
+
+    # --- PC health (read-only)
+    # Fast Startup keeps LastBootUpTime from the last full boot, so the real
+    # "running since" is the newest Kernel-General 12 (logged on every start).
+    $lastStart = $null
+    try {
+        $ev = Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-General'; Id = 12 } -MaxEvents 1 -ErrorAction Stop
+        $lastStart = Iso $ev.TimeCreated
+    } catch { }
+    $fastStartup = $null
+    try { $fastStartup = [int](Get-Item 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power' -ErrorAction Stop).GetValue('HiberbootEnabled') -eq 1 } catch { }
+
+    $memPerf = try { Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory -ErrorAction Stop } catch { $null }
+    $topProcs = @(Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First 5 |
+        ForEach-Object { [ordered]@{ name = $_.ProcessName; mb = [int]($_.WorkingSet64 / 1MB) } })
+
+    $rebootPending = (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') -or
+                     (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending')
+
+    # Windows Update history (installed OK = Operation 1, ResultCode 2;
+    # failed = ResultCode 4). Antivirus definition updates are left out.
+    $updates = $null
+    try {
+        $searcher = (New-Object -ComObject Microsoft.Update.Session).CreateUpdateSearcher()
+        $count = $searcher.GetTotalHistoryCount()
+        if ($count -gt 0) {
+            $hist = @($searcher.QueryHistory(0, [math]::Min($count, 150)) |
+                Where-Object {
+                    $_.Operation -eq 1 -and
+                    $_.Title -notmatch 'Definition|Security Intelligence|Defender Antivirus|Malicious Software Removal' -and
+                    $_.Title -notmatch '^[0-9A-Z]{12}-'   # Microsoft Store app updates
+                })
+            $ok = @($hist | Where-Object { $_.ResultCode -eq 2 } | Sort-Object Date -Descending)
+            # Windows itself (monthly cumulative / preview / rollup), not drivers or .NET
+            $cu = @($ok | Where-Object {
+                ($_.Title -match '^\d{4}-\d{2} .*(Cumulative|Preview|Security) .*Update|Monthly Quality Rollup|Feature update') -and
+                $_.Title -notmatch '\.NET'
+            }) | Select-Object -First 1
+            $since = (Get-Date).ToUniversalTime().AddDays(-30)
+            $updates = [ordered]@{
+                lastInstalled      = if ($ok.Count) { Iso ([datetime]::SpecifyKind($ok[0].Date, 'Utc')) } else { $null }
+                lastTitle          = if ($ok.Count) { $ok[0].Title } else { $null }
+                lastCumulative     = if ($cu) { Iso ([datetime]::SpecifyKind($cu.Date, 'Utc')) } else { $null }
+                lastCumulativeName = if ($cu) { $cu.Title } else { $null }
+                failed30d          = @($hist | Where-Object { $_.ResultCode -eq 4 -and $_.Date -gt $since }).Count
+            }
+        }
+    } catch { }
+
     $body = [ordered]@{
         computerName    = $env:COMPUTERNAME
         user            = $cs.UserName
@@ -179,6 +295,22 @@ try {
         officeProducts  = @($office)
         clickToRun      = $c2r
         nics            = @($nics)
+        security        = [ordered]@{
+            products = @($avProducts)
+            defender = $defender
+            trend    = $trend
+        }
+        health          = [ordered]@{
+            lastStart      = $lastStart
+            fastStartup    = $fastStartup
+            poolNonPagedMb = if ($memPerf) { [int]($memPerf.PoolNonpagedBytes / 1MB) } else { $null }
+            poolPagedMb    = if ($memPerf) { [int]($memPerf.PoolPagedBytes / 1MB) } else { $null }
+            commitGb       = if ($memPerf) { [math]::Round($memPerf.CommittedBytes / 1GB, 1) } else { $null }
+            commitLimitGb  = if ($memPerf) { [math]::Round($memPerf.CommitLimit / 1GB, 1) } else { $null }
+            topProcesses   = @($topProcs)
+            rebootPending  = [bool]$rebootPending
+            updates        = $updates
+        }
     }
     $json = $body | ConvertTo-Json -Depth 6 -Compress
 
