@@ -176,12 +176,12 @@ try {
                 ForEach-Object { $_.IPAddressToString }) + @($_.IPv4Address) | Where-Object { $_ -and $_ -notlike '169.254.*' } | Select-Object -Unique
             [ordered]@{ name = $_.Name; ip = $_.IPv4Address; ips = @($ips) }
         })
-        $staleComps = @($comps | Where-Object $isStale)
-        $staleUsers = @($users | Where-Object $isStale)
-        $oldPwUsers = @($users | Where-Object { $_.pwdLastSet -gt 0 -and [datetime]::FromFileTime($_.pwdLastSet) -lt $oldPw })
         $comps = @(Get-ADComputer -Filter 'Enabled -eq $true' -Properties LastLogonTimestamp, OperatingSystem, whenCreated, pwdLastSet)
         $users = @(Get-ADUser -Filter 'Enabled -eq $true' -Properties LastLogonTimestamp, pwdLastSet, PasswordNeverExpires, whenCreated, DisplayName |
             Where-Object { $_.SamAccountName -notmatch '^(krbtgt|HealthMailbox|SM_|\$)' })
+        $staleComps = @($comps | Where-Object $isStale)
+        $staleUsers = @($users | Where-Object $isStale)
+        $oldPwUsers = @($users | Where-Object { $_.pwdLastSet -gt 0 -and [datetime]::FromFileTime($_.pwdLastSet) -lt $oldPw })
 
         $admins = @()
         foreach ($g in 'Domain Admins', 'Enterprise Admins', 'Schema Admins', 'Administrators') {
