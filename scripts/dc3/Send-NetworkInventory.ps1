@@ -14,6 +14,13 @@
                                                       sees the logons it served)
   PETRA-DC3: -Parts dhcp,ad,logons     PETRA-DC2: -Parts logons
   PETRATH-DC01 (PetraTH.local, Thuhaiba, static IPs / no DHCP): -Parts ad,logons
+    hygiene AD + DNS hygiene for the IT Servers & Backups page, sent once an
+            hour (first run after :00; -HygieneNow sends it straight away):
+            stale accounts, pre-2012 passwords, admin groups, A records on
+            the domain name, zone update/aging settings
+                                                     (DC3 + PETRATH-DC01)
+  Since 2026-11-25: PETRA-DC3 -Parts dhcp,ad,logons,hygiene;
+  PETRATH-DC01 -Parts ad,logons,hygiene
 
   READ-ONLY on the DC: Get-DhcpServerv4*, Get-ADComputer, Get-WinEvent.
   Nothing on the DC or in AD is changed.
@@ -34,7 +41,8 @@ param(
     [string[]]$Parts = @('dhcp', 'ad', 'logons'),
     [string]$ApiUrl = 'https://app.petralu.net/api/network/ingest',
     [string]$TokenFile = (Join-Path $PSScriptRoot 'ingest-token.txt'),
-    [string]$LogFile = (Join-Path $PSScriptRoot 'last-run.log')
+    [string]$LogFile = (Join-Path $PSScriptRoot 'last-run.log'),
+    [switch]$HygieneNow
 )
 
 $ErrorActionPreference = 'Stop'
@@ -136,6 +144,86 @@ try {
         }
         $body.logons = [ordered]@{ dc = $env:COMPUTERNAME; items = @($latest.Values) }
         $summary += "logons=$($latest.Count)"
+    }
+
+    # --- AD + DNS hygiene, once an hour (the task runs every 10 min):
+    # stale enabled accounts, passwords older than 2012 (RC4-only keys),
+    # admin group members, junk A records on the domain name itself, zone
+    # update/aging settings. Read-only, like the rest of this script.
+    if ($Parts -contains 'hygiene' -and ($HygieneNow -or (Get-Date).Minute -lt 10)) {
+        Import-Module ActiveDirectory
+        Import-Module DnsServer
+        $dom = Get-ADDomain
+        $cut = (Get-Date).AddDays(-90)
+        $oldPw = [datetime]'2012-01-01'
+        function LastLogon($o) { if ($o.LastLogonTimestamp) { [datetime]::FromFileTime($o.LastLogonTimestamp) } else { $null } }
+        function Person($o) {
+            [ordered]@{
+                name       = $o.SamAccountName -replace '\$$', ''
+                display    = $o.DisplayName
+                os         = $o.OperatingSystem
+                lastLogon  = Iso (LastLogon $o)
+                pwdLastSet = if ($o.pwdLastSet -gt 0) { Iso ([datetime]::FromFileTime($o.pwdLastSet)) } else { $null }
+                created    = Iso $o.whenCreated
+            }
+        }
+        $isStale = { $_.whenCreated -lt $cut -and (-not (LastLogon $_) -or (LastLogon $_) -lt $cut) }
+
+        # Every real IPv4 of each DC (not just the one AD picks -- that can be
+        # a 169.254 address from an unconfigured second port).
+        $dcs = @(Get-ADDomainController -Filter * | ForEach-Object {
+            $ips = @([System.Net.Dns]::GetHostAddresses($_.HostName) | Where-Object { $_.AddressFamily -eq 'InterNetwork' } |
+                ForEach-Object { $_.IPAddressToString }) + @($_.IPv4Address) | Where-Object { $_ -and $_ -notlike '169.254.*' } | Select-Object -Unique
+            [ordered]@{ name = $_.Name; ip = $_.IPv4Address; ips = @($ips) }
+        })
+        $staleComps = @($comps | Where-Object $isStale)
+        $staleUsers = @($users | Where-Object $isStale)
+        $oldPwUsers = @($users | Where-Object { $_.pwdLastSet -gt 0 -and [datetime]::FromFileTime($_.pwdLastSet) -lt $oldPw })
+        $comps = @(Get-ADComputer -Filter 'Enabled -eq $true' -Properties LastLogonTimestamp, OperatingSystem, whenCreated, pwdLastSet)
+        $users = @(Get-ADUser -Filter 'Enabled -eq $true' -Properties LastLogonTimestamp, pwdLastSet, PasswordNeverExpires, whenCreated, DisplayName |
+            Where-Object { $_.SamAccountName -notmatch '^(krbtgt|HealthMailbox|SM_|\$)' })
+
+        $admins = @()
+        foreach ($g in 'Domain Admins', 'Enterprise Admins', 'Schema Admins', 'Administrators') {
+            try {
+                $m = @(Get-ADGroupMember -Identity $g -Recursive | Where-Object { $_.objectClass -eq 'user' } | ForEach-Object { $_.SamAccountName })
+                $admins += [ordered]@{ group = $g; members = $m }
+            } catch { } # Enterprise/Schema Admins only exist in the forest root
+        }
+
+        $zone = $dom.DNSRoot
+        $apex = @(Get-DnsServerResourceRecord -ZoneName $zone -Name '@' -RRType A | ForEach-Object {
+            [ordered]@{ ip = $_.RecordData.IPv4Address.IPAddressToString; static = -not $_.Timestamp; stamp = Iso $_.Timestamp }
+        })
+
+        $body.hygiene = [ordered]@{
+            domain    = $dom.NetBIOSName
+            dc        = $env:COMPUTERNAME
+            dcs       = $dcs
+            computers = [ordered]@{
+                enabled      = $comps.Count
+                staleCount   = $staleComps.Count
+                staleEnabled = @($staleComps | Sort-Object LastLogonTimestamp | Select-Object -First 300 | ForEach-Object { Person $_ })
+            }
+            users     = [ordered]@{
+                enabled         = $users.Count
+                pwdNeverExpires = @($users | Where-Object { $_.PasswordNeverExpires }).Count
+                neverLoggedOn   = @($users | Where-Object { -not $_.LastLogonTimestamp -and $_.whenCreated -lt (Get-Date).AddDays(-30) }).Count
+                staleCount      = $staleUsers.Count
+                oldPwCount      = $oldPwUsers.Count
+                staleEnabled    = @($staleUsers | Sort-Object LastLogonTimestamp | Select-Object -First 300 | ForEach-Object { Person $_ })
+                oldPasswords    = @($oldPwUsers | Sort-Object pwdLastSet | Select-Object -First 300 | ForEach-Object { Person $_ })
+            }
+            admins    = $admins
+            dns       = [ordered]@{
+                zone          = $zone
+                dynamicUpdate = "$((Get-DnsServerZone -Name $zone).DynamicUpdate)"
+                aging         = [bool](Get-DnsServerZoneAging -Name $zone).AgingEnabled
+                scavenging    = [bool](Get-DnsServerScavenging).ScavengingState
+                apex          = $apex
+            }
+        }
+        $summary += "hygiene=$($dom.NetBIOSName) apex=$($apex.Count)"
     }
 
     $json = $body | ConvertTo-Json -Depth 6 -Compress

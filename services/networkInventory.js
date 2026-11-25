@@ -529,6 +529,7 @@ function ipSortKey(ip) {
 // ---------------------------------------------------------------------------
 
 export const HEALTH_LIMITS = {
+    avPatternDays: 7, // Trend pattern file older than this = out of date
     avUpdateDays: 3, // Trend's own "pattern too old" warning is 7 days
     lowDiskPct: 10,
     lowMemoryPct: 10,
@@ -580,12 +581,14 @@ function summarizeAntivirus(sec, ref) {
     let stoppedServices = [];
     if (trend) {
         product = trend.product || 'Trend Micro';
-        lastUpdate = trend.lastUpdate;
+        // The newest pattern file is the truth; LastUpdateTime is only the
+        // last attempt (reports from before 2026-11-25 have no patternDate).
+        lastUpdate = trend.patternDate || trend.lastUpdate;
         const realTime = (trend.services ?? []).find((x) => String(x.name).toLowerCase() === 'ntrtscan');
         const center = products.find((x) => /trend/i.test(x.name ?? ''));
         const age = lastUpdate ? daysBetween(lastUpdate, ref) : null;
         if (!realTime || realTime.state !== 'Running' || (center && !center.enabled)) status = 'off';
-        else if (trend.patternTooOld || (age !== null && age > L.avUpdateDays) || (age === null && center && !center.upToDate)) status = 'outdated';
+        else if (trend.patternTooOld || (age !== null && age > (trend.patternDate ? L.avPatternDays : L.avUpdateDays)) || (age === null && center && !center.upToDate)) status = 'outdated';
         else status = 'ok';
         stoppedServices = (trend.services ?? [])
             .filter((x) => x.startMode === 'Auto' && x.state !== 'Running')

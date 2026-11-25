@@ -14,6 +14,9 @@
   agent services + update status) and health (real running time with Fast
   Startup, kernel memory pool, commit, top processes, pending restart,
   Windows Update history).
+  On servers (ProductType 2/3) also: PowerShell version, the server's own UTC
+  clock (the app compares it with the time the report arrives) and automatic
+  services that are not running -- for the IT Servers & Backups page.
 
   READ-ONLY on the PC: CIM queries and registry reads. It changes nothing --
   it does not activate, install or remove anything.
@@ -210,11 +213,23 @@ try {
     }
     if ($tk -or $trendSvc.Count) {
         $tv = { param($n) try { $tk.GetValue($n) } catch { $null } }
+        # LastUpdateTime is only the last update *attempt*. What the agent
+        # really has is the date of its newest pattern file (Smart Scan
+        # icrc$oth.*, conventional lpt$vpn.*) -- on 2026-11-25 these were
+        # stuck at 2025-12-29 while LastUpdateTime said "today".
+        $patternDate = $null
+        try {
+            $appPath = (Get-Item -LiteralPath (Split-Path $tk.PSPath -Parent)).GetValue('Application Path')
+            $newest = Get-ChildItem -LiteralPath $appPath -File -ErrorAction Stop |
+                Where-Object { $_.Name -match '^(icrc\$oth|lpt\$vpn)\.\d+$' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($newest) { $patternDate = Iso $newest.LastWriteTime }
+        } catch { }
         $trend = [ordered]@{
             product           = if ($tk) { & $tv 'ProductName' } else { $null }
             version           = if ($tk) { "$(& $tv 'TmListen_Ver')" } else { $null }
             lastUpdate        = if ($tk) { FromUnix (& $tv 'LastUpdateTime') } else { $null }
-            patternTooOld     = if ($tk) { [int](& $tv 'PatternTooOld') -eq 1 } else { $null }
+            patternTooOld     = if ($tk) { [int](& $tv 'PatternTooOld') -eq 1 -or [int](& $tv 'PatternTooOldSmartScan') -eq 1 } else { $null }
+            patternDate       = $patternDate
             lastScheduledScan = if ($tk) { ParseLocal (& $tv 'VirusScheduleScanDateTime') @('yyyy/MM/dd HH:mm:ss') } else { $null }
             lastInfection     = if ($tk) { ParseLocal (& $tv 'LastInfectedSpywareDateTime') @('M/d/yyyy H:mm:ss', 'yyyy/MM/dd HH:mm:ss') } else { $null }
             services          = @($trendSvc)
@@ -297,6 +312,21 @@ try {
         }
     } catch { }
 
+    # Servers only: clock, PowerShell version, stopped automatic services.
+    # Services that are Automatic but normally stop on their own are skipped.
+    $server = $null
+    if ($os.ProductType -ne 1) {
+        $quiet = '^(gupdate|gupdatem|sppsvc|RemoteRegistry|TrustedInstaller|clr_optimization.*|MapsBroker|edgeupdate|MicrosoftEdgeElevationService|tiledatamodelsvc|CDPSvc|ShellHWDetection|WbioSrvc|DoSvc|BITS|UsoSvc|sedsvc|WaaSMedicSvc|wuauserv|IntelAudioService|GoogleUpdater.*|AdobeARMservice|stisvc|SysMain|dmwappushservice|OneSyncSvc.*|CDPUserSvc.*|WpnUserService.*|NetTcpPortSharing|ehRecvr|ehSched|FontCache3.0.0.0|tapisrv|wlidsvc|KeyIso|swprv|VSS|MSDTC|RemoteAccess|PccNTUpd|TmCCSF|TmWSCSvc|Sense|WinDefend|MsMpSvc)$'
+        $stopped = @(Get-CimInstance Win32_Service -Filter "StartMode = 'Auto' AND State <> 'Running'" |
+            Where-Object { $_.Name -notmatch $quiet -and -not $_.DelayedAutoStart } |
+            Select-Object -First 30 | ForEach-Object { [ordered]@{ name = $_.Name; displayName = $_.DisplayName } })
+        $server = [ordered]@{
+            psVersion       = $PSVersionTable.PSVersion.ToString()
+            clientTimeUtc   = $null # set just before sending
+            stoppedServices = $stopped
+        }
+    }
+
     $body = [ordered]@{
         computerName    = $env:COMPUTERNAME
         user            = $cs.UserName
@@ -340,7 +370,9 @@ try {
             updates        = $updates
         }
         win11           = $win11
+        server          = $server
     }
+    if ($server) { $server.clientTimeUtc = (Get-Date).ToUniversalTime().ToString('o') }
     $json = $body | ConvertTo-Json -Depth 6 -Compress
 
     if ($DryRun) { $body | ConvertTo-Json -Depth 6; return }

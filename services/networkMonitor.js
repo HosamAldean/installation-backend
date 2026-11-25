@@ -76,11 +76,11 @@ async function getAlertUserIds() {
     return users.map((u) => u.userId);
 }
 
-export async function pushAlert(title, body) {
+export async function pushAlert(title, body, url = '/admin/it-network') {
     try {
         const userIds = await getAlertUserIds();
         await Promise.all(userIds.map((userId) =>
-            sendPushToUser(userId, { title, body, data: { type: 'it_network', url: '/admin/it-network' } })));
+            sendPushToUser(userId, { title, body, data: { type: 'it_network', url } })));
     } catch (err) {
         console.error('❌ Network alert push failed:', err);
     }

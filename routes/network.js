@@ -20,6 +20,7 @@ import {
     HOST_RE, checkHost, refreshMerakiNow, saveSnapshot, pushAlert,
 } from "../services/networkMonitor.js";
 import { buildDeviceList, loadSnapshots, normalizeMac, summarizeHealth, isActiveDevice } from "../services/networkInventory.js";
+import { buildOps, refreshCerts } from "../services/itOps.js";
 
 const router = express.Router();
 
@@ -59,7 +60,7 @@ router.post("/ingest", async (req, res) => {
         return res.status(401).json({ success: false, message: "Bad token" });
     }
     try {
-        const { dhcp, ad, logons } = req.body ?? {};
+        const { dhcp, ad, logons, backup, hygiene } = req.body ?? {};
         const saved = [];
         if (dhcp && typeof dhcp === "object") {
             await saveSnapshot("dhcp", {
@@ -130,6 +131,80 @@ router.post("/ingest", async (req, res) => {
             });
             saved.push(`logons_${dc}`);
         }
+        // Veeam jobs + repositories from the backup host
+        // (scripts/veeam/Send-VeeamStatus.ps1), for the IT ops page.
+        if (backup && typeof backup === "object") {
+            const iso = (v) => s(v, 40);
+            await saveSnapshot("backup", {
+                server: s(backup.server, 100),
+                version: s(backup.version, 40),
+                jobs: list(backup.jobs).filter((j) => j?.name).slice(0, 200).map((j) => ({
+                    name: s(j.name, 150),
+                    type: s(j.type, 60),
+                    enabled: j.enabled !== false,
+                    lastResult: s(j.lastResult, 30),
+                    sizeGb: Number.isFinite(Number(j.sizeGb)) ? Number(j.sizeGb) : null,
+                    sessions: list(j.sessions).slice(0, 15).map((x) => ({
+                        start: iso(x.start), end: iso(x.end), result: s(x.result, 30),
+                    })),
+                })),
+                repositories: list(backup.repositories).slice(0, 50).map((r) => ({
+                    name: s(r.name, 150),
+                    path: s(r.path, 255),
+                    totalGb: Number(r.totalGb) || 0,
+                    freeGb: Number(r.freeGb) || 0,
+                })),
+            });
+            saved.push("backup");
+        }
+        // AD + DNS hygiene from each DC (Send-NetworkInventory.ps1 -Parts hygiene).
+        if (hygiene && typeof hygiene === "object") {
+            const domain = String(hygiene.domain ?? "").toUpperCase().replace(/[^A-Z0-9-]/g, "").slice(0, 20);
+            if (!domain) return res.status(400).json({ success: false, message: "hygiene.domain is required" });
+            const people = (v) => list(v).slice(0, 300).map((u) => ({
+                name: s(u.name, 100),
+                display: s(u.display, 150),
+                lastLogon: s(u.lastLogon, 40),
+                pwdLastSet: s(u.pwdLastSet, 40),
+                created: s(u.created, 40),
+                os: s(u.os, 100),
+            }));
+            await saveSnapshot(`hygiene_${domain}`, {
+                domain,
+                dc: s(hygiene.dc, 50),
+                dcs: list(hygiene.dcs).slice(0, 20).map((d) => ({
+                    name: s(d.name, 64), ip: s(d.ip, 45), ips: list(d.ips).slice(0, 10).map((x) => s(x, 45)),
+                })),
+                computers: {
+                    enabled: Number(hygiene.computers?.enabled) || 0,
+                    staleCount: Number(hygiene.computers?.staleCount) || 0,
+                    staleEnabled: people(hygiene.computers?.staleEnabled),
+                },
+                users: {
+                    enabled: Number(hygiene.users?.enabled) || 0,
+                    staleCount: Number(hygiene.users?.staleCount) || 0,
+                    oldPwCount: Number(hygiene.users?.oldPwCount) || 0,
+                    pwdNeverExpires: Number(hygiene.users?.pwdNeverExpires) || 0,
+                    neverLoggedOn: Number(hygiene.users?.neverLoggedOn) || 0,
+                    staleEnabled: people(hygiene.users?.staleEnabled),
+                    oldPasswords: people(hygiene.users?.oldPasswords),
+                },
+                admins: list(hygiene.admins).slice(0, 10).map((g) => ({
+                    group: s(g.group, 100),
+                    members: list(g.members).slice(0, 100).map((m) => s(m, 100)),
+                })),
+                dns: hygiene.dns ? {
+                    zone: s(hygiene.dns.zone, 100),
+                    dynamicUpdate: s(hygiene.dns.dynamicUpdate, 40),
+                    aging: Boolean(hygiene.dns.aging),
+                    scavenging: Boolean(hygiene.dns.scavenging),
+                    apex: list(hygiene.dns.apex).slice(0, 1000).map((a) => ({
+                        ip: s(a.ip, 45), stamp: s(a.stamp, 40), static: Boolean(a.static),
+                    })),
+                } : null,
+            });
+            saved.push(`hygiene_${domain}`);
+        }
         res.json({ success: true, saved });
     } catch (err) {
         console.error("❌ Network ingest failed:", err);
@@ -190,6 +265,7 @@ function securityReport(v) {
             version: s(t.version, 40),
             lastUpdate: s(t.lastUpdate, 40),
             patternTooOld: bool(t.patternTooOld),
+            patternDate: s(t.patternDate, 40),
             lastScheduledScan: s(t.lastScheduledScan, 40),
             lastInfection: s(t.lastInfection, 40),
             services: asArray(t.services).slice(0, 10).map((x) => ({
@@ -341,6 +417,14 @@ router.post("/report", async (req, res) => {
             security: securityReport(b.security),
             health: healthReport(b.health),
             win11: win11Report(b.win11),
+            // Servers only (ProductType 2/3): clock + stopped auto services.
+            server: b.server && typeof b.server === "object" ? {
+                psVersion: s(b.server.psVersion, 20),
+                clientTimeUtc: s(b.server.clientTimeUtc, 40),
+                stoppedServices: asArray(b.server.stoppedServices).slice(0, 30).map((x) => ({
+                    name: s(x?.name, 100), displayName: s(x?.displayName, 150),
+                })),
+            } : null,
         };
         await saveSnapshot(key, data);
         alertHealthChange(name.toUpperCase(), prevData,
@@ -478,6 +562,26 @@ router.get("/overview", async (req, res) => {
     } catch (err) {
         console.error("❌ Network overview failed:", err);
         res.status(500).json({ success: false, message: "Failed to load the network overview" });
+    }
+});
+
+// IT ops page (admin/it-ops): servers, backups, AD/DNS hygiene, expiries.
+router.get("/ops", async (req, res) => {
+    try {
+        res.json({ success: true, ...(await buildOps()) });
+    } catch (err) {
+        console.error("❌ IT ops load failed:", err);
+        res.status(500).json({ success: false, message: "Failed to load IT operations" });
+    }
+});
+
+router.post("/ops/certs/refresh", async (req, res) => {
+    try {
+        const items = await refreshCerts();
+        res.json({ success: true, items });
+    } catch (err) {
+        console.error("❌ Certificate check failed:", err);
+        res.status(500).json({ success: false, message: "Certificate check failed" });
     }
 });
 
