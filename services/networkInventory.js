@@ -681,6 +681,8 @@ export function cpuWin11Support(name) {
     }
     if (/Core [3579] \d{3}/i.test(n)) return { ok: true, gen: 'Core' };
     if (/Core ?2|Pentium Dual|Pentium 4|Pentium D\b|Celeron D\b|Atom/i.test(n)) return { ok: false, gen: null };
+    // Pentium G850 / Celeron G530 (3 digits) are 2011-2012 parts
+    if (/(Pentium|Celeron).*\bG\d{3}\b/i.test(n)) return { ok: false, gen: null };
     m = n.match(/Pentium.*\bG(\d{4})/i);
     if (m) return { ok: Number(m[1]) >= 5400, gen: null };
     m = n.match(/Celeron.*\bG(\d{4})/i);
