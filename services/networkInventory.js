@@ -242,7 +242,14 @@ export async function buildDeviceList(snapshots) {
             row = mac ? rows.get(mac) : get(`ad:${String(p.computerName).toUpperCase()}`);
         }
         if (!row.sources.includes('pc')) row.sources.push('pc');
-        row.pc = { ...p, reportedAt: snap.fetchedAt ? new Date(snap.fetchedAt).toISOString() : null };
+        // The software list is served by routes/software.js -- kept out of
+        // the device list so /devices stays small.
+        const { software, ...pcRest } = p;
+        row.pc = {
+            ...pcRest,
+            softwareCount: Array.isArray(software) ? software.length : null,
+            reportedAt: snap.fetchedAt ? new Date(snap.fetchedAt).toISOString() : null,
+        };
         row.activation = summarizeActivation(p);
         row.health = summarizeHealth(p, row.pc.reportedAt);
         row.win11 = win11Readiness(p);

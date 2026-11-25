@@ -417,6 +417,16 @@ router.post("/report", async (req, res) => {
             security: securityReport(b.security),
             health: healthReport(b.health),
             win11: win11Report(b.win11),
+            // Installed programs (machine-wide), for the software page.
+            software: asArray(b.software).slice(0, 800)
+                .map((x) => ({
+                    name: s(x?.name, 200),
+                    version: s(x?.version, 60),
+                    publisher: s(x?.publisher, 150),
+                    installDate: s(x?.installDate, 20),
+                    arch: s(x?.arch, 5),
+                }))
+                .filter((x) => x.name),
             // Servers only (ProductType 2/3): clock + stopped auto services.
             server: b.server && typeof b.server === "object" ? {
                 psVersion: s(b.server.psVersion, 20),

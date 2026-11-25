@@ -17,6 +17,8 @@
   On servers (ProductType 2/3) also: PowerShell version, the server's own UTC
   clock (the app compares it with the time the report arrives) and automatic
   services that are not running -- for the IT Servers & Backups page.
+  Also installed programs (machine-wide Uninstall entries) for the IT
+  software page.
 
   READ-ONLY on the PC: CIM queries and registry reads. It changes nothing --
   it does not activate, install or remove anything.
@@ -312,6 +314,34 @@ try {
         }
     } catch { }
 
+    # Installed programs, machine-wide (both Uninstall views), for the IT
+    # software page. Hidden system components and updates are skipped;
+    # per-user installs (HKCU) are not visible to SYSTEM and not sent.
+    $software = @()
+    try {
+        $seenSw = @{}
+        foreach ($root in @(
+                @{ path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'; arch = if ([Environment]::Is64BitOperatingSystem) { 'x64' } else { 'x86' } },
+                @{ path = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'; arch = 'x86' })) {
+            foreach ($k in @(Get-ChildItem -LiteralPath $root.path -ErrorAction SilentlyContinue)) {
+                $dn = $k.GetValue('DisplayName')
+                if (-not $dn) { continue }
+                if ($k.GetValue('SystemComponent') -eq 1 -or $k.GetValue('ParentKeyName') -or "$($k.GetValue('ReleaseType'))" -match 'Update|Hotfix') { continue }
+                $ver = "$($k.GetValue('DisplayVersion'))"
+                $id = "$dn|$ver"
+                if ($seenSw.ContainsKey($id)) { continue }
+                $seenSw[$id] = $true
+                $software += [ordered]@{
+                    name        = "$dn".Trim()
+                    version     = $ver
+                    publisher   = "$($k.GetValue('Publisher'))"
+                    installDate = "$($k.GetValue('InstallDate'))"
+                    arch        = $root.arch
+                }
+            }
+        }
+    } catch { }
+
     # Servers only: clock, PowerShell version, stopped automatic services.
     # Services that are Automatic but normally stop on their own are skipped.
     $server = $null
@@ -371,6 +401,7 @@ try {
         }
         win11           = $win11
         server          = $server
+        software        = @($software)
     }
     if ($server) { $server.clientTimeUtc = (Get-Date).ToUniversalTime().ToString('o') }
     $json = $body | ConvertTo-Json -Depth 6 -Compress

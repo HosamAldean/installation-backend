@@ -195,6 +195,9 @@ export const PERMISSIONS = Object.freeze({
     // Network page (routes/network.js, 2026-11-21): Meraki clients/devices,
     // WAN/VPN, DHCP + AD inventory, ping monitor and its down/up pushes.
     IT_NETWORK: 'it.network',
+    // Software library + installed-software inventory (routes/software.js,
+    // 2026-11-25). Phase 1 is read-only towards PCs.
+    IT_SOFTWARE: 'it.software',
     // Remote control from the network page (today: the .rdp download, later
     // MeshCentral). Separate on purpose -- seeing the device list must not
     // imply being able to connect to the devices.
@@ -418,6 +421,7 @@ export const PERMISSION_GROUPS = [
         items: [
             { key: PERMISSIONS.IT_LICENSES, labelKey: 'itLicenses' },
             { key: PERMISSIONS.IT_NETWORK, labelKey: 'itNetwork' },
+            { key: PERMISSIONS.IT_SOFTWARE, labelKey: 'itSoftware' },
             { key: PERMISSIONS.IT_REMOTE, labelKey: 'itRemote' },
         ],
     },
