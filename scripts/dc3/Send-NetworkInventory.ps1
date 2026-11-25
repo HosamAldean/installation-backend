@@ -13,6 +13,7 @@
             (Security 4768) in the last 24 h          (every DC: each DC only
                                                       sees the logons it served)
   PETRA-DC3: -Parts dhcp,ad,logons     PETRA-DC2: -Parts logons
+  PETRATH-DC01 (PetraTH.local, Thuhaiba, static IPs / no DHCP): -Parts ad,logons
 
   READ-ONLY on the DC: Get-DhcpServerv4*, Get-ADComputer, Get-WinEvent.
   Nothing on the DC or in AD is changed.
@@ -108,7 +109,9 @@ try {
                 ipv4        = $c.IPv4Address
             }
         }
-        $body.ad = [ordered]@{ computers = $computers }
+        # NetBIOS domain name: the server keeps one AD list per domain
+        # ('ad' = PETRALU, 'ad_PETRATH' from PETRATH-DC01).
+        $body.ad = [ordered]@{ domain = (Get-ADDomain).NetBIOSName; computers = $computers }
         $summary += "computers=$($computers.Count)"
     }
 

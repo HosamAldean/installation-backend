@@ -93,7 +93,13 @@ router.post("/ingest", async (req, res) => {
             saved.push("dhcp");
         }
         if (ad && typeof ad === "object") {
-            await saveSnapshot("ad", {
+            // One snapshot per domain: petralu.local keeps 'ad'; another
+            // domain (PETRATH-DC01 sends domain "PETRATH") gets 'ad_PETRATH'
+            // so it doesn't overwrite petralu's list.
+            const domain = String(ad.domain ?? "").toUpperCase().replace(/[^A-Z0-9-]/g, "").slice(0, 20);
+            const adKey = !domain || domain === "PETRALU" ? "ad" : `ad_${domain}`;
+            await saveSnapshot(adKey, {
+                domain: domain || "PETRALU",
                 computers: list(ad.computers).filter((x) => x?.name).map((x) => ({
                     name: s(x.name, 64),
                     dnsHostName: s(x.dnsHostName, 255),
@@ -106,7 +112,7 @@ router.post("/ingest", async (req, res) => {
                     ipv4: s(x.ipv4, 45),
                 })),
             });
-            saved.push("ad");
+            saved.push(adKey);
         }
         // Last domain user per IP, one snapshot per DC (each DC only sees
         // the logons it served) -- merged by services/networkInventory.js.
@@ -305,7 +311,7 @@ router.get("/overview", async (req, res) => {
             ingestConfigured: Boolean(process.env.NETWORK_INGEST_TOKEN),
             sources: Object.fromEntries(
                 ["lan_scan", "meraki_devices", "meraki_clients", "meraki_uplinks", "meraki_vpn", "dhcp", "ad",
-                    ...Object.keys(snaps).filter((k) => k.startsWith("logons_")).sort()]
+                    ...Object.keys(snaps).filter((k) => k.startsWith("ad_") || k.startsWith("logons_")).sort()]
                     .map((k) => [k, sourceInfo(snaps[k])]),
             ),
             merakiDevices,
