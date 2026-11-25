@@ -221,6 +221,34 @@ try {
         }
     }
 
+    # --- Windows 11 readiness (read-only): TPM, firmware, Secure Boot, CPU.
+    # The verdict (CPU generation etc.) is worked out on the server.
+    $tpm = $null
+    try {
+        $t = Get-CimInstance -Namespace root/cimv2/Security/MicrosoftTpm -ClassName Win32_Tpm -ErrorAction Stop | Select-Object -First 1
+        if ($t) {
+            $tpm = [ordered]@{
+                specVersion = $t.SpecVersion            # "2.0, 0, 1.38" or "1.2, 2, 3"
+                enabled     = [bool]$t.IsEnabled_InitialValue
+                activated   = [bool]$t.IsActivated_InitialValue
+            }
+        }
+    } catch { }
+    $secureBoot = $null
+    try { $secureBoot = [bool](Confirm-SecureBootUEFI -ErrorAction Stop) } catch {
+        try { $secureBoot = [int](Get-Item 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State' -ErrorAction Stop).GetValue('UEFISecureBootEnabled') -eq 1 } catch { }
+    }
+    $cpu0 = $cpus | Select-Object -First 1
+    $win11 = [ordered]@{
+        firmware   = $env:firmware_type                 # UEFI / Legacy
+        secureBoot = $secureBoot
+        tpmPresent = [bool]$tpm
+        tpm        = $tpm
+        arch       = $os.OSArchitecture
+        cpuMaker   = $cpu0.Manufacturer
+        cpuCaption = $cpu0.Caption                      # Intel64 Family 6 Model 158 ...
+    }
+
     # --- PC health (read-only)
     # Fast Startup keeps LastBootUpTime from the last full boot, so the real
     # "running since" is the newest Kernel-General 12 (logged on every start).
@@ -311,6 +339,7 @@ try {
             rebootPending  = [bool]$rebootPending
             updates        = $updates
         }
+        win11           = $win11
     }
     $json = $body | ConvertTo-Json -Depth 6 -Compress
 

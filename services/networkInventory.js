@@ -240,6 +240,7 @@ export async function buildDeviceList(snapshots) {
         row.pc = { ...p, reportedAt: snap.fetchedAt ? new Date(snap.fetchedAt).toISOString() : null };
         row.activation = summarizeActivation(p);
         row.health = summarizeHealth(p, row.pc.reportedAt);
+        row.win11 = win11Readiness(p);
         row.name = row.name || p.computerName;
         row.windows = true;
     }
@@ -657,4 +658,71 @@ export function summarizeHealth(p, reportedAt) {
         issues,
         critical: issues.some((i) => CRITICAL_ISSUES.includes(i)),
     };
+}
+
+// ---------------------------------------------------------------------------
+// Windows 11 readiness (PC report "win11" block, 2026-11-25)
+// ---------------------------------------------------------------------------
+
+// Supported CPU per Microsoft's lists, simplified: Intel Core 8th gen and
+// newer (+ Core Ultra / Core 3-7 series 1+), Pentium Gold G5400+, Celeron
+// G4900+, AMD Ryzen 2000+ (except the Zen 1 2x00G/GE/U/H APUs).
+// ok: true / false / null (unknown -- Xeon, Athlon, mobile Pentium...).
+export function cpuWin11Support(name) {
+    const n = String(name ?? '').replaceAll(/\((R|TM)\)/gi, '').replaceAll(/\s+/g, ' ');
+    if (/Core Ultra/i.test(n)) return { ok: true, gen: 'Ultra' };
+    let m = n.match(/Core i[3579]-(\d{3,5})/i);
+    if (m) {
+        const d = m[1];
+        // i5-10400 / i7-1165G7 / i5-8500 / i5-750
+        const gen = d.length === 5 || (d.length === 4 && d[0] === '1') ? Number(d.slice(0, 2))
+            : d.length === 4 ? Number(d[0]) : 1;
+        return { ok: gen >= 8, gen };
+    }
+    if (/Core [3579] \d{3}/i.test(n)) return { ok: true, gen: 'Core' };
+    if (/Core ?2|Pentium Dual|Pentium 4|Pentium D\b|Celeron D\b|Atom/i.test(n)) return { ok: false, gen: null };
+    m = n.match(/Pentium.*\bG(\d{4})/i);
+    if (m) return { ok: Number(m[1]) >= 5400, gen: null };
+    m = n.match(/Celeron.*\bG(\d{4})/i);
+    if (m) return { ok: Number(m[1]) >= 4900, gen: null };
+    m = n.match(/Ryzen (?:AI|Threadripper)/i);
+    if (m) return { ok: true, gen: 'Ryzen' };
+    m = n.match(/Ryzen \d (?:PRO )?(\d)(\d{3})([A-Z]*)/i);
+    if (m) {
+        const series = Number(m[1]);
+        const zen1Apu = series === 2 && /^(G|GE|U|H)$/i.test(m[3]);
+        return { ok: series >= 2 && !zen1Apu, gen: `Ryzen ${series}000` };
+    }
+    return { ok: null, gen: null };
+}
+
+// -> { status: already | ready | fixable | no | unknown, hard[], fix[], cpuGen }
+//   hard = needs new hardware (cpu, ram, disk, arch, tpm_12 on an old CPU)
+//   fix  = BIOS/firmware settings IT can change (tpm_off, legacy_bios,
+//          secure_boot_off; tpm_12 on a supported CPU = switch to PTT/fTPM 2.0)
+export function win11Readiness(p) {
+    if (!p) return null;
+    const w = p.win11;
+    if (/Windows 11/i.test(p.os?.caption ?? '')) return { status: 'already', hard: [], fix: [], cpuGen: null };
+    if (!w) {
+        // Report from before the win11 block: the CPU alone can already say "no".
+        const c = cpuWin11Support(p.hardware?.cpu?.name);
+        return c.ok === false ? { status: 'no', hard: ['cpu'], fix: [], cpuGen: c.gen, partial: true } : null;
+    }
+    const hard = [];
+    const fix = [];
+    const cpu = cpuWin11Support(p.hardware?.cpu?.name);
+    if (cpu.ok === false) hard.push('cpu');
+    if (p.hardware?.ramGb && p.hardware.ramGb < 3.5) hard.push('ram');
+    const sys = (p.hardware?.volumes ?? []).find((v) => String(v.drive).toUpperCase() === 'C:');
+    if (sys?.sizeGb && sys.sizeGb < 60) hard.push('disk');
+    if (w.arch && !/64/.test(w.arch)) hard.push('arch');
+    const tpmVer = Number.parseFloat(String(w.tpm?.specVersion ?? '').split(',')[0]);
+    if (!w.tpmPresent) fix.push('tpm_off');
+    else if (Number.isFinite(tpmVer) && tpmVer < 2) (cpu.ok ? fix : hard).push('tpm_12');
+    else if (w.tpm && (!w.tpm.enabled || !w.tpm.activated)) fix.push('tpm_off');
+    if (/legacy/i.test(w.firmware ?? '')) fix.push('legacy_bios');
+    else if (w.secureBoot === false) fix.push('secure_boot_off');
+    const status = hard.length ? 'no' : cpu.ok === null ? 'unknown' : fix.length ? 'fixable' : 'ready';
+    return { status, hard, fix, cpuGen: cpu.gen };
 }

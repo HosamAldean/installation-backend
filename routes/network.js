@@ -201,6 +201,23 @@ function securityReport(v) {
     };
 }
 
+function win11Report(v) {
+    if (!v || typeof v !== "object") return null;
+    return {
+        firmware: s(v.firmware, 20),
+        secureBoot: bool(v.secureBoot),
+        tpmPresent: bool(v.tpmPresent),
+        tpm: v.tpm && typeof v.tpm === "object" ? {
+            specVersion: s(v.tpm.specVersion, 40),
+            enabled: bool(v.tpm.enabled),
+            activated: bool(v.tpm.activated),
+        } : null,
+        arch: s(v.arch, 20),
+        cpuMaker: s(v.cpuMaker, 40),
+        cpuCaption: s(v.cpuCaption, 100),
+    };
+}
+
 function healthReport(v) {
     if (!v || typeof v !== "object") return null;
     const u = v.updates;
@@ -323,6 +340,7 @@ router.post("/report", async (req, res) => {
                 .filter((n) => n.mac),
             security: securityReport(b.security),
             health: healthReport(b.health),
+            win11: win11Report(b.win11),
         };
         await saveSnapshot(key, data);
         alertHealthChange(name.toUpperCase(), prevData,
@@ -441,6 +459,11 @@ router.get("/overview", async (req, res) => {
                 healthCritical: devices.filter((d) => d.health?.critical).length,
                 // Windows without security updates (Win 10, 7, 8.1, old Win 11 / Server),
                 // online now or logged on to AD in the last 60 days
+                // Windows 11 upgrade check of PCs not on Windows 11 yet
+                win11Ready: devices.filter((d) => d.win11?.status === "ready").length,
+                win11Fixable: devices.filter((d) => d.win11?.status === "fixable").length,
+                win11No: devices.filter((d) => d.win11?.status === "no").length,
+                win11Unknown: devices.filter((d) => d.win11?.status === "unknown").length,
                 osUnsupported: devices.filter((d) => d.osSupported === false && (d.online
                     || (d.ad?.lastLogon && Date.parse(d.ad.lastLogon) > Date.now() - 60 * 86400000))).length,
                 // Phones/tablets holding a DHCP lease now (networkInventory
