@@ -198,6 +198,10 @@ export const PERMISSIONS = Object.freeze({
     // Software library + installed-software inventory (routes/software.js,
     // 2026-11-25). Phase 1 is read-only towards PCs.
     IT_SOFTWARE: 'it.software',
+    // Install a library item on PCs (phase 2, 2026-11-26). Separate from
+    // it.software on purpose: seeing the library must not imply being able
+    // to run installers on PCs.
+    IT_SOFTWARE_DEPLOY: 'it.software.deploy',
     // Remote control from the network page (today: the .rdp download, later
     // MeshCentral). Separate on purpose -- seeing the device list must not
     // imply being able to connect to the devices.
@@ -422,6 +426,7 @@ export const PERMISSION_GROUPS = [
             { key: PERMISSIONS.IT_LICENSES, labelKey: 'itLicenses' },
             { key: PERMISSIONS.IT_NETWORK, labelKey: 'itNetwork' },
             { key: PERMISSIONS.IT_SOFTWARE, labelKey: 'itSoftware' },
+            { key: PERMISSIONS.IT_SOFTWARE_DEPLOY, labelKey: 'itSoftwareDeploy' },
             { key: PERMISSIONS.IT_REMOTE, labelKey: 'itRemote' },
         ],
     },

@@ -21,6 +21,7 @@ import {
 } from "../services/networkMonitor.js";
 import { buildDeviceList, loadSnapshots, normalizeMac, summarizeHealth, isActiveDevice } from "../services/networkInventory.js";
 import { buildOps, refreshCerts } from "../services/itOps.js";
+import { recordJobResult, takeJobsForPc } from "../services/softwareDeploy.js";
 
 const router = express.Router();
 
@@ -459,10 +460,38 @@ router.post("/report", async (req, res) => {
         await saveSnapshot(key, data);
         alertHealthChange(name.toUpperCase(), prevData,
             prev?.fetchedAt ? new Date(prev.fetchedAt).toISOString() : null, data);
-        res.json({ success: true });
+        // Software Library phase 2: installs queued for this PC. A failure
+        // here must never fail the report itself.
+        let jobs = [];
+        try { jobs = await takeJobsForPc(name); } catch (e) { console.error("❌ Deploy jobs for PC failed:", e); }
+        res.json({ success: true, jobs });
     } catch (err) {
         console.error("❌ PC report failed:", err);
         res.status(500).json({ success: false, message: "Report failed" });
+    }
+});
+
+// POST /report/job -- the PC's result for an install it was handed (same
+// report token; a job only accepts a result from the PC it was sent to).
+router.post("/report/job", async (req, res) => {
+    if (!process.env.NETWORK_REPORT_TOKEN) {
+        return res.status(503).json({ success: false, message: "PC reports are not configured" });
+    }
+    if (!tokenMatches(req.get("x-report-token"), process.env.NETWORK_REPORT_TOKEN)) {
+        return res.status(401).json({ success: false, message: "Bad token" });
+    }
+    const name = String(req.body?.computerName ?? "").trim();
+    if (!PC_NAME_RE.test(name)) return res.status(400).json({ success: false, message: "Bad computerName" });
+    try {
+        const { error, job } = await recordJobResult(name, req.body);
+        if (error) return res.status(409).json({ success: false, message: error });
+        if (job.status === "failed") {
+            pushAlert("🔴 Software install failed", `${job.itemName} on ${job.computerName}: ${job.message ?? `exit code ${job.exitCode}`}`, "/admin/it-software");
+        }
+        res.json({ success: true });
+    } catch (err) {
+        console.error("❌ Install result failed:", err);
+        res.status(500).json({ success: false, message: "Result failed" });
     }
 });
 

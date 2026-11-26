@@ -20,8 +20,11 @@
   Also installed programs (machine-wide Uninstall entries) for the IT
   software page.
 
-  READ-ONLY on the PC: CIM queries and registry reads. It changes nothing --
-  it does not activate, install or remove anything.
+  The report itself is READ-ONLY on the PC: CIM queries and registry reads;
+  it never activates or removes anything. Since 2026-11-26 (Software Library
+  phase 2) the reply can carry installs IT queued in the app for this PC;
+  those run silently from \\PETRA-FILES\Software$ only, after a SHA-256
+  check (Invoke-InstallJobs). No queued install = nothing runs.
 
   The token below is the LOW-privilege report token (NETWORK_REPORT_TOKEN),
   readable by any domain user in SYSVOL by design: all it allows is
@@ -49,6 +52,70 @@ function Write-RunLog($text) {
         "$(Get-Date -Format s) [$([Security.Principal.WindowsIdentity]::GetCurrent().Name)] $text" |
             Set-Content -Path (Join-Path $dir 'last-run.log') -Encoding UTF8
     } catch { }
+}
+
+# --- Software Library phase 2 (2026-11-26): installs queued in the app ------
+# The /report reply lists installs IT queued for this PC. Each one is only
+# run if: its path is inside the software share (only Domain Admins can
+# write there), it is an .msi/.msp/.exe, and the SHA-256 of the LOCAL copy
+# equals the approved hash from the app. Runs silently as SYSTEM, never
+# restarts the PC (/norestart for MSI), 2-hour limit, result sent back.
+$ShareRoot = '\\PETRA-FILES\Software$\'
+
+function Get-Sha256($path) {
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $fs = [IO.File]::OpenRead($path)
+    try { ([BitConverter]::ToString($sha.ComputeHash($fs)) -replace '-', '').ToLower() }
+    finally { $fs.Dispose(); $sha.Dispose() }
+}
+
+function Send-JobResult($id, $ok, $code, $message) {
+    try {
+        $r = [ordered]@{ computerName = $env:COMPUTERNAME; id = $id; ok = [bool]$ok; exitCode = $code; message = $message }
+        Invoke-RestMethod -Method Post -Uri "$ApiUrl/job" -Headers @{ 'X-Report-Token' = $Token } `
+            -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes(($r | ConvertTo-Json -Compress))) -TimeoutSec 60 | Out-Null
+    } catch { }
+}
+
+function Invoke-InstallJobs($jobs) {
+    $work = Join-Path $env:ProgramData 'PetraPcReport\Installs'
+    foreach ($j in $jobs) {
+        $ok = $false; $code = $null; $msg = $null; $dir = $null
+        try {
+            $id = [int]$j.id
+            $path = [string]$j.path
+            if (-not $path.StartsWith($ShareRoot, [StringComparison]::OrdinalIgnoreCase) -or $path.Contains('..')) { throw 'Refused: path is outside the software share' }
+            $ext = [IO.Path]::GetExtension($path).ToLower()
+            if (@('.msi', '.msp', '.exe') -notcontains $ext) { throw "Refused: $ext files are not allowed" }
+            if (-not (Test-Path -LiteralPath $path)) { throw 'Installer not reachable from this PC (share access or file moved)' }
+
+            $dir = Join-Path $work "job-$id"
+            New-Item -ItemType Directory -Force $dir | Out-Null
+            $local = Join-Path $dir ([IO.Path]::GetFileName($path))
+            Copy-Item -LiteralPath $path -Destination $local -Force
+            if ((Get-Sha256 $local) -ne ([string]$j.sha256).ToLower()) { throw 'Refused: SHA-256 differs from the approved file' }
+
+            $extra = [string]$j.args
+            $log = Join-Path $work "job-$id.log"
+            if ($ext -eq '.msi') { $exe = 'msiexec.exe'; $argLine = "/i `"$local`" /qn /norestart /L*v `"$log`" $extra" }
+            elseif ($ext -eq '.msp') { $exe = 'msiexec.exe'; $argLine = "/p `"$local`" /qn /norestart /L*v `"$log`" $extra" }
+            else { $exe = $local; $argLine = $extra }
+
+            $p = if ($argLine.Trim()) { Start-Process -FilePath $exe -ArgumentList $argLine -PassThru -WindowStyle Hidden }
+                 else { Start-Process -FilePath $exe -PassThru -WindowStyle Hidden }
+            $null = $p.Handle   # keeps ExitCode readable after the process ends
+            if (-not $p.WaitForExit(2 * 60 * 60 * 1000)) { try { $p.Kill() } catch { }; throw 'Stopped: still running after 2 hours' }
+            $code = $p.ExitCode
+            $ok = @(0, 3010, 1641) -contains $code
+            if (-not $ok) { $msg = "Installer exit code $code" + $(if ($ext -ne '.exe') { " (log: $log)" } else { '' }) }
+        } catch {
+            $msg = $_.Exception.Message
+        } finally {
+            if ($dir) { Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+        Send-JobResult $id $ok $code $msg
+        try { "$(Get-Date -Format s) job $id ($($j.name)): ok=$ok code=$code $msg" | Add-Content -Path (Join-Path $work 'installs.log') -Encoding UTF8 } catch { }
+    }
 }
 
 $WindowsAppId = '55c92734-d682-4d71-983e-d6ec3f16059f'
@@ -408,9 +475,11 @@ try {
 
     if ($DryRun) { $body | ConvertTo-Json -Depth 6; return }
 
-    Invoke-RestMethod -Method Post -Uri $ApiUrl -Headers @{ 'X-Report-Token' = $Token } `
-        -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($json)) -TimeoutSec 60 | Out-Null
-    Write-RunLog "OK sent $($json.Length) bytes"
+    $resp = Invoke-RestMethod -Method Post -Uri $ApiUrl -Headers @{ 'X-Report-Token' = $Token } `
+        -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($json)) -TimeoutSec 60
+    $jobs = @($resp.jobs | Where-Object { $_ })
+    Write-RunLog "OK sent $($json.Length) bytes, $($jobs.Count) install job(s)"
+    if ($jobs.Count) { Invoke-InstallJobs $jobs }
 }
 catch {
     # Never bother the user; the page shows when a PC last reported.
