@@ -79,6 +79,9 @@ function Send-JobResult($id, $ok, $code, $message) {
 
 function Invoke-InstallJobs($jobs) {
     $work = Join-Path $env:ProgramData 'PetraPcReport\Installs'
+    New-Item -ItemType Directory -Force $work | Out-Null
+    # Progress lines in installs.log, so a stuck install shows where it stopped.
+    function Step($id, $text) { try { "$(Get-Date -Format s) job $id $text" | Add-Content -Path (Join-Path $work 'installs.log') -Encoding UTF8 } catch { } }
     foreach ($j in $jobs) {
         $ok = $false; $code = $null; $msg = $null; $dir = $null
         try {
@@ -94,16 +97,29 @@ function Invoke-InstallJobs($jobs) {
             $local = Join-Path $dir ([IO.Path]::GetFileName($path))
             Copy-Item -LiteralPath $path -Destination $local -Force
             if ((Get-Sha256 $local) -ne ([string]$j.sha256).ToLower()) { throw 'Refused: SHA-256 differs from the approved file' }
+            # Files downloaded in a browser carry an "internet" mark
+            # (Zone.Identifier). Through the shell that pops an invisible
+            # security prompt under SYSTEM and the install hangs forever, so:
+            # drop the mark on our verified local copy, and start the
+            # installer directly (UseShellExecute = false), never via the shell.
+            Remove-Item -LiteralPath $local -Stream Zone.Identifier -ErrorAction SilentlyContinue
+            Step $id 'copied, SHA-256 OK'
 
             $extra = [string]$j.args
             $log = Join-Path $work "job-$id.log"
-            if ($ext -eq '.msi') { $exe = 'msiexec.exe'; $argLine = "/i `"$local`" /qn /norestart /L*v `"$log`" $extra" }
-            elseif ($ext -eq '.msp') { $exe = 'msiexec.exe'; $argLine = "/p `"$local`" /qn /norestart /L*v `"$log`" $extra" }
+            $sys32 = [Environment]::GetFolderPath('System')
+            if ($ext -eq '.msi') { $exe = Join-Path $sys32 'msiexec.exe'; $argLine = "/i `"$local`" /qn /norestart /L*v `"$log`" $extra" }
+            elseif ($ext -eq '.msp') { $exe = Join-Path $sys32 'msiexec.exe'; $argLine = "/p `"$local`" /qn /norestart /L*v `"$log`" $extra" }
             else { $exe = $local; $argLine = $extra }
 
-            $p = if ($argLine.Trim()) { Start-Process -FilePath $exe -ArgumentList $argLine -PassThru -WindowStyle Hidden }
-                 else { Start-Process -FilePath $exe -PassThru -WindowStyle Hidden }
-            $null = $p.Handle   # keeps ExitCode readable after the process ends
+            $psi = New-Object Diagnostics.ProcessStartInfo
+            $psi.FileName = $exe
+            $psi.Arguments = $argLine.Trim()
+            $psi.WorkingDirectory = $dir
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $p = [Diagnostics.Process]::Start($psi)
+            Step $id "started pid $($p.Id)"
             if (-not $p.WaitForExit(2 * 60 * 60 * 1000)) { try { $p.Kill() } catch { }; throw 'Stopped: still running after 2 hours' }
             $code = $p.ExitCode
             $ok = @(0, 3010, 1641) -contains $code
@@ -114,7 +130,7 @@ function Invoke-InstallJobs($jobs) {
             if ($dir) { Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue }
         }
         Send-JobResult $id $ok $code $msg
-        try { "$(Get-Date -Format s) job $id ($($j.name)): ok=$ok code=$code $msg" | Add-Content -Path (Join-Path $work 'installs.log') -Encoding UTF8 } catch { }
+        Step $id "($($j.name)) done: ok=$ok code=$code $msg"
     }
 }
 
