@@ -426,6 +426,8 @@ try {
 
     $body = [ordered]@{
         computerName    = $env:COMPUTERNAME
+        # Tells the app this script runs queued installs (older copies don't).
+        agent           = [ordered]@{ installs = 1 }
         user            = $cs.UserName
         os              = [ordered]@{
             caption        = $os.Caption

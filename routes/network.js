@@ -460,10 +460,13 @@ router.post("/report", async (req, res) => {
         await saveSnapshot(key, data);
         alertHealthChange(name.toUpperCase(), prevData,
             prev?.fetchedAt ? new Date(prev.fetchedAt).toISOString() : null, data);
-        // Software Library phase 2: installs queued for this PC. A failure
-        // here must never fail the report itself.
+        // Software Library phase 2: installs queued for this PC -- only to a
+        // script that says it runs them (agent.installs), so an older copy
+        // never swallows a job. A failure here must never fail the report.
         let jobs = [];
-        try { jobs = await takeJobsForPc(name); } catch (e) { console.error("❌ Deploy jobs for PC failed:", e); }
+        if (Number(b.agent?.installs) >= 1) {
+            try { jobs = await takeJobsForPc(name); } catch (e) { console.error("❌ Deploy jobs for PC failed:", e); }
+        }
         res.json({ success: true, jobs });
     } catch (err) {
         console.error("❌ PC report failed:", err);
