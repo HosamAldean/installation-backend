@@ -69,13 +69,16 @@ try {
         try { (Get-Content -Raw $CacheFile | ConvertFrom-Json).PSObject.Properties | ForEach-Object { $cache[$_.Name] = $_.Value } } catch { }
     }
     $newCache = @{}
-    $files = @()
+    $files = @(); $skipped = 0
     $exts = '.msi', '.exe', '.msix', '.msixbundle', '.appx', '.msp', '.zip'
     foreach ($f in Get-ChildItem -LiteralPath $Root -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $exts -contains $_.Extension.ToLower() } | Select-Object -First 2000) {
         $rel = $f.FullName.Substring($Root.Length).TrimStart('\')
         $stamp = "$($f.Length)|$($f.LastWriteTimeUtc.Ticks)"
         $c = $cache[$rel]
-        $hash = if ($c -and $c.stamp -eq $stamp) { $c.sha256 } else { (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash.ToLower() }
+        # A file still being copied in is locked: skip it this run, next run picks it up.
+        try {
+            $hash = if ($c -and $c.stamp -eq $stamp) { $c.sha256 } else { (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower() }
+        } catch { $skipped++; continue }
         $newCache[$rel] = @{ stamp = $stamp; sha256 = $hash }
 
         $product = $null; $version = $null; $company = $null
@@ -107,7 +110,7 @@ try {
     $token = (Get-Content -Raw -Path $TokenFile).Trim()
     $resp = Invoke-RestMethod -Method Post -Uri $ApiUrl -Headers @{ 'X-Ingest-Token' = $token } `
         -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($json)) -TimeoutSec 60
-    "$(Get-Date -Format s) OK files=$($files.Count) saved=$($resp.saved -join ',')" | Set-Content -Path $LogFile
+    "$(Get-Date -Format s) OK files=$($files.Count) skipped=$skipped saved=$($resp.saved -join ',')" | Set-Content -Path $LogFile
 }
 catch {
     "$(Get-Date -Format s) FAILED $($_.Exception.Message)" | Set-Content -Path $LogFile
